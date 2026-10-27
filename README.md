@@ -28,6 +28,23 @@ rclone mount dramahub:/ /mnt/dramahub --vfs-cache-mode full --dir-cache-time 30s
 
 Emby 库路径指向 `/mnt/dramahub/短剧`，类型选「电视节目」。
 
+## 开发环境
+
+生产与测试共用同一个镜像，ffmpeg 版本由镜像固定（见 `env.lock`）：
+
+```bash
+make env-check                  # 校验容器内 go/ffmpeg 版本与 env.lock 一致
+make e2e-image                  # 构建测试镜像（runtime + Go 工具链）
+make test-e2e                   # 容器内跑集成测试，--network=none
+make run-container              # 容器内起服务，挂 ./data，映射 :8080
+```
+
+本机 `make build` / `make test` 只用于快速迭代：开发机 ffmpeg 与容器 ffmpeg 版本不同，
+本机结果不能作为验收依据。升级基础镜像 = 改 `Containerfile` 的 digest + `env.lock` + 跑 `make env-check`。
+
+podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限定名 `localhost/drama-hub`，运行命令带 `--pull=never`。
+宿主机 8080 被占用时用 `make run-container PORT=18081`。
+
 ## 文档
 
 - `AGENTS.md` — 硬约束与目录约定（改代码前先读）

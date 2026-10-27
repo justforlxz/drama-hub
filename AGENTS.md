@@ -44,12 +44,16 @@ docs/                   规范与 ADR
 ## 命令
 
 ```
-make build      # 编译到 ./bin/drama-hub
-make run        # 本地启动（默认 :8080，DB 在 ./data/）
-make test       # go test -race ./...
-make lint       # go vet + staticcheck
-make check      # lint + test，提交前跑这个
+make build        # 本机编译到 ./bin/drama-hub
+make run          # 本机启动（快速迭代，非验收依据）
+make check        # 本机 lint + test
+make env-check    # 校验容器内 go/ffmpeg 版本与 env.lock 一致
+make test-e2e     # 容器内集成测试（--network=none），验收依据
+make run-container # 容器内跑服务，挂 ./data
 ```
+
+**验收一律以容器结果为准**：开发机 ffmpeg 与容器 ffmpeg 不是同一个版本，本机跑绿不代表验收通过。
+`ffmpeg` 只出现在 runtime 镜像里，e2e 段从 runtime 派生，所以测试与线上用同一个二进制。
 
 ## 规范
 

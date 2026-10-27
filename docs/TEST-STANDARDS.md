@@ -61,4 +61,13 @@
 
 ## 提交前
 
-`make check`（= `go vet` + `staticcheck` + `go test -race ./...`）。不通过不提交。
+- 本机快速反馈：`make check`（= `go vet` + `staticcheck` + `go test -race ./...`）。
+- **合并前必须**：`make env-check` + `make test-e2e`（容器、`--network=none`）。本机结果不能替代。
+
+## 容器内测试
+
+- 测试环境 = 与 runtime **同一个 ffmpeg 二进制**（e2e 段 `FROM runtime`），所以切片时长、TS 产物在测试与线上一致。
+- `--network=none`：任何访问外网的测试在这里会直接失败，这是刻意的。假上游用 `httptest.Server`（容器内 localhost 可用）。
+- 需要 ffmpeg 的测试文件加 `//go:build e2e`，`make test`（本机）跳过它们，`make test-e2e` 全跑。这样本机迭代不受 ffmpeg 版本干扰，也不会让人误以为本机跑绿就等于验收通过。
+- 容器内 `-race` 需要 cgo，e2e 段已装 `build-base`；不要为此关掉 `-race`。
+- 测试产物写 `/tmp`（tmpfs），不写进只读挂载的源码目录。

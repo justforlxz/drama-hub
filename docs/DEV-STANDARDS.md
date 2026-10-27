@@ -51,13 +51,15 @@
 | key | 默认 | 取值范围 | 作用 |
 |---|---|---|---|
 | `strm_prefix` | `""` | URL 或空 | strm 内 URL 前缀，指向 rclone/openlist 代理 |
-| `cache_max_mb` | `204800` | 1024–1048576 | 缓存上限 |
-| `cache_lru_days` | `30` | 1–365 | 未访问淘汰天数 |
+| `stream_secret` | 必填 | ≥ 32 字节 | 出流 HMAC 签名密钥（见 ADR-0003） |
 | `seg_target_sec` | `10` | 4–30 | 分片目标时长 |
 | `seg_prefetch` | `2` | 0–10 | 预取分片数 |
 | `pin_days` | `7` | 0–90 | 最近 N 天播放过的合并集整集预取 |
-| `ffmpeg_concurrency` | `min(4, NumCPU/2)` | 1–32 | ffmpeg 并发上限 |
 | `webdav_user` / `webdav_pass` | 必填 | — | WebDAV Basic 认证 |
+
+**不属于本服务运行配置**（由缓存代理负责，见 ADR-0004）：缓存上限、LRU 天数。
+它们只在 WebUI/文档生成 rclone 配置建议值时出现。**本服务不实现任何缓存淘汰**。
+ffmpeg 并发上限固定为 `NumCPU`，不做成可调项（见 `internal/segment` 的并发闸）。
 
 新增参数必须同 PR 更新上表，并在 `settings` 里给默认值 + 范围校验。写非法值返回 400，不静默纠正。
 

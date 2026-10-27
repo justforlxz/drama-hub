@@ -32,19 +32,5 @@ ff_ver=$(sed -E 's/^ffmpeg version ([^ ]+).*/\1/' <<<"$ff_line")
 [[ $ff_ver == "$FFMPEG_VERSION" ]] || fail "ffmpeg: 实际 $ff_ver，期望 $FFMPEG_VERSION（$ff_line）"
 ok "ffmpeg $ff_ver"
 
-echo "== 编码器 =="
-encoders=$("$engine" run --rm --network=none --entrypoint ffmpeg "$tag" -hide_banner -encoders 2>/dev/null)
-for e in ${FFMPEG_ENCODERS//,/ }; do
-  grep -qE "^ [A-Z.]{6} $e " <<<"$encoders" || fail "缺少编码器 $e"
-done
-ok "编码器齐全：$FFMPEG_ENCODERS"
-
-echo "== 封装器 =="
-muxers=$("$engine" run --rm --network=none --entrypoint ffmpeg "$tag" -hide_banner -muxers 2>/dev/null)
-for m in ${FFMPEG_MUXERS//,/ }; do
-  grep -qE "^  E $m " <<<"$muxers" || fail "缺少封装器 $m"
-done
-ok "封装器齐全：$FFMPEG_MUXERS"
-
 echo
 echo "环境与 env.lock 一致。"

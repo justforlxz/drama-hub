@@ -6,7 +6,7 @@
 
 | 层 | 形式 | 管什么 | 不跑什么 |
 |---|---|---|---|
-| 单元 | `go test`，无 I/O | 纯逻辑：集号派生、segment 切点计算、`seq → (集号, 秒)`、LRU 淘汰顺序、settings 范围校验 | 不起 HTTP、不碰磁盘、不调 ffmpeg |
+| 单元 | `go test`，无 I/O | 纯逻辑：集号派生、segment 切点计算、`seq → (集号, 秒)`、HMAC 签名校验、settings 范围校验 | 不起 HTTP、不碰磁盘、不调 ffmpeg |
 | 集成 | `go test`，`httptest` + 真 SQLite（临时文件）+ 真 ffmpeg | 端点契约：Range/206、Content-Length、token、playlist 合法性、并发闸 | 不访问外网、不连真 Emby |
 | 验收 | 手工清单，真 Emby + 真 rclone | 播放、拖动、续播、电视墙 | 不做成自动化 |
 
@@ -18,9 +18,9 @@
 2. **Range 语义**：单集合成的 `206` + `Content-Range: bytes a-b/total`；越界返回 `416`；`HEAD` 返回相同的 `Content-Length` 但不返回 body。
 3. **分片边界**：给定 fixture 的 `segment` 表，断言 `seq` 到 `(ep_no, start_sec, dur)` 的映射与总量等于各集时长之和（±一帧容差）。**这是合并集正确性的唯一守门测试，不允许跳过。**
 4. **playlist 合法性**：自造 m3u8 必须能被 `ffprobe` 解析出预期总时长，且集边界处有 `#EXT-X-DISCONTINUITY`；分片串起来解码无错误（`ffmpeg -v error -i playlist -f null -` 返回 0）。
-5. **token**：过期 / 篡改 / 缺失 → `401`；有效 token 换一个 `uid` → `403`。
-6. **缓存策略**：超过 `cache_max_mb` 触发淘汰；被 pin 的剧不淘汰；`last_used_at` 被访问更新。用假时钟，不用 `time.Sleep`。
-7. **settings**：非法值（越界、非数字）→ `400` 且不写入；合法值生效且下次读回一致。
+5. **出流签名**（ADR-0003）：正确签名放行；篡改或缺失 → `401`。用 `crypto/hmac.Equal` 常数时间比较，**不测过期时间、不测 token 表**——这两样都不存在，写了就是给自己造需求。
+6. **settings**：非法值（越界、非数字）→ `400` 且不写入；合法值生效且下次读回一致。
+7. **pin 预取**：`pin_days` 命中的合并集被喂给缓存层；不命中则不喂。**不测淘汰**——淘汰由缓存代理负责（ADR-0004），本服务没有可测的淘汰逻辑。
 
 ## 禁止的测试（写了要删）
 
@@ -59,15 +59,14 @@
 - 分片转封装失败 → 返回 `502`，不缓存失败结果
 - DB 写失败 → 请求失败且连接可用（断言后续请求仍 `200`）
 
+## 测试只有一条路径：容器
+
+- `make test` 就是跑容器，**没有第二条路径**，因此不需要 `//go:build` 标签来区分本机与容器测试。
+- 测试环境与 runtime 用**同一个 ffmpeg 二进制**（e2e 段 `FROM runtime`），切片时长与 TS 产物在测试与线上一致。
+- 测试二进制在 build 段（自带 gcc）编译为 `-race`，再拷进 e2e 镜像；e2e 里没有 Go 工具链，镜像小、测试不用每次重新编译。
+- `--network=none`：任何访问外网的测试会直接失败，这是刻意的。假上游用 `httptest.Server`（容器内 localhost 可用）。
+- 测试产物写 `/tmp`（tmpfs），不写进只读挂载的源码目录。
+
 ## 提交前
 
-- 本机快速反馈：`make check`（= `go vet` + `staticcheck` + `go test -race ./...`）。
-- **合并前必须**：`make env-check` + `make test-e2e`（容器、`--network=none`）。本机结果不能替代。
-
-## 容器内测试
-
-- 测试环境 = 与 runtime **同一个 ffmpeg 二进制**（e2e 段 `FROM runtime`），所以切片时长、TS 产物在测试与线上一致。
-- `--network=none`：任何访问外网的测试在这里会直接失败，这是刻意的。假上游用 `httptest.Server`（容器内 localhost 可用）。
-- 需要 ffmpeg 的测试文件加 `//go:build e2e`，`make test`（本机）跳过它们，`make test-e2e` 全跑。这样本机迭代不受 ffmpeg 版本干扰，也不会让人误以为本机跑绿就等于验收通过。
-- 容器内 `-race` 需要 cgo，e2e 段已装 `build-base`；不要为此关掉 `-race`。
-- 测试产物写 `/tmp`（tmpfs），不写进只读挂载的源码目录。
+`make check`（= `go vet` + 容器内测试）。合并前额外跑 `make env-check` 确认镜像未漂移。

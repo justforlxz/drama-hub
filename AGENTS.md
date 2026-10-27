@@ -20,9 +20,11 @@
 2. **合并集只有一种实现：虚拟 HLS 分片聚合。** 禁止物化合并文件、禁止字节拼接多集 MP4（`moov` 只描述首集，拼字节必然时长错、seek 崩）。这条是两个方案对比后定的，不要再试。
 3. **每个虚拟文件必须给出精确 `Content-Length`。** WebDAV 的 `PROPFIND` 少了它，rclone mount 读不到文件、Emby 扫不出集。渲染 → 算长度 → 再返回，一次请求内完成。
 4. **单二进制 + SQLite。** 没有 Node、没有前端构建步骤、没有第二个运行时、没有外部缓存服务。界面用 Go 模板 + 少量原生 JS，模板随二进制嵌入（`embed`）。
-5. **可调参数进 `settings` 表。** strm 前缀、缓存上限、LRU 天数、分片时长、预取数、pin 天数全部运行时可变，改完即时生效。代码里出现这类魔法数字视为缺陷。
+5. **可调参数进 `settings` 表。** strm 前缀、出流签名密钥、分片时长、预取数、pin 天数运行时可变，改完即时生效。代码里出现这类魔法数字视为缺陷。**缓存上限与 LRU 天数不是本服务的配置**：缓存由缓存代理负责（ADR-0004），本服务不实现任何缓存淘汰。
 6. **对外集号只由 `emby_item` 派生表决定。** 合并调整只重建派生表，`drama` / `episode` 原始数据不动。
 7. **出流用字节透传，不用 302。** 302 到签名 CDN 会让缓存键漂移、过期链接命中旧缓存返回错内容。
+8. **出流 token 是 HMAC 常量签名，无过期、无状态、无 token 表**（ADR-0003）。带过期的 token 会破坏缓存键稳定性，与缓存目标直接冲突。
+9. **不做理论性加固。** 新增任何防护/兜底/校验前，先说明具体的失败模式、发生可能性、复杂度成本，取得确认再写。单用户本机场景下概率接近零的边缘情况一律不写。
 
 ## 目录
 
@@ -34,7 +36,7 @@ internal/vfs/           虚拟文件树 → strm/nfo/图片 渲染
 internal/webdav/        x/net/webdav 自定义 FileSystem
 internal/stream/        出流：HEAD/GET/Range/token
 internal/segment/       关键帧索引、播放列表生成、分片转封装
-internal/cache/         分片缓存策略、LRU、pin
+internal/cache/         artifact 缓存（封面/关键帧索引）+ pin 预取驱动；不含视频缓存淘汰
 internal/web/           管理 API + 页面模板
 docs/                   规范与 ADR
 ```
@@ -44,16 +46,16 @@ docs/                   规范与 ADR
 ## 命令
 
 ```
-make build        # 本机编译到 ./bin/drama-hub
-make run          # 本机启动（快速迭代，非验收依据）
-make check        # 本机 lint + test
+make build        # 本机编译检查（不产出验收物）
+make check        # lint + 容器内测试
 make env-check    # 校验容器内 go/ffmpeg 版本与 env.lock 一致
-make test-e2e     # 容器内集成测试（--network=none），验收依据
-make run-container # 容器内跑服务，挂 ./data
+make test         # 容器内跑全部测试（--network=none），唯一测试路径
+make run          # 容器内跑服务，挂 ./data，PORT 可选
 ```
 
-**验收一律以容器结果为准**：开发机 ffmpeg 与容器 ffmpeg 不是同一个版本，本机跑绿不代表验收通过。
-`ffmpeg` 只出现在 runtime 镜像里，e2e 段从 runtime 派生，所以测试与线上用同一个二进制。
+**运行与测试只有容器这一条路径**：开发机 ffmpeg 与容器 ffmpeg 不是同一个版本。
+`ffmpeg` 只出现在 runtime 镜像里，e2e 段 `FROM runtime`，所以测试与线上用同一个二进制。
+测试二进制在 build 段编译好再拷进 e2e，e2e 镜像里没有 Go 工具链。
 
 ## 规范
 

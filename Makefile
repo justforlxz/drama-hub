@@ -20,6 +20,7 @@ build:
 
 lint:
 	go vet ./...
+	./scripts/check-deps.sh
 	@command -v staticcheck >/dev/null 2>&1 \
 		&& staticcheck ./... \
 		|| echo "staticcheck 未安装，已跳过（go install honnef.co/go/tools/cmd/staticcheck@latest）"

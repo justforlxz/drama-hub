@@ -15,6 +15,7 @@ fi
 
 echo "--- go build ./... ---"
 go build ./... || mark "编译失败"
+./scripts/check-deps.sh || mark "依赖方向违规"
 
 echo "--- go vet ./... ---"
 go vet ./... || mark "vet 失败"

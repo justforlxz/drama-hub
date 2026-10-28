@@ -1,0 +1,29 @@
+name: ci
+
+# 本仓库为私有免费账号：分支保护 / rulesets 不可用（GitHub 403），
+# 因此这里是「检出 + 报告」，不构成合并阻断。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ENGINE=docker ./scripts/ci.sh --lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ENGINE=docker ./scripts/ci.sh --test

@@ -50,6 +50,29 @@ RUN set -eux; \
       go test -c -race -o "/out/tests/$rel/pkg.test" "$pkg"; \
     done
 
+# ---------------------------------------------------------------- lint
+# 只装工具链与 staticcheck，不带 ffmpeg：lint 不需要它，独立段让构建更快。
+# staticcheck 版本与 go 一起锁在 env.lock —— 版本错配会让检查结果不稳定
+# （2025.1.1 在 go1.27 上直接崩，实测）。
+FROM ${GOIMG} AS lint
+
+ARG STATICCHECK_VERSION=0.8.2
+# 本机与容器都访问不到 proxy.golang.org（实测超时），必须显式指定镜像源。
+ARG GOPROXY=https://goproxy.cn,direct
+
+ENV GOFLAGS=-trimpath GOPROXY=${GOPROXY}
+RUN go install honnef.co/go/tools/cmd/staticcheck@v${STATICCHECK_VERSION} \
+ && mv "$(go env GOPATH)/bin/staticcheck" /usr/local/bin/staticcheck
+
+# 源码是只读挂载：go build / staticcheck 要写缓存，写不进就假失败（实测过）。
+ENV PATH=/usr/local/bin:$PATH \
+    GOCACHE=/tmp/go-build \
+    GOTMPDIR=/tmp \
+    STATICCHECK_CACHE=/tmp/staticcheck-cache
+
+WORKDIR /src
+ENTRYPOINT ["/bin/sh"]
+
 # ---------------------------------------------------------------- runtime
 # 唯一的 ffmpeg 真值来源。
 FROM ${BASE} AS runtime

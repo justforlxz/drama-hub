@@ -71,6 +71,19 @@ ffmpeg 并发上限固定为 `NumCPU`，不做成可调项（见 `internal/segme
 
 ## 代码组织
 
+依赖方向单向：内部 import 仅允许 `rank(importer) > rank(importee)`；同级、反向、
+未登记包一律失败，由 `scripts/check-deps.sh` 强制（`make lint` / `ci-lint.sh` 接入）。
+新增包必须注册到 `scripts/check-deps.sh`。
+
+| rank | 包 | 允许 import 的内部包 |
+|---|---|---|
+| 60 | `cmd/drama-hub` | 全部 internal |
+| 50 | `internal/web` | 45 / 40 / 30 / 20 / 10 |
+| 40 | `internal/webdav`、`internal/stream`、`internal/segment` | 30 / 20 / 10 |
+| 30 | `internal/provider`、`internal/vfs` | 20 / 10 |
+| 20 | `internal/cache` | 10 |
+| 10 | `internal/store` | 无 |
+
 - 一个文件一个关注点，超过 500 行先考虑拆分。
 - 接口定义在消费方，只声明用到的方法；不预建「为将来准备」的接口。
 - 构造函数注入依赖：`NewServer(store, settings, logger)`；不用全局单例、不用 `init()` 注册。

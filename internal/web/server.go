@@ -1,6 +1,3 @@
-// Package web 提供管理界面与 API 的 HTTP 入口。
-//
-// 依赖通过构造函数注入；本包不持有全局状态。
 package web
 
 import (

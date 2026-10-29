@@ -1,7 +1,6 @@
 package web
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -24,23 +23,16 @@ func TestTestdataRelativePathWorks(t *testing.T) {
 	}
 }
 
-// TestServer_Healthz_ReturnsOK 覆盖健康检查端点的响应契约。
-func TestServer_Healthz_ReturnsOK(t *testing.T) {
+// TestServer_UnimplementedSubtree 锁定占位语义：管理 API 整棵子树（含更深子路径）
+// 一律 501。healthz 属装配面已迁到 cmd，本包不重复覆盖。
+func TestServer_UnimplementedSubtree(t *testing.T) {
 	srv := NewServer(slog.New(slog.DiscardHandler))
 
-	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("状态码 = %d, 期望 %d", rec.Code, http.StatusOK)
-	}
-	var body struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("响应不是合法 JSON: %v", err)
-	}
-	if body.Status != "ok" {
-		t.Errorf("status = %q, 期望 %q", body.Status, "ok")
+	for _, path := range []string{"/api/", "/api/x", "/api/x/y"} {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotImplemented {
+			t.Errorf("GET %s 状态码 = %d, 期望 %d", path, rec.Code, http.StatusNotImplemented)
+		}
 	}
 }

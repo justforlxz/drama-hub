@@ -1,0 +1,265 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"strconv"
+	"time"
+)
+
+// settings 表的哨兵错误。调用方用 errors.Is 判断，不比较错误字符串。
+var (
+	// ErrUnknownSetting 表示 key 不在注册表里。读写都会返回它。
+	ErrUnknownSetting = errors.New("未知的配置项")
+	// ErrInvalidSetting 表示值未通过校验（解析失败、越界、类型不符），此时不落库。
+	ErrInvalidSetting = errors.New("非法的配置值")
+	// ErrSettingMissing 表示必填项在库中不存在。
+	ErrSettingMissing = errors.New("必填配置项缺失")
+)
+
+// SettingKey 是 settings 表的键。
+//
+// 注册表只认这里列出的 7 个 key（真值见 docs/DEV-STANDARDS.md「配置」表）。
+// 缓存上限与 LRU 天数由缓存代理负责（ADR-0004），不属于本服务配置。
+type SettingKey string
+
+// settings 表的 key 常量。
+const (
+	KeyStrmPrefix   SettingKey = "strm_prefix"
+	KeyStreamSecret SettingKey = "stream_secret"
+	KeySegTargetSec SettingKey = "seg_target_sec"
+	KeySegPrefetch  SettingKey = "seg_prefetch"
+	KeyPinDays      SettingKey = "pin_days"
+	KeyWebDAVUser   SettingKey = "webdav_user"
+	KeyWebDAVPass   SettingKey = "webdav_pass"
+)
+
+// minSecretBytes 是出流签名密钥的最小字节数（ADR-0003 的 HMAC 密钥）。
+const minSecretBytes = 32
+
+// settingsDDL 是 settings 表的唯一 DDL。
+//
+// F3 的 migrations/0001_init.sql 必须写入同一份 DDL（保留 IF NOT EXISTS），
+// 两处幂等共存；改一处必须同步改另一处。
+const settingsDDL = `
+CREATE TABLE IF NOT EXISTS settings (
+	key        TEXT PRIMARY KEY,
+	value_json TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+)`
+
+// EnsureSettings 建 settings 表，可重复调用。
+//
+// 幂等：DDL 带 IF NOT EXISTS，重复执行不报错、不丢数据。
+func EnsureSettings(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, settingsDDL); err != nil {
+		return fmt.Errorf("建 settings 表: %w", err)
+	}
+	return nil
+}
+
+// Settings 是 settings 表的读写入口。
+//
+// 不缓存：每次读都查库，保证「改值后下一次读取立即生效」（AGENTS.md 硬约束 5）。
+type Settings struct {
+	db *sql.DB
+}
+
+// NewSettings 构造 Settings。
+func NewSettings(db *sql.DB) *Settings {
+	return &Settings{db: db}
+}
+
+// Set 校验并写入一个配置项。
+//
+// 校验失败返回 ErrInvalidSetting 且不写库；key 未注册返回 ErrUnknownSetting。
+// 写成功时 updated_at 更新为当前 UTC RFC3339 时间。
+func (s *Settings) Set(ctx context.Context, key SettingKey, raw string) error {
+	value, err := parseSetting(key, raw)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("编码配置 %s: %w", key, err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE
+		 SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+		string(key), string(encoded), time.Now().UTC().Format(time.RFC3339),
+	); err != nil {
+		return fmt.Errorf("写入配置 %s: %w", key, err)
+	}
+	return nil
+}
+
+// String 读取一个字符串配置项。
+//
+// 库中无行时取默认值（如 strm_prefix 的 ""）；必填项无行返回 ErrSettingMissing；
+// key 未注册返回 ErrUnknownSetting；整型 key 用本方法读返回 ErrInvalidSetting。
+func (s *Settings) String(ctx context.Context, key SettingKey) (string, error) {
+	value, err := s.value(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	str, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%w: %s 是整型配置，用 Int 读取", ErrInvalidSetting, key)
+	}
+	return str, nil
+}
+
+// Int 读取一个整型配置项。
+//
+// 无行时取默认值；必填项无行返回 ErrSettingMissing；key 未注册返回 ErrUnknownSetting；
+// 字符串 key 用本方法读返回 ErrInvalidSetting。
+func (s *Settings) Int(ctx context.Context, key SettingKey) (int, error) {
+	value, err := s.value(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	n, ok := value.(int)
+	if !ok {
+		return 0, fmt.Errorf("%w: %s 是字符串配置，用 String 读取", ErrInvalidSetting, key)
+	}
+	return n, nil
+}
+
+// value 读取 key 的类型化值：库中有行则 JSON 解码，无行则取默认值或报缺。
+func (s *Settings) value(ctx context.Context, key SettingKey) (any, error) {
+	spec, ok := specFor(key)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownSetting, key)
+	}
+	encoded, found, err := s.load(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		if spec.required {
+			return nil, fmt.Errorf("%w: %s", ErrSettingMissing, key)
+		}
+		// 默认值走同一条校验路径，注册表里写错默认值会在这里暴露。
+		return parseSetting(key, spec.def)
+	}
+	switch spec.kind {
+	case kindInt:
+		var n int
+		if err := json.Unmarshal([]byte(encoded), &n); err != nil {
+			return nil, fmt.Errorf("解码配置 %s: %w", key, err)
+		}
+		return n, nil
+	default: // 其余 kind 都存 JSON 字符串
+		var str string
+		if err := json.Unmarshal([]byte(encoded), &str); err != nil {
+			return nil, fmt.Errorf("解码配置 %s: %w", key, err)
+		}
+		return str, nil
+	}
+}
+
+// load 读 key 的已编码值。found 为 false 表示库中无该行。
+func (s *Settings) load(ctx context.Context, key SettingKey) (encoded string, found bool, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT value_json FROM settings WHERE key = ?`, string(key)).Scan(&encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("读取配置 %s: %w", key, err)
+	}
+	return encoded, true, nil
+}
+
+// settingKind 决定校验与 JSON 编码方式。
+type settingKind int
+
+const (
+	kindString settingKind = iota // 非空字符串（必填项）
+	kindURL                       // 空，或带 scheme 的绝对 URL
+	kindSecret                    // 至少 minSecretBytes 字节
+	kindInt                       // [min, max] 闭区间整数
+)
+
+// settingSpec 是一个 key 的注册表条目。
+//
+// required 为 false 时 def 是默认值的原始文本，读取时会过 parseSetting；
+// required 为 true 时 def 无意义。
+type settingSpec struct {
+	kind     settingKind
+	required bool
+	def      string
+	min, max int
+}
+
+// specFor 返回 key 的注册表条目。switch 返回值而非包级 map：
+// 无包级可变状态，调用方拿到副本。
+func specFor(key SettingKey) (settingSpec, bool) {
+	switch key {
+	case KeyStrmPrefix:
+		return settingSpec{kind: kindURL}, true
+	case KeyStreamSecret:
+		return settingSpec{kind: kindSecret, required: true}, true
+	case KeySegTargetSec:
+		return settingSpec{kind: kindInt, def: "10", min: 4, max: 30}, true
+	case KeySegPrefetch:
+		return settingSpec{kind: kindInt, def: "2", min: 0, max: 10}, true
+	case KeyPinDays:
+		return settingSpec{kind: kindInt, def: "7", min: 0, max: 90}, true
+	case KeyWebDAVUser:
+		return settingSpec{kind: kindString, required: true}, true
+	case KeyWebDAVPass:
+		return settingSpec{kind: kindString, required: true}, true
+	}
+	return settingSpec{}, false
+}
+
+// parseSetting 校验并规范化 raw，返回可 JSON 编码的类型化值（string 或 int）。
+//
+// 纯函数：不碰数据库、不碰文件，可直接单测。
+func parseSetting(key SettingKey, raw string) (any, error) {
+	spec, ok := specFor(key)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownSetting, key)
+	}
+	switch spec.kind {
+	case kindURL:
+		if raw == "" {
+			return "", nil
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s 不是合法 URL: %v", ErrInvalidSetting, key, err)
+		}
+		if !u.IsAbs() {
+			return nil, fmt.Errorf("%w: %s 必须是带 scheme 的绝对 URL", ErrInvalidSetting, key)
+		}
+		return raw, nil
+	case kindSecret:
+		if len(raw) < minSecretBytes {
+			return nil, fmt.Errorf("%w: %s 至少 %d 字节，实际 %d", ErrInvalidSetting, key, minSecretBytes, len(raw))
+		}
+		return raw, nil
+	case kindString:
+		if raw == "" {
+			return nil, fmt.Errorf("%w: %s 不能为空", ErrInvalidSetting, key)
+		}
+		return raw, nil
+	case kindInt:
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s 不是整数: %q", ErrInvalidSetting, key, raw)
+		}
+		if n < spec.min || n > spec.max {
+			return nil, fmt.Errorf("%w: %s 必须在 %d–%d 之间，实际 %d", ErrInvalidSetting, key, spec.min, spec.max, n)
+		}
+		return n, nil
+	default:
+		return nil, fmt.Errorf("%w: %s 的类型未实现", ErrInvalidSetting, key)
+	}
+}

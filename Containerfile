@@ -21,6 +21,10 @@ RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /src
 
+# 本机与容器都访问不到 proxy.golang.org（实测超时），必须显式指定镜像源。
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
+
 # 依赖层单独缓存：go.mod/go.sum 不变时无需重下模块。
 COPY go.mod go.sum* ./
 RUN go mod download
@@ -59,6 +63,13 @@ FROM ${GOIMG} AS lint
 ARG STATICCHECK_VERSION=0.8.2
 # 本机与容器都访问不到 proxy.golang.org（实测超时），必须显式指定镜像源。
 ARG GOPROXY=https://goproxy.cn,direct
+
+# 依赖层与 build 段同理：go.mod/go.sum 不变时无需重下模块。
+# 源码是运行期只读挂载，模块缓存必须在镜像构建期落进 /go/pkg/mod，
+# 否则 --network=none 下 go build / go vet / staticcheck 解析不了依赖。
+WORKDIR /src
+COPY go.mod go.sum* ./
+RUN go mod download
 
 ENV GOFLAGS=-trimpath GOPROXY=${GOPROXY}
 RUN go install honnef.co/go/tools/cmd/staticcheck@v${STATICCHECK_VERSION} \

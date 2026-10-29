@@ -34,6 +34,9 @@ curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}
 curl -i http://127.0.0.1:8080/dav/      # 501
 ```
 
+每个请求输出一条结构化访问日志（`method` / `path` / `status` / `duration_ms`，见
+`internal/httpx`）；出流路径里的签名 token 段被掩码为 `{token}`，query 不进日志。
+错误响应统一为 `{"code":"<kind>","message":"..."}`（404/400/502/503，其余 500）。
 
 需要的运行环境：`ffmpeg`、`ffprobe` 在 `PATH` 里。
 

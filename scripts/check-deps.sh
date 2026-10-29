@@ -14,6 +14,7 @@ internal/stream 40
 internal/segment 40
 internal/provider 30
 internal/vfs 30
+internal/httpx 30
 internal/cache 20
 internal/store 10"
 
@@ -81,7 +82,7 @@ check_line() {
     done
 }
 
-# 内置 fixture：合法边 2、反向 1、同级 1、未登记 1、外部 1 —— 恰 3 条违规。
+# 内置 fixture：合法边 2、反向 2、同级 1、未登记 0、外部 1 —— 恰 3 条违规。
 # 输入格式与 go list 实际输出一致（完整 import path）。
 self_test() {
     # 先钉住字段选择：GOLIST_FMT 必须同时含 .Imports / .TestImports / .XTestImports。
@@ -105,6 +106,8 @@ self_test() {
     check_line "$m/internal/provider $m/internal/cache"
     check_line "$m/internal/store $m/internal/web"
     check_line "$m/internal/vfs $m/internal/provider"
+    # 注册 httpx(rank 30) 后，这条边由「未登记」变「反向」（cache rank 20 → httpx 30），
+    # 违规数仍为 3，自测语义不变。
     check_line "$m/internal/cache $m/internal/httpx"
     check_line "$m/internal/store github.com/other/module"
     got=$(wc -l <"$OUT" | tr -d ' ')

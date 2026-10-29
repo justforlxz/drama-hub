@@ -27,6 +27,25 @@
 - `panic` 只允许出现在 `main` 的启动装配阶段；请求路径里任何 panic 视为缺陷（recover 中间件只做兜底 + 记录，不吞掉不记录）。
 - 出站 HTTP 一律 `http.Client{Timeout: ...}` 或 `ctx` 超时；没有超时的出站调用视为缺陷。
 
+### HTTP 边界：错误类别与统一响应
+
+`internal/httpx` 定义**传输层错误类别**，边界包（`web` / `stream` / `webdav`）在返回前用
+`fmt.Errorf("%w: 详情", httpx.ErrXxx)` 打标；domain 包保留自己的包内哨兵，**不** import
+`internal/httpx`。映射由 `httpx.StatusCode`（`errors.Is` 判定，支持 `%w` 包装，未命中 → 500）：
+
+| 哨兵 | 状态码 | 响应体 `code` |
+|---|---|---|
+| `httpx.ErrNotFound` | 404 | `not_found` |
+| `httpx.ErrInvalid` | 400 | `invalid` |
+| `httpx.ErrUpstream` | 502 | `upstream` |
+| `httpx.ErrUnavailable` | 503 | `unavailable` |
+| 其它错误 | 500 | `internal` |
+
+边界 handler 用 `httpx.WriteError(w, err)` 统一写出：`Content-Type:
+application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<err.Error()>"}`。
+`WriteError` **不写日志**（每请求一条访问日志归 `httpx.RequestLogger`，否则失败请求会出现
+两条日志），错误详情只进响应体 —— 因此**错误文本里不得带 token / 密码**。
+
 ## 上下文与并发
 
 - `context.Context` 作为第一个参数贯穿到所有 I/O（DB、HTTP、exec）。
@@ -69,6 +88,27 @@ ffmpeg 并发上限固定为 `NumCPU`，不做成可调项（见 `internal/segme
 - **禁止记录**：完整带签名的播放直链、token 明文、WebDAV 密码。需要定位时记 `vid` + `host` + 路径前 32 字符。
 - 每个请求一条入口日志（方法、路径、状态、耗时），出站上游一条（源、状态、字节数）。
 
+### 请求访问日志中间件
+
+`httpx.RequestLogger(logger, next)` 在**装配根**（`cmd` 的 `newHandler`）挂**一次**，每请求
+**恰一条** slog 记录，字段固定：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `method` | string | `r.Method` |
+| `path` | string | `r.URL.Path` 经 `httpx.redactPath` 掩码 |
+| `status` | int | 响应状态码（未显式 `WriteHeader` 时 200）|
+| `duration_ms` | int | 处理耗时（毫秒）|
+
+级别按状态：5xx → Error，4xx → Warn，其余 Info。
+
+**掩码规则**：出流路径形的 token 在路径段里（ADR-0003：`/s/{token}/e/{uid}`、
+`/s/{token}/seg/{uid}/{seq}.ts`，cache-key 稳定性要求它可见），因此以 `/s/` 开头的路径，
+把紧随其后的一段替换为 `{token}`（`/s/SECRET/e/42` → `/s/{token}/e/42`）。日志只记
+`r.URL.Path`，天然不含 query，`?token=…` 这类参数不会落盘。
+
+中间件只允许挂一次：在 `web` / `stream` / `webdav` 内再挂一层会让同一请求产生两条日志。
+
 ## 代码组织
 
 依赖方向单向：内部 import 仅允许 `rank(importer) > rank(importee)`；同级、反向、
@@ -80,9 +120,12 @@ ffmpeg 并发上限固定为 `NumCPU`，不做成可调项（见 `internal/segme
 | 60 | `cmd/drama-hub` | 全部 internal |
 | 50 | `internal/web` | 45 / 40 / 30 / 20 / 10 |
 | 40 | `internal/webdav`、`internal/stream`、`internal/segment` | 30 / 20 / 10 |
-| 30 | `internal/provider`、`internal/vfs` | 20 / 10 |
+| 30 | `internal/provider`、`internal/vfs`、`internal/httpx` | 20 / 10 |
 | 20 | `internal/cache` | 10 |
 | 10 | `internal/store` | 无 |
+
+`internal/httpx` 是 HTTP 边界的横切层：只依赖标准库、不 import 任何 internal 包；
+与它同 rank 30 的 `provider` / `vfs` 互不 import —— 上游/虚拟层不做 HTTP 状态分类。
 
 - 一个文件一个关注点，超过 500 行先考虑拆分。
 - 接口定义在消费方，只声明用到的方法；不预建「为将来准备」的接口。

@@ -26,7 +26,8 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
 | `/dav/` 及全部子路径 | 任意 | 501 | 只读 WebDAV 挂载点，后续接入 |
 | `/s/{token}/e/{uid}` | GET / HEAD | 200/206/416 | 单集 MP4 出流：HMAC 签名 + Range 透传 |
-| `/s/` 其余子路径 | 任意 | 501 | 分片与合并集属后续阶段 |
+| `/s/{token}/seg/{uid}/{seq}.ts` | GET | 200/404/502/503 | 单集分片：现转封装 MPEG-TS，索引未就绪 503 |
+| `/s/` 其余子路径 | 任意 | 501 | 合并集与播放列表属后续阶段（M7） |
 | `/api/` 及全部子路径 | 任意 | 501 | 管理 API，后续接入 |
 | 其它路径（含 `/`） | 任意 | 404 | 未装配；管理界面属后续阶段 |
 
@@ -34,6 +35,12 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 "stream:"+uid) )`，secret 取 `settings.stream_secret`。错误签名 → 401；uid 非法或
 不存在 → 404；`play_url` 为空或上游失败 → 502。`Range` 原样透传到上游，206/416
 由上游判定后透传回。
+
+分片端点同样按该 token 鉴权。分片索引由 `internal/segment` 用 `ffprobe
+-skip_frame nokey` 预扫源、把切点对齐到关键帧后写入 `segment` 表（未索引 → 503 +
+`Retry-After`）；切片走 `ffmpeg -ss <切点> -t <片长> -c copy -f mpegts`，单片
+返回 `video/mp2t` 并带 `Cache-Control: public, max-age=86400`。ffmpeg 失败 → 502，
+失败结果不落库、不缓存。
 
 ```bash
 curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}

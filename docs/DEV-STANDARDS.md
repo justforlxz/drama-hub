@@ -51,7 +51,7 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 - `context.Context` 作为第一个参数贯穿到所有 I/O（DB、HTTP、exec）。
 - 每个 goroutine 必须有明确的 owner 与退出条件；不接受没有 `cancel` 的长期 goroutine。
-- ffmpeg 调用统一过 `internal/segment` 的并发闸：默认 `min(4, NumCPU/2)`，可通过 `settings.ffmpeg_concurrency` 调整。超过上限的请求排队，不丢弃。
+- ffmpeg/ffprobe 调用统一过 `internal/segment` 的并发闸：`min(4, max(1, NumCPU/2))`，固定值不可调（见 `internal/segment` 的闸注释）。超过上限的请求排队，不丢弃。
 - 共享可变状态用 `sync.Mutex` 或 channel 二选一，不混用；禁止包级可变变量。
 
 ## 数据库
@@ -63,7 +63,8 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 - 时间统一存 UTC 的 RFC3339 文本；展示时区转换在 Web 层做。
 - store 用哨兵错误表达结果：查询/删除无行返回 `ErrNotFound`，唯一/主键约束冲突由 `wrapWriteErr` 统一映射为 `ErrConflict`（均可 `errors.Is` 判断），不向调用方泄漏裸 `*sqlite.Error`。
 - `drama` / `episode` 的写入一律 upsert：`drama` 以 `(provider, provider_id)`、`episode` 以 `(drama_id, ep_no)` 为幂等身份，冲突时只更新可变业务列，身份列与入参 `id` 被忽略，返回行 id。
-- 删剧走 `drama → episode` 的 `ON DELETE CASCADE` 连带删集（依赖 `foreign_keys=ON`，由 `Open` 的 DSN 施加），不影响其它剧目。
+- 删剧走 `drama → episode` 的 `ON DELETE CASCADE` 连带删集（依赖 `foreign_keys=ON`，由 `Open` 的 DSN 施加），不影响其它剧目；`segment` 经 `episode` 级联一并删除。
+- `segment` 表是「每集的分片索引」，由 `internal/segment` 索引任务整体重建：`ReplaceSegments` 一事务内先删后插（重复索引幂等、失败整体回滚），`ListSegments` 按 `start_sec` 升序（即片内序）；无行返回空切片而非 `ErrNotFound`（「还没索引」是正常状态，由分片端点按 503 处理）。
 - 跨行写入用 `Store.InTx`：同一事务内执行、失败整体回滚。事务内 `Store` 复用同一批读写方法；取数/网络请求必须在事务之外完成（SQLite 单写者，长事务持锁）。
 
 ## 配置
@@ -83,7 +84,7 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 **不属于本服务运行配置**（由缓存代理负责，见 ADR-0004）：缓存上限、LRU 天数。
 它们只在 WebUI/文档生成 rclone 配置建议值时出现。**本服务不实现任何缓存淘汰**。
-ffmpeg 并发上限固定为 `NumCPU`，不做成可调项（见 `internal/segment` 的并发闸）。
+ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（见 `internal/segment` 的闸注释）。
 
 新增参数必须同 PR 更新上表，并在 `settings` 里给默认值 + 范围校验。写非法值返回 400，不静默纠正。
 
@@ -94,7 +95,8 @@ ffmpeg 并发上限固定为 `NumCPU`，不做成可调项（见 `internal/segme
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/s/{token}/e/{uid}` | GET / HEAD | 单集 MP4 字节中继，Range 透传 |
-| `/s/` 子树其余路径 | 任意 | 501（分片属 M6、合并集属 M7） |
+| `/s/{token}/seg/{uid}/{seq}.ts` | GET | 单集分片：MPEG-TS，`Cache-Control: public, max-age=86400`（M6） |
+| `/s/` 子树其余路径 | 任意 | 501（合并集属 M7） |
 
 `GET` 路由模式同时匹配 `HEAD`（Go 1.22 ServeMux 行为），不单独注册；`HEAD` 与
 `GET` 对同一 URL 的上游响应必须给出同一 `Content-Length`，且 `HEAD` 不读上游 body。
@@ -172,6 +174,45 @@ secret 取 `settings.stream_secret`，**每请求读一次不缓存**（硬约�
 
 上游在 body 传输**中途**失败时响应头已发出，无法改写成 502，客户端看到截断。
 不为此引入全量缓冲（缓冲整集字节是错误设计）。
+
+## 分片（segment）
+
+模块 `internal/segment`，装配在 `/s/` 子树下：`segment.Cutter` 用比 `/s/` 更具体的
+pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `<seq>.ts`
+（seq 从 0 起、允许前导零；缓存代理按整串 URL 做 key，本服务不改写）。签名校验用
+装配根注入的 `stream.Verify`（segment 与 stream 同 rank 40，不能互相 import）。
+
+### 关键帧索引
+
+`Cutter.Index(episodeID)` 用 `ffprobe -skip_frame nokey` 预扫源，把切点按目标时长
+对齐到关键帧后整体写入 `segment` 表：
+
+- **切点规则**：首片从 0 起；之后每个切点取第一个 `>= 当前切点 + seg_target_sec`
+  的关键帧。切点都落在关键帧上，`-c copy` 切片内部才不会漂移（实测「目标 10s
+  实际 10.66s」就是这条规则）。
+- **总时长**：Σ `dur` == 源时长（±一帧）。`Timeline` 把有序的各集分片拼成连续
+  seq 空间，`seq → (集号, 集内秒)` 供合并集（M7）O(1) 定位。
+- **幂等与失败**：`ReplaceSegments` 一事务内先删后插，重复索引幂等；探测或切片
+  失败**不写库、不缓存失败结果**（库里保留旧索引或保持为空）。
+- **触发点**：索引不在请求路径上自动触发（ADR-0001：索引缺失一律 503）。调用
+  `Cutter.Index` 的任务属 M7（合并编排）与 R1（管理面）。
+
+### 分片端点状态码矩阵
+
+| 情形 | 响应 |
+|---|---|
+| 正常切片 | 200 + `Content-Type: video/mp2t` + `Content-Length` + `Cache-Control` |
+| 签名不匹配 | 401（`httpx.ErrUnauthorized`） |
+| uid 非法 / 剧集不存在 / seq 越界 / 文件名非法 | 404（`httpx.ErrNotFound`） |
+| `play_url` 为空、ffprobe/ffmpeg 失败 | 502（`httpx.ErrUpstream`），不缓存失败结果 |
+| 索引未就绪（`segment` 表无该集行） | 503 + `Retry-After: 5`（`httpx.ErrUnavailable`），不出半截流 |
+
+- 切片把完整 TS 字节收进内存再写响应（单片 10s 约 2–5 MB，DESIGN §2），ffmpeg
+  中途失败时客户端看到干净的 502 而非截断流。
+- ffmpeg/ffprobe 一律带硬超时（`timeoutProbe=30s` / `timeoutCut=60s`）；stderr 尾部
+  只进日志，不落响应体；日志只记源 host，不落完整直链（可能带签名）。
+- 并发闸：ffmpeg/ffprobe 调用排队过 `min(4, max(1, NumCPU/2))` 的闸，超出的请求
+  排队不丢弃；客户端断开时放弃排队并结束请求。
 
 ## 日志
 

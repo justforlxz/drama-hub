@@ -37,6 +37,7 @@
 |---|---|---|
 | `httpx.ErrNotFound` | 404 | `not_found` |
 | `httpx.ErrInvalid` | 400 | `invalid` |
+| `httpx.ErrUnauthorized` | 401 | `unauthorized` |
 | `httpx.ErrUpstream` | 502 | `upstream` |
 | `httpx.ErrUnavailable` | 503 | `unavailable` |
 | 其它错误 | 500 | `internal` |
@@ -84,6 +85,90 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 ffmpeg 并发上限固定为 `NumCPU`，不做成可调项（见 `internal/segment` 的并发闸）。
 
 新增参数必须同 PR 更新上表，并在 `settings` 里给默认值 + 范围校验。写非法值返回 400，不静默纠正。
+
+## 出流（stream）
+
+模块 `internal/stream`，装配在 `/s/` 前缀下。本阶段只有一个端点：
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/s/{token}/e/{uid}` | GET / HEAD | 单集 MP4 字节中继，Range 透传 |
+| `/s/` 子树其余路径 | 任意 | 501（分片属 M6、合并集属 M7） |
+
+`GET` 路由模式同时匹配 `HEAD`（Go 1.22 ServeMux 行为），不单独注册；`HEAD` 与
+`GET` 对同一 URL 的上游响应必须给出同一 `Content-Length`，且 `HEAD` 不读上游 body。
+
+### uid 规则
+
+`uid = "e" + strconv.FormatInt(episode.id, 10)`（如 `e42`）。
+
+- 派生自**稳定的** `episode.id`（M1 的 upsert 保证同 id），不读 `emby_item`：那是
+  幂等重建的派生表，id 可能在重建中变化，而签名 URL 的缓存键必须长期稳定。
+- `e` 前缀把单集与合并集的 uid 空间分开（DESIGN D3）。**合并集 uid 不得匹配
+  `^e[0-9]+$`。**
+- 不匹配 `^e[0-9]+$`、超出 int64、或库中无该行 → 404。
+
+uid 只是出流 URL 的句柄，与硬约束 6（对外集号只由 `emby_item` 决定）无关；
+本模块不读、不写 `emby_item`。
+
+### 鉴权
+
+```
+token = base64url_nopad( HMAC-SHA256( secret, "stream:" + uid ) )
+```
+
+`stream.Sign` / `stream.Verify` 按 ADR-0003 逐字节实现，编码固定
+`base64.RawURLEncoding`（43 字符、无 `=`），比较用 `crypto/hmac.Equal`。
+secret 取 `settings.stream_secret`，**每请求读一次不缓存**（硬约束 5：改完即时
+生效；换 secret 后旧 URL 立即失效，是 ADR-0003 的既定后果）。无过期、无状态、
+无 token 表。
+
+### 状态码矩阵
+
+| 情形 | 响应 |
+|---|---|
+| 上游 200 | 200 + `Content-Length` + `Content-Type` + `Accept-Ranges`，body 透传 |
+| 上游 206 | 206 + 上述 + `Content-Range`，body 透传 |
+| 上游 416 | 416 原样透传（含上游的 `Content-Range`，若给了） |
+| 上游其它 4xx / 5xx（含 403、404） | 502（`httpx.ErrUpstream`），**不转发上游 body** |
+| 传输错误 / 超时 | 502 |
+| secret 读失败 | 500（响应体与日志都不含 secret） |
+| 签名不匹配 | 401（`httpx.ErrUnauthorized`） |
+| uid 非法 / 剧集不存在 | 404（`httpx.ErrNotFound`） |
+| `play_url` 为空 | 502（`httpx.ErrUpstream`） |
+| 客户端断开（ctx 取消） | 不写响应，仅记日志 |
+
+- **Range 纯透传，不在本地合成 206 / 416**：两者都由上游判定（实测红果 CDN
+  都正确）。请求的 `Range` 头原样转发给上游。
+- **不做 302**（硬约束 7）：Go 默认 client 在内部跟随上游重定向（≤10 次）并
+  保留 `Range`；任何 3xx 都不会发给客户端。
+- 回传给客户端的头**只有** `Content-Type`、`Content-Length`、`Content-Range`、
+  `Accept-Ranges`；其余上游头一律丢弃。
+- **先拿到上游响应并定下状态码，再写任何客户端字节**：所有上游失败都产出干净的
+  502，不会先写 200 再失败。
+
+### 出站客户端
+
+```go
+&http.Client{Transport: &http.Transport{
+    DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+    ResponseHeaderTimeout: 15 * time.Second,
+    DisableCompression:    true,
+}}
+```
+
+- **`DisableCompression: true` 是硬要求**：Go 默认 Transport 会给无 `Range` 的
+  GET 自动加 `Accept-Encoding: gzip` 并透明解压，把响应里的 `Content-Length`
+  抹掉 → 「长度精确」直接失效（本地 httptest 对照实验实测）。
+- **禁止 `Client.Timeout`**：那是对整个响应体（含长视频）计时，会截断大文件。
+  连不上 / 不回头由 `DialContext` 与 `ResponseHeaderTimeout` 覆盖，body 传输交给
+  请求 ctx（客户端断开即取消），仍满足「出站 HTTP 一律带 timeout 或 ctx 超时」。
+- 客户端实例挂在 `Server` 字段上，禁止包级可变变量。
+
+### 已知边界
+
+上游在 body 传输**中途**失败时响应头已发出，无法改写成 502，客户端看到截断。
+不为此引入全量缓冲（缓冲整集字节是错误设计）。
 
 ## 日志
 

@@ -224,3 +224,65 @@ func TestHandler_StreamEpisode(t *testing.T) {
 		t.Errorf("GET /s/x 状态码 = %d, 期望 %d", rec.Code, http.StatusNotImplemented)
 	}
 }
+
+// TestHandler_SegmentRoute 覆盖 M6 的装配：分片端点挂在 `/s/` 子树下、比
+// stream.Server 的 `/s/` 更具体，因此命中切片 handler（不是 501）；`/s/` 其余
+// 路径仍是 501。签名校验用 cmd 注入的 stream.Verify，所以错 token → 401。
+func TestHandler_SegmentRoute(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "seg.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	if err := settings.Set(context.Background(), store.KeyStreamSecret, secret); err != nil {
+		t.Fatalf("Set stream_secret: %v", err)
+	}
+	buf := &bytes.Buffer{}
+	h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), st, settings)
+
+	// 正确签名 + 库中不存在的集：走到 handler 后是 404，而不是 501 兜底。
+	uid := "e999"
+	token := stream.Sign([]byte(secret), uid)
+	rec := serve(t, h, http.MethodGet, "/s/"+token+"/seg/"+uid+"/0.ts")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("分片端点状态码 = %d, 期望 404（501 说明装配没接上）", rec.Code)
+	}
+
+	// 错签名 → 401（证明校验用的是注入的 stream.Verify）。
+	rec = serve(t, h, http.MethodGet, "/s/bogus/seg/"+uid+"/0.ts")
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("错 token 状态码 = %d, 期望 401", rec.Code)
+	}
+
+	// `/s/` 其余子路径仍 501（M5 语义不回归）。
+	if rec = serve(t, h, http.MethodGet, "/s/x"); rec.Code != http.StatusNotImplemented {
+		t.Errorf("GET /s/x 状态码 = %d, 期望 501", rec.Code)
+	}
+
+	// 访问日志：分片路径的 token 段被掩码，且日志里不出现 token 明文。
+	var sawSeg bool
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var entry struct {
+			Msg  string `json:"msg"`
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("日志不是合法 JSON: %v（line=%q）", err, line)
+		}
+		if entry.Msg == "http request" && strings.Contains(entry.Path, "/seg/") {
+			sawSeg = true
+			if want := "/s/{token}/seg/" + uid + "/0.ts"; entry.Path != want {
+				t.Errorf("分片日志 path = %q, 期望 %q", entry.Path, want)
+			}
+		}
+	}
+	if !sawSeg {
+		t.Error("没有看到分片请求的访问日志")
+	}
+	if strings.Contains(buf.String(), token) {
+		t.Error("日志里出现 token 明文")
+	}
+}

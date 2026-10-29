@@ -4,8 +4,8 @@
 // rank 40/50/60 的包可 import 本包；与同为 30 的 vfs 同级、互不 import。
 // 规则见 docs/DEV-STANDARDS.md「代码组织」，由 scripts/check-deps.sh 强制。
 //
-// 边界：本阶段只提供包骨架与空壳类型，不含任何业务逻辑。
+// 边界：本阶段提供官网 SSR 数据源的元数据同步（SyncSeries）与按需直链解析
+// （FetchDirectURL）。App 接口回退不在这里。官网列表页的 seriesDetail.vid_list
+// 只给出集标识，单集页 SSR 的 contentUrl 是约 10 秒预览片而非整集，因此同步不写
+// episode.play_url，整集字节来源由上层决定（见 docs/DEV-STANDARDS.md「数据源」）。
 package provider
-
-// Source 是本包的中枢类型，代表一个上游数据源。
-type Source struct{}

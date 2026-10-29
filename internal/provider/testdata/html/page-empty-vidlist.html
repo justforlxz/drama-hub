@@ -1,0 +1,13 @@
+<!--
+来源：https://hongguoduanju.com/player/7503745441910017049（2026-10-29 匿名抓取）
+裁剪：只保留 _ROUTER_DATA.loaderData['player_(series_id)/page'] 的 isSuccess / series_id /
+      seriesDetail 相关字段，页面外壳、其余 SSR 载荷与 <script> 属性全部删除；
+      保留真实页面的 ';\nfunction runWindowFn(){…' 尾部，用于验证 json.Decoder 在首个 JSON 值后停止。
+改造：vid_list 为 []。
+覆盖：AC6 的非空校验（空 vid_list → ErrParse）。
+-->
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>红果短剧</title></head><body>
+<script async="" data-script-src="modern-inline">_ROUTER_DATA = {"loaderData":{"player_layout":null,"player_(series_id)\u002Fpage":{"isSuccess":true,"series_id":"7503745441910017049","seriesDetail":{"episode_cnt":76,"accessible_episode_cnt":5,"pay_type":0,"series_id":"7503745441910017049","series_name":"宴律，你的白月光回国了","series_cover":"https://p3-novel.byteimg.com/novel-pic/34ad28f319c9c2b6598792ce2deaaaf8~tplv-shrink:640:0.image","series_intro":"七年前，顾星晚捅伤亲生父亲入狱；五年前，宴矜撑伞在监狱门口等她，却得知她早已出狱。时隔七年重逢，顾星晚望着律界大佬宴矜怔愣，对方却称不认识她，且早已订有婚约。顾星晚选择缄口不言，无人知晓，她曾在狱中为宴矜生下过一个孩子，过往的纠葛与未说出口的秘密，成了她心底最深的牵挂。","first_visible_time":"1747533495","vid_list":[]}}}};
+function runWindowFn(){"use strict";}</script>
+</body></html>

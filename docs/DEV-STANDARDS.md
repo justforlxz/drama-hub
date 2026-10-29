@@ -63,6 +63,7 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 - store 用哨兵错误表达结果：查询/删除无行返回 `ErrNotFound`，唯一/主键约束冲突由 `wrapWriteErr` 统一映射为 `ErrConflict`（均可 `errors.Is` 判断），不向调用方泄漏裸 `*sqlite.Error`。
 - `drama` / `episode` 的写入一律 upsert：`drama` 以 `(provider, provider_id)`、`episode` 以 `(drama_id, ep_no)` 为幂等身份，冲突时只更新可变业务列，身份列与入参 `id` 被忽略，返回行 id。
 - 删剧走 `drama → episode` 的 `ON DELETE CASCADE` 连带删集（依赖 `foreign_keys=ON`，由 `Open` 的 DSN 施加），不影响其它剧目。
+- 跨行写入用 `Store.InTx`：同一事务内执行、失败整体回滚。事务内 `Store` 复用同一批读写方法；取数/网络请求必须在事务之外完成（SQLite 单写者，长事务持锁）。
 
 ## 配置
 
@@ -111,6 +112,33 @@ ffmpeg 并发上限固定为 `NumCPU`，不做成可调项（见 `internal/segme
 `r.URL.Path`，天然不含 query，`?token=…` 这类参数不会落盘。
 
 中间件只允许挂一次：在 `web` / `stream` / `webdav` 内再挂一层会让同一请求产生两条日志。
+
+
+## 数据源（provider）
+
+`internal/provider` 是官网 SSR 数据源（`provider` / `source` 一律写 `"web"`）。两个入口，各自的出站请求数固定：
+
+| 入口 | 上游 | 请求数 | 副作用 |
+|---|---|---|---|
+| `Source.SyncSeries(ctx, st, sid)` | `GET {BaseURL}/player/{sid}` | 1 | 一个事务写 1 部剧 + 全部集 |
+| `Source.FetchDirectURL(ctx, sid, vid)` | `GET {BaseURL}/player/{sid}/{vid}` | 1 | 不写库（读时解析） |
+
+- `BaseURL` 默认 `https://hongguoduanju.com`，是唯一为测试开的缝（`--network=none` 下指向 `httptest.Server`）。空 `*http.Client` → 默认 15s 超时客户端；出站一律带 `ctx` + `Client.Timeout`。
+- 响应体经 `io.LimitReader` 读，上限 4 MiB；超限按 `ErrParse`（页面异常放大，不是可重试的传输错误）。
+- 解析：`_ROUTER_DATA` 后的 JSON 用标准库 `json.Decoder` 从 `{` 起解（不手写括号扫描）；JSON-LD 用 `regexp` 取出 `<script type="application/ld+json">` 块后按 `@type` 过滤。
+- 校验（任一不满足即 `ErrParse`，**不写库**）：`isSuccess` 不为 `false`；页面的 `series_id` 与 `seriesDetail.series_id` 都等于请求 `sid`（被锁集会被上游 302 到别的集/别的剧页面）；`vid_list` 非空、元素全为数字、无重复。JSON-LD 块另做绑定校验：`url` 的 pathname 是 `/player/{sid}` 或 `/player/{sid}/{vid}`，且 `contentUrl` 的 pathname 含 `/{vid}`。
+- `vid_list` 下标即集号（`ep_no = i+1`）。
+- 哨兵：`ErrUpstream`（传输错误 / 非 200 / 空响应体）、`ErrParse`（结构变化 / 身份不符 / 超限）、`ErrNoDirectURL`（VideoObject 在但 `contentUrl` 缺失）。provider 不 import `internal/httpx`，状态码映射由边界包负责。
+
+### `play_url` 留空的契约
+
+**同步不写 `episode.play_url` / `play_url_at`。** 实测（2026-10-29，9 部剧逐一 ffprobe）：列表页 `vid_list` 给全全部集，但单集页 SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **实际时长恒为 10.08 秒**（JSON-LD 却声明整集时长 1m48s–3m38s），第 2..N 集 `contentUrl` 为空字符串、`publicVideoSeo: null`。把预览链写进 `play_url` 等于「整库每集只播 10 秒」，比留空更有害。
+
+因此：同步只保证「剧与集齐全、`vid`/`ep_no` 正确」；`play_url` 为空表示**尚无可用播放源**。真直链按需走 `FetchDirectURL`，由消费者（出流）决定怎么用。整集字节来源属 M5 及之后的范围（见 MKACG-592 的 PL 决策项）。
+
+### 测试
+
+假官网一律是 `httptest.Server`：`Source.BaseURL` 指向它，`sync_at` 用注入时钟（`Source.now`），不依赖真实外网与真实时间。fixture 放 `internal/provider/testdata/html/`，裁剪自真实页面并在文件头注明来源、裁剪日期与覆盖场景。
 
 ## 代码组织
 

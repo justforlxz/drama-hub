@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -48,7 +49,8 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, uid, playURL stri
 	ctx := r.Context()
 	upstreamStatus := 0
 	var written int64
-	defer func() { s.logUpstream(ctx, uid, playURL, upstreamStatus, written) }()
+	var dialErr error
+	defer func() { s.logUpstream(ctx, uid, playURL, upstreamStatus, written, dialErr) }()
 
 	req, err := http.NewRequestWithContext(ctx, r.Method, playURL, nil)
 	if err != nil {
@@ -65,11 +67,26 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, uid, playURL stri
 			// 客户端已断开：连接没了，写任何响应都是噪声，只记日志。
 			return
 		}
+		// 只留底层原因（*url.Error 的 Err，不含 play_url）：否则失败请求只剩
+		// upstream_status=0，DNS/TLS/拒连/超时无法区分。仍是一条出站日志。
+		var urlErr *url.Error
+		dialErr = err
+		if errors.As(err, &urlErr) {
+			dialErr = urlErr.Err
+		}
 		httpx.WriteError(w, fmt.Errorf("请求上游: %w", httpx.ErrUpstream))
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 	upstreamStatus = resp.StatusCode
+
+	// 上游用 chunked 时给不出精确长度（Go client 对 chunked 会去掉 Content-Length，
+	// ContentLength 为 -1），HEAD 与 GET 就会拿到不一致的长度 —— 宁可 502，也不
+	// 产出无长度的 200/206（AGENTS.md 硬约束 3）。416 无 body，无需长度约束。
+	if upstreamStatus != http.StatusRequestedRangeNotSatisfiable && resp.ContentLength < 0 {
+		httpx.WriteError(w, fmt.Errorf("上游未给出 Content-Length: %w", httpx.ErrUpstream))
+		return
+	}
 
 	switch upstreamStatus {
 	case http.StatusOK, http.StatusPartialContent, http.StatusRequestedRangeNotSatisfiable:
@@ -93,11 +110,12 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, uid, playURL stri
 	}
 }
 
-// logUpstream 记录一条出站上游日志：uid / upstream_host / upstream_status / bytes。
+// logUpstream 记录一条出站上游日志：uid / upstream_host / upstream_status / bytes；
+// 传输错误（status 0）时额外带 err（底层原因，不含 play_url）。
 //
 // 禁止记录完整 play_url（带签名）与 token；定位需要路径时按 DEV-STANDARDS 只
 // 记 host + 路径前 32 字符，这里只取 host。
-func (s *Server) logUpstream(ctx context.Context, uid, playURL string, status int, written int64) {
+func (s *Server) logUpstream(ctx context.Context, uid, playURL string, status int, written int64, cause error) {
 	host := ""
 	if u, err := url.Parse(playURL); err == nil {
 		host = u.Host
@@ -106,10 +124,14 @@ func (s *Server) logUpstream(ctx context.Context, uid, playURL string, status in
 	if status < 200 || status >= 400 {
 		level = slog.LevelError
 	}
-	s.logger.LogAttrs(ctx, level, "stream upstream",
+	attrs := []slog.Attr{
 		slog.String("uid", uid),
 		slog.String("upstream_host", host),
 		slog.Int("upstream_status", status),
 		slog.Int64("bytes", written),
-	)
+	}
+	if cause != nil {
+		attrs = append(attrs, slog.String("err", cause.Error()))
+	}
+	s.logger.LogAttrs(ctx, level, "stream upstream", attrs...)
 }

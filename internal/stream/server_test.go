@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -45,6 +46,7 @@ func newTestDB(t *testing.T) *store.DB {
 // cdnSeen 是假 CDN 观察到的一次请求（不透传 body，只看请求头）。
 type cdnSeen struct {
 	method         string
+	path           string
 	rangeHeader    string
 	acceptEncoding string
 }
@@ -60,6 +62,7 @@ func newCDN(t *testing.T, body []byte) (*httptest.Server, func() []cdnSeen) {
 		mu.Lock()
 		seen = append(seen, cdnSeen{
 			method:         r.Method,
+			path:           r.URL.Path,
 			rangeHeader:    r.Header.Get("Range"),
 			acceptEncoding: r.Header.Get("Accept-Encoding"),
 		})
@@ -71,6 +74,38 @@ func newCDN(t *testing.T, body []byte) (*httptest.Server, func() []cdnSeen) {
 		mu.Lock()
 		defer mu.Unlock()
 		return append([]cdnSeen(nil), seen...)
+	}
+}
+
+// cdnSeen2 是自定义假 CDN 记录的一次请求（method / path / range）。
+type cdnSeen2 struct {
+	method      string
+	path        string
+	rangeHeader string
+}
+
+// newChunkedCDN 起一个 chunked（无 Content-Length）假 CDN：先 Flush 再写 body，
+// 强制 net/http 走 chunked 传输。用于锁定「上游不给精确长度 → 502 而非无长度 200」。
+func newChunkedCDN(t *testing.T, body []byte) (*httptest.Server, func() []cdnSeen2) {
+	t.Helper()
+	var mu sync.Mutex
+	seen := make([]cdnSeen2, 0, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, cdnSeen2{method: r.Method, path: r.URL.Path, rangeHeader: r.Header.Get("Range")})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "video/mp4")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // 强制 chunked：响应不再携带 Content-Length
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []cdnSeen2 {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]cdnSeen2(nil), seen...)
 	}
 }
 
@@ -329,7 +364,7 @@ func TestHandler_ServeBytes(t *testing.T) {
 // 一致且等于真实长度，HEAD 不返回 body。
 func TestHandler_HeadMatchesGet(t *testing.T) {
 	body := bytes.Repeat([]byte("drama"), 1024) // 5120 字节
-	fx, _ := newFixture(t, body, true)
+	fx, seen := newFixture(t, body, true)
 
 	get := serve(t, fx.srv, http.MethodGet, fx.basePath, "")
 	head := serve(t, fx.srv, http.MethodHead, fx.basePath, "")
@@ -345,6 +380,11 @@ func TestHandler_HeadMatchesGet(t *testing.T) {
 	}
 	if head.Body.Len() != 0 {
 		t.Errorf("HEAD body 长度 = %d, 期望 0", head.Body.Len())
+	}
+	// HEAD 必须原样透传到上游（方法透传契约）：上游观察到的最后一条是 HEAD。
+	last := seen()[len(seen())-1]
+	if last.method != http.MethodHead {
+		t.Errorf("上游观察到 method=%q, 期望 HEAD（HEAD 被当成 GET 透传会拉全量 body）", last.method)
 	}
 }
 
@@ -429,7 +469,9 @@ func TestHandler_UpstreamFailure(t *testing.T) {
 		case 3:
 			w.WriteHeader(http.StatusNotFound)
 		default:
+			// 恢复后的正常源站：明确给出长度（chunked 源站已由专门的用例覆盖）。
 			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(body)
 		}
@@ -525,6 +567,96 @@ func TestHandler_HeaderWhitelist(t *testing.T) {
 	}
 }
 
+// TestHandler_UpstreamLog 锁定出站日志契约（DEV-STANDARDS 日志节）：一次请求恰好
+// 一条 "stream upstream" 记录，字段为 uid / upstream_host / upstream_status / bytes，
+// 且日志里不出现 play_url 全文（禁止记录带签名直链）。
+func TestHandler_UpstreamLog(t *testing.T) {
+	body := []byte("hello world")
+	cdn, _ := newCDN(t, body)
+	db := newTestDB(t)
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	_ = settings.Set(context.Background(), store.KeyStreamSecret, testSecret)
+	dramaID, _ := st.UpsertDrama(context.Background(), store.Drama{Provider: "web", ProviderID: "s", Title: "剧"})
+	epID, _ := st.UpsertEpisode(context.Background(), store.Episode{DramaID: dramaID, EpNo: 1, Source: "web", Vid: "v", PlayURL: cdn.URL + "/signed-path?sign=secretquery"})
+	uid := "e" + strconv.FormatInt(epID, 10)
+
+	buf := &bytes.Buffer{}
+	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv := NewServer(st, settings, logger)
+	rec := serve(t, srv, http.MethodGet, "/s/"+Sign([]byte(testSecret), uid)+"/e/"+uid, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", rec.Code)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("日志条数 = %d, 期望 1（buf=%q）", len(lines), buf.String())
+	}
+	var entry struct {
+		Msg            string `json:"msg"`
+		UID            string `json:"uid"`
+		UpstreamHost   string `json:"upstream_host"`
+		UpstreamStatus int    `json:"upstream_status"`
+		Bytes          int64  `json:"bytes"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("日志不是合法 JSON: %v（line=%q）", err, lines[0])
+	}
+	if entry.Msg != "stream upstream" {
+		t.Errorf("msg = %q, 期望 stream upstream", entry.Msg)
+	}
+	if entry.UID != uid || entry.UpstreamHost == "" || entry.UpstreamStatus != 200 || entry.Bytes != int64(len(body)) {
+		t.Errorf("字段不齐: uid=%q host=%q status=%d bytes=%d", entry.UID, entry.UpstreamHost, entry.UpstreamStatus, entry.Bytes)
+	}
+	if buf.Len() > 0 && strings.Contains(buf.String(), "signed-path") {
+		t.Errorf("日志出现 play_url 路径（禁止记录完整直链）")
+	}
+}
+
+// TestHandler_DialFailureLog 锁定「传输错误可区分」：连接失败时记一条含底层
+// 原因的 warn 日志（否则只剩 upstream_status=0），且日志不含 play_url。
+func TestHandler_DialFailureLog(t *testing.T) {
+	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	closedURL := closed.URL
+	closed.Close() // 端口关闭 → 连接被拒
+
+	db := newTestDB(t)
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	_ = settings.Set(context.Background(), store.KeyStreamSecret, testSecret)
+	dramaID, _ := st.UpsertDrama(context.Background(), store.Drama{Provider: "web", ProviderID: "s", Title: "剧"})
+	epID, _ := st.UpsertEpisode(context.Background(), store.Episode{DramaID: dramaID, EpNo: 1, Source: "web", Vid: "v", PlayURL: closedURL + "/deadbeef.mp4"})
+	uid := "e" + strconv.FormatInt(epID, 10)
+
+	buf := &bytes.Buffer{}
+	srv := NewServer(st, settings, slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	rec := serve(t, srv, http.MethodGet, "/s/"+Sign([]byte(testSecret), uid)+"/e/"+uid, "")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("状态码 = %d, 期望 502", rec.Code)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("日志条数 = %d, 期望 1（每次出站恰一条；buf=%q）", len(lines), buf.String())
+	}
+	var entry struct {
+		Msg            string `json:"msg"`
+		UID            string `json:"uid"`
+		UpstreamStatus int    `json:"upstream_status"`
+		Err            string `json:"err"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("日志不是合法 JSON: %v（line=%q）", err, lines[0])
+	}
+	if entry.Msg != "stream upstream" || entry.UID != uid || entry.Err == "" {
+		t.Errorf("日志字段不符: msg=%q uid=%q err=%q（传输错误必须能在日志里区分原因）", entry.Msg, entry.UID, entry.Err)
+	}
+	if strings.Contains(buf.String(), "deadbeef") {
+		t.Errorf("日志出现 play_url 路径")
+	}
+}
+
 // TestHandler_UpstreamClientConfig 覆盖 AC11 的代码核对：Transport 必须
 // DisableCompression 且有连接/响应头超时；Client.Timeout 必须为 0（否则截断长流）。
 func TestHandler_UpstreamClientConfig(t *testing.T) {
@@ -545,6 +677,37 @@ func TestHandler_UpstreamClientConfig(t *testing.T) {
 	}
 	if tr.ResponseHeaderTimeout == 0 {
 		t.Error("ResponseHeaderTimeout = 0, 期望有响应头超时")
+	}
+}
+
+// TestHandler_ChunkedUpstream 覆盖「上游不给精确 Content-Length（chunked）→ 502」：
+// HEAD/GET 长度精确这条 AC 依赖上游长度，chunked 上游给不出长度时宁可 502，
+// 不给无长度的 200（AGENTS.md 硬约束 3：每个虚拟文件必须给出精确 Content-Length）。
+func TestHandler_ChunkedUpstream(t *testing.T) {
+	body := []byte("chunked body data")
+	cdn, _ := newChunkedCDN(t, body)
+	db := newTestDB(t)
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	_ = settings.Set(context.Background(), store.KeyStreamSecret, testSecret)
+	dramaID, _ := st.UpsertDrama(context.Background(), store.Drama{Provider: "web", ProviderID: "s", Title: "剧"})
+	epID, _ := st.UpsertEpisode(context.Background(), store.Episode{DramaID: dramaID, EpNo: 1, Source: "web", Vid: "v", PlayURL: cdn.URL + "/video.mp4"})
+	uid := "e" + strconv.FormatInt(epID, 10)
+	srv := NewServer(st, settings, slog.New(slog.DiscardHandler))
+	path := "/s/" + Sign([]byte(testSecret), uid) + "/e/" + uid
+
+	rec := serve(t, srv, http.MethodGet, path, "")
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("chunked GET 状态码 = %d, 期望 502（无长度不给出 200）", rec.Code)
+	}
+	var got struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v（body=%q）", err, rec.Body.String())
+	}
+	if got.Code != "upstream" {
+		t.Errorf("code = %q, 期望 upstream", got.Code)
 	}
 }
 

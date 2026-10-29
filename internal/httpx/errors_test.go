@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// TestStatusCode 覆盖 AC1：四哨兵（裸与 %w 包装）→ 404/400/502/503，无关错误 → 500。
+// TestStatusCode 覆盖 AC1：五哨兵（裸与 %w 包装）→ 404/400/401/502/503，无关错误 → 500。
 func TestStatusCode(t *testing.T) {
 	cases := []struct {
 		name string
@@ -20,6 +20,8 @@ func TestStatusCode(t *testing.T) {
 		{"包装 ErrNotFound", fmt.Errorf("加载剧集 %s: %w", "42", ErrNotFound), http.StatusNotFound},
 		{"裸 ErrInvalid", ErrInvalid, http.StatusBadRequest},
 		{"包装 ErrInvalid", fmt.Errorf("范围 %d 越界: %w", 7, ErrInvalid), http.StatusBadRequest},
+		{"裸 ErrUnauthorized", ErrUnauthorized, http.StatusUnauthorized},
+		{"包装 ErrUnauthorized", fmt.Errorf("uid %s 签名不匹配: %w", "e42", ErrUnauthorized), http.StatusUnauthorized},
 		{"裸 ErrUpstream", ErrUpstream, http.StatusBadGateway},
 		{"包装 ErrUpstream", fmt.Errorf("源站返回 403: %w", ErrUpstream), http.StatusBadGateway},
 		{"裸 ErrUnavailable", ErrUnavailable, http.StatusServiceUnavailable},
@@ -34,7 +36,7 @@ func TestStatusCode(t *testing.T) {
 }
 
 // TestWriteError 覆盖 AC2：每类写出正确 status、JSON Content-Type、合法 body，
-// code ∈ not_found|invalid|upstream|unavailable|internal，message == err.Error()。
+// code ∈ not_found|invalid|unauthorized|upstream|unavailable|internal，message == err.Error()。
 func TestWriteError(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -44,6 +46,7 @@ func TestWriteError(t *testing.T) {
 	}{
 		{"ErrNotFound", ErrNotFound, http.StatusNotFound, "not_found"},
 		{"包装 ErrInvalid", fmt.Errorf("第 %s 集不存在: %w", "3", ErrInvalid), http.StatusBadRequest, "invalid"},
+		{"ErrUnauthorized", ErrUnauthorized, http.StatusUnauthorized, "unauthorized"},
 		{"ErrUpstream", ErrUpstream, http.StatusBadGateway, "upstream"},
 		{"ErrUnavailable", ErrUnavailable, http.StatusServiceUnavailable, "unavailable"},
 		{"无关错误", errors.New("内部错误"), http.StatusInternalServerError, "internal"},

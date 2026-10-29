@@ -16,18 +16,24 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 
 首次启动自动建库与迁移。
 
-## HTTP 接口（框架阶段）
+## HTTP 接口
 
-框架阶段只有路由骨架，业务端点按阶段陆续接入。未实现的端点返回 **501 Not Implemented**
-（已规划未实现），不是 404；未装配的路径返回 404。
+未实现的端点返回 **501 Not Implemented**（已规划未实现），不是 404；未装配的
+路径返回 404。
 
 | 端点 | 方法 | 状态 | 说明 |
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
 | `/dav/` 及全部子路径 | 任意 | 501 | 只读 WebDAV 挂载点，后续接入 |
-| `/s/` 及全部子路径 | 任意 | 501 | 出流转服务，后续接入 |
+| `/s/{token}/e/{uid}` | GET / HEAD | 200/206/416 | 单集 MP4 出流：HMAC 签名 + Range 透传 |
+| `/s/` 其余子路径 | 任意 | 501 | 分片与合并集属后续阶段 |
 | `/api/` 及全部子路径 | 任意 | 501 | 管理 API，后续接入 |
 | 其它路径（含 `/`） | 任意 | 404 | 未装配；管理界面属后续阶段 |
+
+出流 token 是 HMAC 常量签名（ADR-0003）：`token = base64url( HMAC-SHA256(secret,
+"stream:"+uid) )`，secret 取 `settings.stream_secret`。错误签名 → 401；uid 非法或
+不存在 → 404；`play_url` 为空或上游失败 → 502。`Range` 原样透传到上游，206/416
+由上游判定后透传回。
 
 ```bash
 curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}
@@ -36,7 +42,7 @@ curl -i http://127.0.0.1:8080/dav/      # 501
 
 每个请求输出一条结构化访问日志（`method` / `path` / `status` / `duration_ms`，见
 `internal/httpx`）；出流路径里的签名 token 段被掩码为 `{token}`，query 不进日志。
-错误响应统一为 `{"code":"<kind>","message":"..."}`（404/400/502/503，其余 500）。
+错误响应统一为 `{"code":"<kind>","message":"..."}`（404/400/401/502/503，其余 500）。
 
 需要的运行环境：`ffmpeg`、`ffprobe` 在 `PATH` 里。
 

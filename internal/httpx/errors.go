@@ -14,14 +14,18 @@ var (
 	ErrNotFound = errors.New("资源不存在")
 	// ErrInvalid 表示请求本身无效（参数、范围、格式），映射 400。
 	ErrInvalid = errors.New("请求无效")
+	// ErrUnauthorized 表示签名或凭据不通过，映射 401。出流（ADR-0003）与
+	// WebDAV Basic 认证共用；本 token 不是 HTTP 认证方案，因此不写
+	// WWW-Authenticate。
+	ErrUnauthorized = errors.New("未授权")
 	// ErrUpstream 表示上游（数据源 / CDN）失败，映射 502。
 	ErrUpstream = errors.New("上游失败")
 	// ErrUnavailable 表示依赖暂不可用（索引未完成等），映射 503。
 	ErrUnavailable = errors.New("暂不可用")
 )
 
-// StatusCode 把错误映射为 HTTP 状态码：四个哨兵分别 404 / 400 / 502 / 503，
-// 未命中任何哨兵返回 500。用 errors.Is 判定，因此支持 %w 包装；四个哨兵互不
+// StatusCode 把错误映射为 HTTP 状态码：五个哨兵分别 404 / 400 / 401 / 502 / 503，
+// 未命中任何哨兵返回 500。用 errors.Is 判定，因此支持 %w 包装；五个哨兵互不
 // 包含，判定顺序不影响结果。
 func StatusCode(err error) int {
 	switch {
@@ -29,6 +33,8 @@ func StatusCode(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, ErrInvalid):
 		return http.StatusBadRequest
+	case errors.Is(err, ErrUnauthorized):
+		return http.StatusUnauthorized
 	case errors.Is(err, ErrUpstream):
 		return http.StatusBadGateway
 	case errors.Is(err, ErrUnavailable):
@@ -51,6 +57,8 @@ func errorCode(status int) string {
 		return "not_found"
 	case http.StatusBadRequest:
 		return "invalid"
+	case http.StatusUnauthorized:
+		return "unauthorized"
 	case http.StatusBadGateway:
 		return "upstream"
 	case http.StatusServiceUnavailable:

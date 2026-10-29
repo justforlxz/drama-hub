@@ -135,6 +135,66 @@ ffmpeg 并发上限固定为 `NumCPU`，不做成可调项（见 `internal/segme
 - 构造函数注入依赖：`NewServer(store, settings, logger)`；不用全局单例、不用 `init()` 注册。
 - 导出标识符必须有 doc 注释，说明契约与错误返回；私有函数只在「为什么」不显然时写一行注释。
 
+## 虚拟文件树与渲染（internal/vfs）
+
+树与文件内容全部按请求渲染，不落盘（AGENTS.md 硬约束 1）。`vfs.Tree` 只有两个入口：
+`List(ctx)` 枚举全部目录与文件节点，`Render(ctx, path)` 返回文件的完整字节。
+
+### 目录与命名（纯函数，`tree.go`）
+
+```
+短剧/
+└── <剧名> (<年份>)/
+    ├── tvshow.nfo
+    └── Season 01/
+        ├── <剧名> - S01E01 - <标签>.strm
+        └── <剧名> - S01E01 - <标签>.nfo
+```
+
+- 剧目录 `<剧名> (<年份>)`：年份来自 `drama.year`；`year=0` 显式写成 `(<0>)`，不省略。
+- 季目录恒为 `Season 01`（M3；`season` 是 M7 的 `emby_item` 概念）。
+- 集号 `S%02dE%02d`；`<标签>` = `episode.title`，空则 `第<ep_no>集`。
+- 目录名与文件名里的 `/ \ : * ? " < > |` 一律替换为 `_`（Windows + WebDAV 非法字符集）。
+- 路径以 `/` 分隔、相对 vfs 根、无前导 `/`；WebDAV 的绝对路径由 `internal/webdav` 映射。
+
+### strm 形态
+
+一行 URL + 尾 `\n`，前缀取 `settings.strm_prefix`：
+
+```
+{strm_prefix}/s/{token}/e/{uid}
+```
+
+- `uid` = `episode.id` 的十进制（M3 临时约定；M7 若改 `emby_item.uid` 规则需同步改 vfs）。
+- `token` 由装配根注入的 `vfs.TokenFunc(secret, uid string) string` 计算，签名算法是
+  `internal/stream` 的 ADR-0003 HMAC —— vfs（rank 30）不 import stream（rank 40）。
+- `strm_prefix` 与 `stream_secret` 每次渲染现读，改值即时生效（硬约束 5）。
+
+### NFO 形态
+
+`encoding/xml` 序列化，固定头 `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>` +
+两空格缩进体 + 尾换行。XML 转义交给编码器。
+
+| 文件 | 根元素 | 字段 | 说明 |
+|---|---|---|---|
+| 集 `.nfo` | `episodedetails` | `title` / `season` / `episode` / `runtime` | `runtime` 单位是**分钟**（`duration_sec / 60` 向下取整）；写秒会被 Emby 放大 60 倍 |
+| `tvshow.nfo` | `tvshow` | `title` / `year` / `plot` | `plot` 来自 `drama.plot` |
+
+`aired` 不写：`play_url_at` 是采集时间，不是播出日期。
+
+### 长度
+
+渲染结果的长度只有 `len(Render 的 []byte)` 一个真值，本包不提供独立的 `Size()` 或长度字段。
+`internal/webdav` 的 `PROPFIND getcontentlength` 与 `internal/stream` 的 `Content-Length`
+都取这个值（硬约束 3）。
+
+### 查询成本
+
+`Render` 是**常数次查询**、与全库规模无关：按目录名 `ListDramas` 匹配单部剧（1 次），
+集级文件再取该剧的 `ListEpisodes`（1 次）；`.strm` 另加两次现读设置。全树遍历
+（1 次 `ListDramas` + 每剧 1 次 `ListEpisodes`）只属于 `List`，避免 Emby/rclone
+逐个文件 GET 时把整库集表读一遍。
+
 ## 提交
 
 `<类型>(<范围>): <祈使句>`，正文说明「为什么」而不是「改了什么」。范围用包名（`stream`、`vfs`、`store`）。格式化与重命名单独提交。

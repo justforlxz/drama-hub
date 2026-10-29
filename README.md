@@ -14,7 +14,26 @@ make build                    # 产出 ./bin/drama-hub
 DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 ```
 
-首次启动自动建库与迁移。打开 `http://127.0.0.1:8080/` 进入管理界面，先配 WebDAV 账号与 `strm_prefix`。
+首次启动自动建库与迁移。
+
+## HTTP 接口（框架阶段）
+
+框架阶段只有路由骨架，业务端点按阶段陆续接入。未实现的端点返回 **501 Not Implemented**
+（已规划未实现），不是 404；未装配的路径返回 404。
+
+| 端点 | 方法 | 状态 | 说明 |
+|---|---|---|---|
+| `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
+| `/dav/` 及全部子路径 | 任意 | 501 | 只读 WebDAV 挂载点，后续接入 |
+| `/s/` 及全部子路径 | 任意 | 501 | 出流转服务，后续接入 |
+| `/api/` 及全部子路径 | 任意 | 501 | 管理 API，后续接入 |
+| 其它路径（含 `/`） | 任意 | 404 | 未装配；管理界面属后续阶段 |
+
+```bash
+curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}
+curl -i http://127.0.0.1:8080/dav/      # 501
+```
+
 
 需要的运行环境：`ffmpeg`、`ffprobe` 在 `PATH` 里。
 

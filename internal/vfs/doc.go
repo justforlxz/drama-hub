@@ -1,11 +1,17 @@
-// Package vfs 把虚拟文件树渲染为 strm / nfo / 图片。
+// Package vfs 把数据库里的剧目与集渲染成一棵只读的虚拟文件树。
+//
+// Tree 是本包唯一入口：List 枚举全部目录与文件节点，Render 按路径产出
+// strm / nfo 的完整字节。树与文件名都是纯函数派生的，不落盘（AGENTS.md
+// 硬约束 1）；渲染结果的长度只有 len(返回值) 一个真值，调用方拿它当
+// Content-Length（硬约束 3），本包不提供独立的长度字段或 Size 方法。
 //
 // 依赖方向：rank 30，可 import rank 20/10 的 internal 包（cache、store）；
 // rank 40/50/60 的包可 import 本包；与同为 30 的 provider 同级、互不 import。
 // 规则见 docs/DEV-STANDARDS.md「代码组织」，由 scripts/check-deps.sh 强制。
 //
-// 边界：本阶段只提供包骨架与空壳类型，不含任何业务逻辑。
+// 边界：只读 drama / episode 两张表；读写 emby_item、封面下载、HTTP 处理、
+// 缓存与分页都不在本包。出流 token 的算法（HMAC，ADR-0003）属 internal/stream
+// （rank 40），本包通过 NewTree 注入的 TokenFunc 计算，不自行实现签名。
+//
+// 渲染契约见 docs/DEV-STANDARDS.md「虚拟文件树与渲染」。
 package vfs
-
-// Tree 是本包的中枢类型，代表一棵可渲染的虚拟文件树。
-type Tree struct{}

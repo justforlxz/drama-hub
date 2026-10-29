@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/httpx"
 	"github.com/justforlxz/drama-hub/internal/web"
 )
 
@@ -68,13 +69,16 @@ func main() {
 // 框架阶段的行为只有两类：已实现的端点返回真实响应，其余挂载点返回
 // 501（已规划未实现）。不注册 "/" catch-all —— 未装配路径由 ServeMux
 // 自然兜底 404，这是「未知路径 → 404」的前提。
+//
+// 请求日志中间件只在装配根挂一次：/healthz、/dav/、/s/、/api/（含 web 内部）
+// 与未知路径都经它，每请求恰一条访问日志（token 段掩码，见 internal/httpx）。
 func newHandler(logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("/dav/", handleNotImplemented)
 	mux.HandleFunc("/s/", handleNotImplemented)
 	mux.Handle("/api/", web.NewServer(logger))
-	return mux
+	return httpx.RequestLogger(logger, mux)
 }
 
 // handleHealthz 是存活探测：只证明进程还能接请求。

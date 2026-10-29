@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -67,5 +69,58 @@ func TestHandler_UnknownPathNotFound(t *testing.T) {
 		if rec.Code != http.StatusNotFound {
 			t.Errorf("GET %s 状态码 = %d, 期望 %d", path, rec.Code, http.StatusNotFound)
 		}
+	}
+}
+
+// TestHandler_LogsRequests（F5 AC7）证明装配根每请求恰一条访问日志：对
+// /healthz、/dav/、/nope 各发一次，每次 1 条含 method/path/status/duration_ms
+// 四字段的 JSON 日志，路径与状态和响应一致。logger 级别设为 Debug，避免级别
+// 过滤影响条数。
+func TestHandler_LogsRequests(t *testing.T) {
+	cases := []struct {
+		path     string
+		wantPath string
+		wantCode int
+	}{
+		{"/healthz", "/healthz", http.StatusOK},
+		{"/dav/", "/dav/", http.StatusNotImplemented},
+		{"/nope", "/nope", http.StatusNotFound},
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			buf := &bytes.Buffer{}
+			h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+			rec := serve(t, h, http.MethodGet, c.path)
+			if rec.Code != c.wantCode {
+				t.Errorf("GET %s 状态码 = %d, 期望 %d", c.path, rec.Code, c.wantCode)
+			}
+
+			lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+			if len(lines) != 1 {
+				t.Fatalf("GET %s 日志条数 = %d, 期望 1（buf=%q）", c.path, len(lines), buf.String())
+			}
+			var entry struct {
+				Method     string `json:"method"`
+				Path       string `json:"path"`
+				Status     int    `json:"status"`
+				DurationMS *int64 `json:"duration_ms"`
+			}
+			if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+				t.Fatalf("日志不是合法 JSON: %v（line=%q）", err, lines[0])
+			}
+			if entry.Method != http.MethodGet {
+				t.Errorf("method = %q, 期望 GET", entry.Method)
+			}
+			if entry.Path != c.wantPath {
+				t.Errorf("path = %q, 期望 %q", entry.Path, c.wantPath)
+			}
+			if entry.Status != c.wantCode {
+				t.Errorf("status = %d, 期望 %d", entry.Status, c.wantCode)
+			}
+			if entry.DurationMS == nil || *entry.DurationMS < 0 {
+				t.Errorf("duration_ms = %v, 期望 ≥ 0", entry.DurationMS)
+			}
+		})
 	}
 }

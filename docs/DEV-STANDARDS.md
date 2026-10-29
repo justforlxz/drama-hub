@@ -351,6 +351,74 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 （1 次 `ListDramas` + 每剧 1 次 `ListEpisodes`）只属于 `List`，避免 Emby/rclone
 逐个文件 GET 时把整库集表读一遍。
 
+## WebDAV（internal/webdav）
+
+挂载点 `/dav/`（`webdav.MountPath`），只读。协议实现委托 `golang.org/x/net/webdav`，
+本包只提供两件事：`x/net/webdav.FileSystem` 适配（`fs.go`）与 Basic 认证（`handler.go`）。
+
+### 路径映射
+
+**DAV 根 = vfs 根目录**：`/` → `短剧`，`/剧名 (2024)/…` → `短剧/剧名 (2024)/…`。
+根目录名从 `vfs.List` 现取（唯一不带 `/` 的目录节点），不在本包复制字面量。
+
+因此 `rclone lsf --max-depth 3 dramahub:/` 的第一级就是剧目录（`docs/ACCEPTANCE.md` P2）：
+Emby 库路径 `rclone mount dramahub:/ /mnt/dramahub` → `/mnt/dramahub`。
+
+### 长度
+
+`getcontentlength` 与 GET 的 `Content-Length` 都取 `len(vfs.Render 的字节)`（硬约束 3），
+没有第二条长度来源。`PROPFIND` 里目录不带 `getcontentlength`（协议层对 collection 不适用）。
+
+### 认证
+
+Basic，凭据取 `settings.webdav_user` / `webdav_pass`，**每请求现读**（硬约束 5，改值即时生效）。
+缺任一项或凭据不符 → `401` + `WWW-Authenticate: Basic`，响应体是 `httpx` 统一错误体
+（`code: "unauthorized"`）。比较用 `subtle.ConstantTimeCompare`。
+
+### 只读
+
+`Mkdir` / `RemoveAll` / `Rename` 与任何带写意图的 `OpenFile` 一律失败
+（`PUT`/`DELETE`/`MKCOL` → `405`）。锁定用 `x/net/webdav.MemLS`（协议层要求，不落盘）。
+
+### 请求内快照
+
+`x/net/webdav` 处理一个 `PROPFIND` 会对同一份数据反复调用 `Stat` / `OpenFile`（父目录一次、
+每个子项再各一次）。逐次 `List` 会让一次目录列举变成 O(目录项数) 次全树查询，因此一次
+请求内把 `List` 结果与渲染结果挂在请求 ctx 上（`snapshot`），每请求各算一次。**不跨请求**：
+没有 TTL、没有失效逻辑，数据改了下一个请求即见（硬约束 5 同理）。
+
+### 已知边界
+
+- 修改时间恒为零值（`entry.ModTime`）：库里没有可靠的 mtime，`sync_at` / `play_url_at`
+  是采集时间。零值让 ETag 稳定在「内容长度」上，`http.ServeContent` 也不写 `Last-Modified`。
+- 不做封面 `poster.jpg`（属 artifact 缓存，单独任务）；不做合并集（M7）。
+
+### 测试（两层，都不需要外部 rclone）
+
+**单元**（`fs_unit_test.go`）：`fakeTree` 提供节点与渲染字节，**不碰 SQLite、不起
+HTTP**。覆盖路径映射（DAV 根 = vfs 根目录）、长度只来自 `len(渲染字节)`、
+`fs.ErrNotExist` 包装、`Readdir` 直接子项、只读语义、请求内快照（同请求只 `List`
+一次、同路径只渲染一次、不跨请求复用）、渲染/列举错误透传。这几条守住适配逻辑本身。
+
+**集成**（`webdav_test.go`）：真 SQLite + 真 handler（`httptest`），验证协议契约。
+客户端游览（等同 `rclone lsf --max-depth 3`、Emby 扫库的请求序列）由进程内的递归
+PROPFIND 客户端完成，不依赖外部二进制、不起守护进程、不落盘：
+
+- `TestWalkTree_CompleteDepth3`：max-depth 3 枚举出完整树（剧 → Season 01 → strm/nfo），
+  并对每个文件项断言 `getcontentlength == GET 实际 body 长度`。
+- `TestWalkTree_DepthBounded`：遍历在预算内结束、深度不超过 max-depth。
+
+消费方接口：`webdav.Tree`（`List` + `Render`）定义在 `fs.go`（接口在消费方，
+DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 `fakeTree`。
+
+**超时是硬要求**（`webdav_test.go` 顶部常量）：`requestTimeout = 5s`（单请求，
+`http.Client.Timeout` + `context.WithTimeout` 双保险）、`walkTimeout = 30s`（整棵遍历）。
+超时立即 `t.Fatalf` 而不是挂住——手工验证时 `rclone mount --daemon` 不退出的坑
+不能再出现在测试路径上。
+
+真机 `rclone lsf` / Emby 扫描仍在 `docs/ACCEPTANCE.md` 的 P2 手工清单里，
+是验收层（人工、一次性），不是 `make test` 的组成部分。
+
 ## 提交
 
 `<类型>(<范围>): <祈使句>`，正文说明「为什么」而不是「改了什么」。范围用包名（`stream`、`vfs`、`store`）。格式化与重命名单独提交。

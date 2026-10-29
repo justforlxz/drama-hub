@@ -24,7 +24,7 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 | 端点 | 方法 | 状态 | 说明 |
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
-| `/dav/` 及全部子路径 | 任意 | 501 | 只读 WebDAV 挂载点，后续接入 |
+| `/dav/` 及全部子路径 | 任意 | 207/200/401/404/405 | 只读 WebDAV：PROPFIND 207（带 getcontentlength）、GET strm/nfo 200；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401 |
 | `/s/{token}/e/{uid}` | GET / HEAD | 200/206/416 | 单集 MP4 出流：HMAC 签名 + Range 透传 |
 | `/s/{token}/seg/{uid}/{seq}.ts` | GET | 200/404/502/503 | 单集分片：现转封装 MPEG-TS，索引未就绪 503 |
 | `/s/` 其余子路径 | 任意 | 501 | 合并集与播放列表属后续阶段（M7） |
@@ -44,7 +44,7 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 
 ```bash
 curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}
-curl -i http://127.0.0.1:8080/dav/      # 501
+curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8080/dav/  # 207 + getcontentlength
 ```
 
 每个请求输出一条结构化访问日志（`method` / `path` / `status` / `duration_ms`，见
@@ -59,9 +59,10 @@ curl -i http://127.0.0.1:8080/dav/      # 501
 rclone config create dramahub webdav url http://127.0.0.1:8080/dav vendor other \
   user <webdav_user> pass <webdav_pass>
 rclone mount dramahub:/ /mnt/dramahub --vfs-cache-mode full --dir-cache-time 30s
+rclone lsf --max-depth 3 dramahub:/     # 剧目录 → Season 01 → strm/nfo
 ```
 
-Emby 库路径指向 `/mnt/dramahub/短剧`，类型选「电视节目」。
+Emby 库路径指向 `/mnt/dramahub`（DAV 根即剧集库根），类型选「电视节目」。
 
 ## 开发环境
 

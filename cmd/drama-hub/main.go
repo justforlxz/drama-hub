@@ -16,7 +16,9 @@ import (
 	"github.com/justforlxz/drama-hub/internal/segment"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
+	"github.com/justforlxz/drama-hub/internal/vfs"
 	"github.com/justforlxz/drama-hub/internal/web"
+	"github.com/justforlxz/drama-hub/internal/webdav"
 )
 
 // Build-time variables, overridden via -ldflags.
@@ -84,18 +86,18 @@ func main() {
 // newHandler 装配顶层路由。cmd 是唯一的装配根：路由表在这里一眼可见，
 // 领域包只提供自己的 handler，不关心挂载点。
 //
-// /healthz 与 /api/ 之外的挂载点返回 501（已规划未实现）；/s/ 已接入出流与分片：
-// stream.Server 独占 `/s/` 前缀，segment.Cutter 用比它更具体的 pattern 挂在同一
-// 子树（Go 的 ServeMux 取最具体者），两者互不 import（同 rank）。合并集（M7）
-// 仍由 stream.Server 兜底 501。不注册 "/" catch-all —— 未装配路径由 ServeMux
-// 自然兜底 404，这是「未知路径 → 404」的前提。
+// /healthz、/dav/（M4 只读 WebDAV）、/s/（M5 出流 + M6 分片）都已接上真实实现；
+// /api/ 仍为占位 501（属 R1）。/s/ 子树里 stream.Server 占 `/s/` 前缀，segment.Cutter
+// 用比它更具体的 pattern 挂在同一子树（Go 的 ServeMux 取最具体者），两者互不 import
+// （同 rank）；合并集（M7）仍由 stream.Server 兜底 501。不注册 "/" catch-all ——
+// 未装配路径由 ServeMux 自然兜底 404，这是「未知路径 → 404」的前提。
 //
 // 请求日志中间件只在装配根挂一次：/healthz、/dav/、/s/、/api/（含 web 内部）
 // 与未知路径都经它，每请求恰一条访问日志（token 段掩码，见 internal/httpx）。
 func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("/dav/", handleNotImplemented)
+	mux.Handle(webdav.MountPath, webdav.NewHandler(vfs.NewTree(st, settings, signToken), settings, logger))
 	mux.Handle("/s/", stream.NewServer(st, settings, logger))
 	// 分片端点：签名校验用 stream.Verify 注入（segment 不能 import 同 rank 的 stream）。
 	mux.Handle(segment.Route, segment.NewCutter(st, settings, logger, stream.Verify))
@@ -109,11 +111,9 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
 }
 
-// handleNotImplemented 表示挂载点已规划、实现属后续阶段。
-// pattern 不带 method 前缀，任意方法命中同一语义，而不是 405。
-func handleNotImplemented(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusNotImplemented)
-}
+// signToken 把 stream.Sign 适配为 vfs.TokenFunc：vfs（rank 30）不 import stream
+// （rank 40），签名算法在装配根接上，见 docs/DEV-STANDARDS.md「虚拟文件树与渲染」。
+func signToken(secret, uid string) string { return stream.Sign([]byte(secret), uid) }
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {

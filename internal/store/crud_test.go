@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -25,10 +24,11 @@ func newCRUDTestDB(t *testing.T) *DB {
 }
 
 // countRows 统计 table 的行数。
-func countRows(t *testing.T, db *sql.DB, table string) int {
+// countRows 统计 table 的行数。形参用 dbtx：根 Store 与事务内 Store 都适用。
+func countRows(t *testing.T, db dbtx, table string) int {
 	t.Helper()
 	var n int
-	if err := db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil {
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM `+table).Scan(&n); err != nil {
 		t.Fatalf("统计 %s: %v", table, err)
 	}
 	return n
@@ -465,7 +465,7 @@ func TestConcurrentEpisodeWrites(t *testing.T) {
 		t.Fatalf("episode 行数 = %d, 期望 %d（不丢数据）", n, goroutines*perGoroutine)
 	}
 
-	rows, err := s.db.Query(`SELECT ep_no FROM episode WHERE drama_id = ?`, dramaID)
+	rows, err := s.db.QueryContext(context.Background(), `SELECT ep_no FROM episode WHERE drama_id = ?`, dramaID)
 	if err != nil {
 		t.Fatalf("查询 ep_no: %v", err)
 	}
@@ -488,5 +488,74 @@ func TestConcurrentEpisodeWrites(t *testing.T) {
 		if !seen[n] {
 			t.Fatalf("ep_no = %d 缺失", n)
 		}
+	}
+}
+
+// AC11：InTx 的提交/回滚语义。回滚后两表 0 行，提交路径可见，事务内 id 与
+// 提交后的行一致；fn 的错误必须原样冒泡（不被包装成 ErrConflict 之类）。
+func TestInTxCommitAndRollback(t *testing.T) {
+	s := NewStore(newCRUDTestDB(t).DB)
+	ctx := context.Background()
+
+	sentinel := errors.New("业务失败")
+	err := s.InTx(ctx, func(tx *Store) error {
+		id, err := tx.UpsertDrama(ctx, Drama{Provider: "web", ProviderID: "p", Title: "剧"})
+		if err != nil {
+			return err
+		}
+		if _, err := tx.UpsertEpisode(ctx, Episode{DramaID: id, EpNo: 1, Source: "web", Vid: "v1"}); err != nil {
+			return err
+		}
+		// 事务内能读到自己写的行。
+		if n := countRows(t, tx.db, "episode"); n != 1 {
+			t.Fatalf("事务内 episode 行数 = %d, 期望 1", n)
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("InTx 返回 %v, 期望原样返回 sentinel", err)
+	}
+	if n := countRows(t, s.db, "drama"); n != 0 {
+		t.Fatalf("回滚后 drama 行数 = %d, 期望 0", n)
+	}
+	if n := countRows(t, s.db, "episode"); n != 0 {
+		t.Fatalf("回滚后 episode 行数 = %d, 期望 0", n)
+	}
+
+	var committedDramaID, committedEpID int64
+	if err := s.InTx(ctx, func(tx *Store) error {
+		id, err := tx.UpsertDrama(ctx, Drama{Provider: "web", ProviderID: "p", Title: "剧"})
+		if err != nil {
+			return err
+		}
+		committedDramaID = id
+		epID, err := tx.UpsertEpisode(ctx, Episode{DramaID: id, EpNo: 1, Source: "web", Vid: "v1"})
+		if err != nil {
+			return err
+		}
+		committedEpID = epID
+		return nil
+	}); err != nil {
+		t.Fatalf("InTx 提交路径: %v", err)
+	}
+	if n := countRows(t, s.db, "episode"); n != 1 {
+		t.Fatalf("提交后 episode 行数 = %d, 期望 1", n)
+	}
+	if _, err := s.DramaByID(ctx, committedDramaID); err != nil {
+		t.Fatalf("提交后按 id 查剧目: %v", err)
+	}
+	if _, err := s.EpisodeByID(ctx, committedEpID); err != nil {
+		t.Fatalf("提交后按 id 查集: %v", err)
+	}
+
+	// 事务内 Store 不能再开事务：SQLite 不支持嵌套写事务，早失败好过隐式挂起。
+	if err := s.InTx(ctx, func(tx *Store) error { return tx.InTx(ctx, func(*Store) error { return nil }) }); err == nil {
+		t.Fatal("嵌套 InTx 未报错")
+	}
+	// 事务内的方法与根 Store 同语义：缺行仍返回 ErrNotFound，不因事务包装而漂移。
+	if err := s.InTx(ctx, func(tx *Store) error {
+		return tx.DeleteDrama(ctx, 99999)
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("事务内 DeleteDrama 缺行 = %v, 期望 ErrNotFound", err)
 	}
 }

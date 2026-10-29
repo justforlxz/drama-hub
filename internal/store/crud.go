@@ -40,17 +40,49 @@ type Episode struct {
 	PlayURLAt   string
 }
 
+// dbtx 是 Store 实际使用的 SQL 句柄：*sql.DB（根 Store）与 *sql.Tx（事务内
+// Store）都满足，因此同一批方法在事务内外共用一份实现。
+type dbtx interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 // Store 是 drama / episode 两张表的读写入口。
 //
 // 与 Settings 同构：构造注入 *sql.DB、不缓存。drama 与 episode 的读写天生跨表
 // （删剧级联、M2 批量入库、M3 一次枚举剧与集），因此共用一个 receiver。
 type Store struct {
-	db *sql.DB
+	db   dbtx
+	root *sql.DB // 只有根 Store 非 nil；InTx 用它开事务
 }
 
 // NewStore 构造 Store。
 func NewStore(db *sql.DB) *Store {
-	return &Store{db: db}
+	return &Store{db: db, root: db}
+}
+
+// InTx 在同一事务内执行 fn：fn 返回错误即回滚并把该错误原样返回，返回 nil 则提交。
+//
+// 事务内的 *Store 复用同一批读写方法，SQL 与语义与根 Store 完全一致。fn 里不得做
+// 网络或外部进程 I/O：SQLite 单写者，长事务会持锁阻塞其它写入（同步的取数阶段
+// 必须在 InTx 之外完成）。
+func (s *Store) InTx(ctx context.Context, fn func(tx *Store) error) error {
+	if s.root == nil {
+		return errors.New("store: 不支持嵌套事务")
+	}
+	tx, err := s.root.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务: %w", err)
+	}
+	if err := fn(&Store{db: tx}); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务: %w", err)
+	}
+	return nil
 }
 
 // dramaColumns 是 drama 表的显式列清单，顺序必须与 scanDrama 的 Scan 顺序一致。

@@ -1,0 +1,15 @@
+<!--
+来源：https://hongguoduanju.com/player/7503745441910017049/7503780574541122622（2026-10-29 匿名抓取）
+裁剪：只保留 _ROUTER_DATA 的单集页载荷与两个 ld+json 块（非 VideoObject 的 @graph 块
+      裁剪为 TVEpisode/ItemList/TVSeries 三类，ItemList 保留另外两集的 /player 链接）；
+      页面外壳与其余 <script> 删除。
+改造：VideoObject.contentUrl 写成双重转义 + HTML 实体 + Range 参数的变体。
+覆盖：AC4（\u002F→/、\u0026→&、&amp;→&、删 Range 参数）。
+-->
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>红果短剧</title></head><body>
+<script async="" data-script-src="modern-inline">_ROUTER_DATA = {"loaderData":{"player_layout":null,"player_(series_id)\u002F(vid)\u002Fpage":{"isSuccess":true,"series_id":"7503745441910017049","vid":"7503780574541122622","publicVideoSeo":null}}};
+function runWindowFn(){"use strict";}</script>
+<script type="application/ld+json" data-rh="true">{"@context": "https://schema.org", "@graph": [{"@type": "TVEpisode", "@id": "https://hongguoduanju.com/player/7503745441910017049#episode", "name": "宴律，你的白月光回国了 第1集", "url": "https://hongguoduanju.com/player/7503745441910017049", "episodeNumber": 1}, {"@type": "ItemList", "@id": "https://hongguoduanju.com/player/7503745441910017049#episodes", "itemListElement": [{"@type": "ListItem", "position": 2, "url": "https://hongguoduanju.com/player/7503745441910017049/7503780577347128382"}, {"@type": "ListItem", "position": 3, "url": "https://hongguoduanju.com/player/7503745441910017049/7503780574608231486"}]}, {"@type": "TVSeries", "@id": "https://hongguoduanju.com/detail?series_id=7503745441910017049#series", "url": "https://hongguoduanju.com/detail?series_id=7503745441910017049", "name": "宴律，你的白月光回国了"}]}</script>
+<script type="application/ld+json" data-rh="true">{"@context": "https://schema.org", "@type": "VideoObject", "@id": "https://hongguoduanju.com/player/7503745441910017049#video", "name": "宴律，你的白月光回国了 第1集", "url": "https://hongguoduanju.com/player/7503745441910017049", "duration": "PT3M31S", "width": 360, "height": 640, "contentUrl": "https:\\u002F\\u002Fhongguoduanju.com\\u002Fvideo\\u002Fpublic\\u002F7503780574541122622\\u002F360p.mp4?token=a\\u0026Range=0-1&amp;b=2"}</script>
+</body></html>

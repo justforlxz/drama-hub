@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+来源：https://hongguoduanju.com/sitemap/hongguoduanju/index1.xml（2026-10-30 匿名抓取，5,242,837 字节 / 43,475 个 loc）
+裁剪：只留 4 个真实 loc + 1 个非剧目 loc，其余整份删除。id 取自真实文件。
+改造：多留一条重复 loc（同一部剧在 /player 与 /detail 两种形状里各出现一次是上游常态），
+      并把 7701334722449787928 也列进来（真实 id，为构造「sitemap ∩ /category 交集」
+      而放进本 fixture）；跨页去重归框架（docs/SCHEDULER-MODEL.md 段 1），插件不去重。
+覆盖：两种剧目 URL 形状（/player/{id}、/detail?series_id={id}）、非剧目 loc 跳过、
+      页内重复 loc 原样透传（去重是框架的活）、子 sitemap 单份 5 MiB 的读取上限。
+-->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>https://hongguoduanju.com/player/7619615344046378009</loc><lastmod>2026-10-29</lastmod></url>
+<url><loc>https://hongguoduanju.com/detail?series_id=7616334357598309401</loc><lastmod>2026-10-29</lastmod></url>
+<url><loc>https://hongguoduanju.com/player/7683103397246946328</loc><lastmod>2026-10-29</lastmod></url>
+<url><loc>https://hongguoduanju.com/player/7619615344046378009</loc><lastmod>2026-10-29</lastmod></url>
+<url><loc>https://hongguoduanju.com/player/7701334722449787928</loc><lastmod>2026-10-29</lastmod></url>
+<url><loc>https://hongguoduanju.com/about</loc><lastmod>2026-10-29</lastmod></url>
+</urlset>

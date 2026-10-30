@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+来源：https://hongguoduanju.com/sitemap/hongguoduanju/index2.xml（2026-10-30 匿名抓取，5,242,877 字节 / 43,556 个 loc）
+裁剪：只留 3 个真实 loc，其余整份删除。
+改造：第一条与 sitemap-1.xml 重复（模拟跨文件重复），第二条与 sitemap-seo.xml 重复。
+覆盖：跨页去重（框架）、页内顺序保真。
+-->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>https://hongguoduanju.com/player/7683103397246946328</loc><lastmod>2026-10-29</lastmod></url>
+<url><loc>https://hongguoduanju.com/player/7603667977744960574</loc><lastmod>2026-10-29</lastmod></url>
+<url><loc>https://hongguoduanju.com/detail?series_id=7605500183484320792</loc><lastmod>2026-10-29</lastmod></url>
+</urlset>

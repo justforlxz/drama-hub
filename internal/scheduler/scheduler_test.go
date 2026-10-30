@@ -779,3 +779,51 @@ func sameSet(got, want []string) bool {
 	}
 	return true
 }
+
+// TestRound_ResumeFromCursorAfterRestart 覆盖「游标处 kill 后重启」：游标落库后重启，
+// 新一轮从游标继续——不回头重枚举走过的页，也不把库里已有的剧再灌一遍。
+//
+// 两个证据合在一条用例里：枚举只被调 2 次（page-1 不再读）、同步的 id 里没有 a/b
+// （它们在游标之后又被枚举到一次，但库里已有，差集把它们滤掉）。
+func TestRound_ResumeFromCursorAfterRestart(t *testing.T) {
+	src := &fakeSource{name: "web", pages: []plugin.Page{
+		{Refs: refs("web", "a", "b"), Next: &plugin.Cursor{Token: "page-2"}},
+		{Refs: refs("web", "c", "a"), Next: &plugin.Cursor{Token: "page-3"}},
+		{Refs: refs("web", "d", "b")},
+	}}
+	h := newHarness(t, src)
+	// 被杀之前的状态：a、b 已入库，游标停在 page-2（上一轮枚举到第 1 页之后）。
+	h.seedDrama("web", "a", "2026-10-01T00:00:00Z")
+	h.seedDrama("web", "b", "2026-10-01T00:00:00Z")
+	if err := h.st.SaveState(context.Background(), store.SourceState{
+		Name: "web", Cursor: "page-2", LastRunAt: formatTime(testNow.Add(-2 * time.Hour)),
+	}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+	// 关掉存量轮转：本用例只观察「枚举续跑 + 新剧灌库」，别让轮转刷新的 id 混进来。
+	h.set(store.KeyRefreshBatch, "0")
+	before := h.state("web").Cursor
+	t.Logf("重启前：游标 = %q，库里已有 2 部（a、b）", before)
+
+	h.runRound("web")
+
+	if got := src.enumerateCalls(); got != 2 {
+		t.Errorf("枚举页数 = %d, 期望 2（从 page-2 起，不回头重读 page-1）", got)
+	}
+	// c、d 是新的；a、b 在这两页里又出现了一次，但库里已有 → 不重复入库。
+	if got := h.syncers["web"].syncedIDs(); !sameSet(got, []string{"c", "d"}) {
+		t.Errorf("同步的 id = %v, 期望 {c,d}（a、b 已在库，差集滤掉）", got)
+	}
+	st := h.state("web")
+	if st.Cursor != "" {
+		t.Errorf("枚举走完后游标 = %q, 期望空（下一轮从起点重来）", st.Cursor)
+	}
+	if st.LastOkAt == "" {
+		t.Error("完整跑完一轮后 last_ok_at 为空")
+	}
+	if st.LastError != "" {
+		t.Errorf("成功一轮后 last_error = %q, 期望清空", st.LastError)
+	}
+	t.Logf("重启后：游标 %q → %q，入库 %d 部（跳过已在库的 2 部）",
+		before, st.Cursor, len(h.syncers["web"].syncedIDs()))
+}

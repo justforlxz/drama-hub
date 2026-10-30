@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+来源：https://hongguoduanju.com/seo-important.xml（2026-10-30 匿名抓取，4,000 个 loc）
+裁剪：只留 2 个真实 loc，其余删除。
+改造：第一条与 sitemap-2.xml 重复（真实数据里 1,954/2,000 本来就含在子 sitemap 内）。
+覆盖：第三段（seo）接在子 sitemap 之后、loc 只有 /detail 一种形状。
+-->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>https://hongguoduanju.com/detail?series_id=7605500183484320792</loc><lastmod>2026-09-10</lastmod></url>
+<url><loc>https://hongguoduanju.com/detail?series_id=7615465407347952664</loc><lastmod>2026-09-10</lastmod></url>
+</urlset>

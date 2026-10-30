@@ -8,7 +8,7 @@ L1 口径（枚举到底有多少东西）见 `docs/L1-CORPUS-SCOPE.md`。
 
 | 能力 | 谁实现 | 对应方法 | 一次调用的上游成本 | 框架拿它做什么 |
 |---|---|---|---|---|
-| 目录发现 | 插件 | `Enumerate` | 红果：30 个请求 / 全量，可分页 | 找出「源里有、库里没有」的作品 |
+| 目录发现 | 插件 | `Enumerate` | 红果：64 个请求 / 全量（30 份 sitemap + 34 页 `/category`），可分页 | 找出「源里有、库里没有」的作品 |
 | 剧目详情 | 插件 | `Work` | 红果：1 个请求 / 部 | 写 `drama` 行 |
 | 集列表 | 插件 | `Work`（同一返回值） | 0（与详情同一个响应） | 写 `episode` 行、重建 `emby_item` |
 | 直链解析 | 插件 | `Resolve` | 红果：1 个请求 / 集 | `/video/{id}/{seq}.ts` 生成分片时按需取，不落库也不进缓存索引（`docs/PLAYBACK-CONTRACT.md`） |
@@ -151,8 +151,10 @@ type Plugin interface {
    Cookie、请求头。可以含作品标识与集号（排障要）。
 4. **超时归插件。** 每次出站请求 MUST 带 `ctx`，且 `*http.Client` 有 `Timeout`
    （默认值见「配置」）。框架给整个调用另加一层 `ctx` 超时。
-5. **响应体必须限量。** 红果实测单页 213 KB，插件 MUST 用 `io.LimitReader` 封顶
-   （红果插件沿用现有 4 MiB），超限按 `ErrSchema`（页面异常放大不是可重试故障）。
+5. **响应体必须限量。** 插件 MUST 用 `io.LimitReader` 封顶，超限按 `ErrSchema`
+   （页面异常放大不是可重试故障）。红果实测页面（列表页 / 集页 / `/category` 一页）
+   213–281 KB，封顶 **4 MiB**；子 sitemap 不是「一页」而是整份 5,242,7xx 字节的 XML
+   （29 份实测均如此），单独封顶 **8 MiB**——两档上限分开，页面档不因 sitemap 放宽。
 6. **`Enumerate` 返回的 `WorkRef.Plugin` MUST 等于 `Name()`。** 框架会校验，
    不等即按 `ErrSchema` 处理（这是插件实现 bug，不是上游问题）。
 7. **`Work` 返回的 `Episodes[i].No` MUST 等于 `i+1`。** 不连续即 `ErrSchema`。
@@ -164,7 +166,7 @@ type Plugin interface {
 | 哨兵 | 触发条件（举例） | 框架动作 | 库 | 可重试 |
 |---|---|---|---|---|
 | `ErrUpstream` | 连接失败、5xx、读体失败、`ctx` 超时、空响应体 | 跳过该对象，记 `source_state.last_error` 与时间，**不清游标** | 不变 | 是（下一周期） |
-| `ErrRejected` | 429、403、风控页 | 立刻中止本轮的剩余工作，落当前游标，记错误 | 不变 | 是（退避到下一周期） |
+| `ErrRejected` | 429、403、444、风控页 | 立刻中止本轮的剩余工作，落当前游标，记错误 | 不变 | 是（退避到下一周期） |
 | `ErrSchema` | 缺 `_ROUTER_DATA`、身份校验失败、`vid_list` 为空/非数字/重复 | 跳过该对象，记错误与计数；同一轮内连续 N 次（N=20）则中止本轮（当作源级结构变更） | 不变 | 否（人等） |
 | `ErrNotFound` | 上游 404 / 明确表示已下架 | 跳过该对象，**不删库**（刷新只增改不删，见 `docs/DATA-MODEL.md`「增删改语义」） | 不变 | 否 |
 | `ErrNoStream` | `VideoObject` 在但无 `contentUrl`；集页 404 | 该集可播性 = 否。出流端点返回 502，同步流程视为成功 | 不变 | 否 |
@@ -240,7 +242,7 @@ if err := reg.Register(hongguo.New(hongguo.Config{
 
 | 方法 | 上游 | 说明 |
 |---|---|---|
-| `Enumerate` | `GET /sitemap/hongguoduanju/index.xml` → `index{N}.xml` → 并集 `GET /seo-important.xml` | 只取 `/player/{id}` 与 `/detail?series_id={id}` 的 id。一个 `Cursor` = 第几个子 sitemap + 已读位置；游标走完 30 个文件后，用 `GET /category?page=1..34` 补齐 sitemap 滞后漏掉的最新剧目 |
+| `Enumerate` | `GET /sitemap/hongguoduanju/index.xml` → `index{N}.xml` → 并集 `GET /seo-important.xml`，再 `GET /category?page=2..34` | 只取 `/player/{id}` 与 `/detail?series_id={id}` 的 id。游标 `v1:<段>:<位置>`（段 = `s`/`e`/`c`）：sitemap 段是「第几份子 sitemap」，seo 段只一份，category 段是「第几页」。走完 30 份 sitemap 后，用 `/category` 全 34 页补齐 sitemap 滞后漏掉的最新剧目。一页 = 一份上游文档（子 sitemap 整份 43,556 个 loc 一次返回），**不在文件中间切页**：切在中间要把「第几份 + 已读位置」都塞进游标，而一次 5 MiB GET 的成本本来就大于一次游标往返 |
 | `Work` | `GET /player/{id}` | 解析 `_ROUTER_DATA → loaderData["player_(series_id)/page"] → seriesDetail`：`series_name` / `series_cover` / `series_intro` / `tags` / `episode_cnt` / `vid_list` |
 | `Resolve` | `GET /player/{id}/{ep_vid}` | JSON-LD `VideoObject.contentUrl` + 绑定校验（`url` 的 pathname 含 `/player/{id}`、`contentUrl` 含 `/ep_vid`） |
 
@@ -248,6 +250,11 @@ if err := reg.Register(hongguo.New(hongguo.Config{
 - 校验沿用现有实现（`internal/provider/parse.go` 已验证的部分）：`isSuccess` 不为
   false、页面 `series_id` 与 `seriesDetail.series_id` 都等于请求 id、`vid_list` 非空/
   全数字/无重复。
+- **444 是限流，不是「不存在」。** 实测全量灌库累计约 1 万次 `/player` 之后，源侧开始对
+  `/player` 全量回 HTTP 444（无响应体、~50 ms；同一时刻 sitemap 与 `/category` 仍是 200），
+  约十几分钟后恢复。插件按 `ErrRejected` 处理（中止本轮、退避到下一周期）：不这么做的话
+  4 个 worker 会在被限流的 17 分钟里打出 98,190 次请求（444 回得快，比正常吞吐高 20 倍）。
+  取证与实测数字见 `docs/L1-CORPUS-SCOPE.md`「取证 F」。
 - **已知的源侧硬限制**（不是插件缺陷、不许在插件里「修」）：只有第 1 集公开直链，
   且是 10 秒预览；第 2..N 集 `contentUrl` 缺失；第 4 集起集页 404。
   `docs/L1-CORPUS-SCOPE.md` 取证 D 有完整数据。

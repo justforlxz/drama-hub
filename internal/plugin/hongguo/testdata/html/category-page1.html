@@ -1,0 +1,14 @@
+<!--
+来源：https://hongguoduanju.com/category（2026-10-30 匿名抓取，281 KB / 24 条推荐）
+裁剪：只保留 _ROUTER_DATA.loaderData.category_page 的 isSuccess / pagination / recommendList，
+      recommendList 只留 2 条（真实条目、真实字段），页面外壳与 category_layout 的
+      SSR 载荷全部删除，保留真实页面的 ';\nfunction runWindowFn(){…' 尾部。
+改造：pagination.totalPages 从 34 改成 2（fixture 只有 2 页），其余分页字段是真实值；
+      第 2 页第 2 条重复第 1 条（构造「同一部剧在 /category 两页各出现一次」）。
+覆盖：/category 的 series_id 提取、末页判定（Next==nil）、页码校验、跨页重复。
+-->
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>红果短剧</title></head><body>
+<script async="" data-script-src="modern-inline">_ROUTER_DATA = {"loaderData":{"category_layout":null,"category_page":{"isSuccess":true,"pagination":{"total":800,"pageNum":1,"pageSize":24,"totalPages":2},"recommendList":[{"episode_cnt":96,"series_id":"7701334722449787928","series_name":"一念沉沦，霍总心动了","tags":["爱情","都市爱情","暧昧拉扯","总裁","职场","现代"],"series_episode_info":{"episode_cnt":96,"episode_total_cnt":96,"series_status":1}},{"episode_cnt":86,"series_id":"7694653385668037657","series_name":"王妈在顾家当保姆后全家只会搞笑了","tags":["喜剧","轻喜剧","反转","直爽女主","总裁","现代","豪门"],"series_episode_info":{"episode_cnt":86,"episode_total_cnt":86,"series_status":1}}]}}};
+function runWindowFn(){window[document.currentScript.getAttribute("data-fn-name")].apply(window,JSON.parse(document.currentScript.textContent))}</script>
+</body></html>

@@ -101,23 +101,38 @@ func parseDirectURL(html, sid, vid string) (string, error) {
 	return "", fmt.Errorf("%w: 无绑定本集(%s/%s)的 VideoObject", plugin.ErrSchema, sid, vid)
 }
 
-// playerPage 从 HTML 里解出 _ROUTER_DATA，按 key 顺序取第一个 page 载荷。
-func playerPage(html string) (playerPageData, error) {
+// loaderData 从 HTML 里解出 _ROUTER_DATA.loaderData（key → 原始 JSON 载荷）。
+//
+// 三种页面（列表页、单集页、`/category`）共用一个外壳，只是 key 不同；取壳的一步
+// 放在这里，各页面的解析各自按 key 取自己的载荷。
+func loaderData(html string) (map[string]json.RawMessage, error) {
 	loc := routerDataRE.FindStringIndex(html)
 	if loc == nil {
-		return playerPageData{}, fmt.Errorf("%w: 缺 _ROUTER_DATA", plugin.ErrSchema)
+		return nil, fmt.Errorf("%w: 缺 _ROUTER_DATA", plugin.ErrSchema)
 	}
 	dec := json.NewDecoder(strings.NewReader(html[loc[1]-1:]))
 	var router struct {
 		LoaderData map[string]json.RawMessage `json:"loaderData"`
 	}
 	if err := dec.Decode(&router); err != nil {
-		return playerPageData{}, fmt.Errorf("%w: _ROUTER_DATA JSON 解码失败: %v", plugin.ErrSchema, err)
+		return nil, fmt.Errorf("%w: _ROUTER_DATA JSON 解码失败: %v", plugin.ErrSchema, err)
+	}
+	if len(router.LoaderData) == 0 {
+		return nil, fmt.Errorf("%w: _ROUTER_DATA 缺 loaderData", plugin.ErrSchema)
+	}
+	return router.LoaderData, nil
+}
+
+// playerPage 解出 player 页的载荷：按 key 顺序取第一个存在的 page。
+func playerPage(html string) (playerPageData, error) {
+	loader, err := loaderData(html)
+	if err != nil {
+		return playerPageData{}, err
 	}
 	// 列表页与单集页两个 key 同构，按固定优先序取第一个存在的：列表页优先，
 	// 单集页兜底（实测两类页面各只有其中一个 key）。
 	for _, key := range []string{"player_(series_id)/page", "player_(series_id)/(vid)/page"} {
-		raw, ok := router.LoaderData[key]
+		raw, ok := loader[key]
 		if !ok {
 			continue
 		}

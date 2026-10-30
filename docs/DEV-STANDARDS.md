@@ -74,6 +74,9 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 启动引导只读环境变量三项：`DRAMA_HUB_DB`、`DRAMA_HUB_ADDR`、`DRAMA_HUB_LOG_LEVEL`。其余全部走 settings。
 
+写入路径只有 `Settings.Set`（进程内），**没有 HTTP 写入口**：管理面 `/api/status` 只读。
+因此首次部署与改配置要直写 `settings` 表，运维侧写法与校验方式见 `docs/OPS.md` §2.4。
+
 | key | 默认 | 取值范围 | 作用 |
 |---|---|---|---|
 | `strm_prefix` | `""` | URL 或空 | strm 内 URL 前缀，指向 rclone/openlist 代理 |

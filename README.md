@@ -2,10 +2,10 @@
 
 短剧媒体管理器。把红果短剧的数据整理成 Emby 能直接识别的剧集库。
 
-- 只读虚拟 WebDAV：按需渲染 `.strm` / `.nfo` / 封面，Emby 通过 `rclone mount` 扫描
+- 只读虚拟 WebDAV：按需渲染 `.strm` / `.nfo`，Emby 通过 `rclone mount` 扫描
 - 出流服务：单集 MP4 透传（支持 Range），合并集自造 HLS 播放列表，按分片回源
 - 合并集：N 集合成 1 条剧集，时间轴精确到关键帧，**不落物化文件**
-- 缓存：分片级 LRU，上限与保留期后台可调
+- 缓存：由缓存代理（rclone `serve http` + `--vfs-cache-mode full`）负责淘汰，本服务只给建议参数（ADR-0004）
 
 ## 快速开始
 
@@ -14,7 +14,9 @@ make build                    # 产出 ./bin/drama-hub
 DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 ```
 
-首次启动自动建库与迁移。
+首次启动自动建库与迁移。首次部署还要写一次 `settings`（`webdav_user` / `webdav_pass` /
+`stream_secret` / `strm_prefix`，**当前没有配置写入 API**，写法见 `docs/OPS.md` §2.4），
+否则 WebDAV 恒 401、`/s/` 恒 500。安装、接 rclone/Emby、升级与回滚的全部步骤见 `docs/OPS.md`。
 
 ## HTTP 接口
 
@@ -103,28 +105,36 @@ Emby 库路径指向 `/mnt/dramahub`（DAV 根即剧集库根），类型选「�
 生产与测试共用同一个镜像，ffmpeg 版本由镜像固定（见 `env.lock`）：
 
 ```bash
-make env-check                  # 校验容器内 go/ffmpeg 版本与 env.lock 一致
-make e2e-image                  # 构建测试镜像（runtime + Go 工具链）
-make test-e2e                   # 容器内跑集成测试，--network=none
-make run-container              # 容器内起服务，挂 ./data，映射 :8080
+./scripts/ci.sh                 # CI 单入口：lint（gofmt/build/check-deps/vet/staticcheck）+ 容器内 -race 测试 + 版本锁
+./scripts/ci.sh --lint          # 只跑静态检查
+./scripts/ci.sh --test          # 只跑容器测试
+make test                       # 等价于容器内跑全部测试（--network=none）
+make run                        # 容器内起服务，挂 ./data，PORT 可选
+make shell                      # 进 e2e 镜像的 shell
 ```
 
 本机 `make build` / `make test` 只用于快速迭代：开发机 ffmpeg 与容器 ffmpeg 版本不同，
 本机结果不能作为验收依据。升级基础镜像 = 改 `Containerfile` 的 digest + `env.lock` + 跑 `make env-check`。
 
 podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限定名 `localhost/drama-hub`，运行命令带 `--pull=never`。
-宿主机 8080 被占用时用 `make run-container PORT=18081`。
+宿主机 8080 被占用时用 `make run PORT=18081`。
 
 ## 文档
 
 - `AGENTS.md` — 硬约束与目录约定（改代码前先读）
 - `docs/DEV-STANDARDS.md` — 依赖、错误处理、配置、日志规范
 - `docs/TEST-STANDARDS.md` — 测试分层、必须覆盖的协议断言
-- `docs/ACCEPTANCE.md` — 真机验收清单
+- `docs/ACCEPTANCE.md` — 真机验收清单与本轮（P2–P5）实测记录
+- `docs/OPS.md` — 安装 / 升级 / 回滚，配置引导与已知限制
 - `docs/adr/` — 架构决策记录
 
 ## 状态
 
-实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、合并编排与派生表重建齐备。R1（管理界面三页）已实现：剧目增删、合并编排、同步与缓存看板都接真实 API。真机验收（P2–P5）待跑。
+实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、合并编排与派生表重建齐备。R1（管理界面三页）已实现：剧目增删、合并编排、同步与缓存看板都接真实 API。
+
+R2 的真机验收（P2–P5）已跑，结论是**尚未跑通**：P2 的 rclone 面（三级目录、长度、strm 前缀）
+通过；单集出流与合并集出流被三处缺口挡住 —— ① `episode.play_url` 没有来源（同步不写、
+`FetchDirectURL` 无生产调用方、上游只给首集 10 秒预览片）② 分片索引没有触发点（`segment` 表恒空）
+③ 不渲染封面、不采集时长。另有缓存代理接法未验证、配置无写入 API 两项运维面缺口。逐条命令与输出见 `docs/ACCEPTANCE.md`，影响面见 `docs/OPS.md` §7。
 
 设计基线见 MKACG-580 附件 `DESIGN-drama-hub.md`。

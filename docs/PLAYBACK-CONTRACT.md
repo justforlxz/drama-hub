@@ -41,11 +41,27 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid
 - **不可猜**：没有 `stream_secret` 造不出合法 id。
 - 换 `stream_secret` 后所有 URL 失效（与现状一致，`docs/DEV-STANDARDS.md`「鉴权」已这么定）。
 
-**为什么不是 RFC-4122 UUID**：真 UUID 要么落库（`emby_item` 整体重建会换值 → URL 漂 →
+**D1 已定（lxz 2026-10-30）**：「可以不用 UUID，只要保证不飘移即可」。因此就是上面这个方案。
+
+**为什么不是 RFC-4122 UUID**：真 UUID 要么落库（`emby_item` 整体重建会换值 → URL 飘 →
 缓存全废），要么挂到 `episode` / `merge_group`（两张表各加一列 + 一次迁移），
-换来的只是「看起来像 UUID」。id 只需要「不透明 + 稳定 + 不可猜」，上面三条 HMAC 方案全满足，
-且零 schema 变更。若 PL 坚持真 UUID，唯一不破坏缓存的做法是把它挂在 `episode` /
-`merge_group` 上（**不是** `emby_item`），这一点必须写进 ADR 再改。
+换来的只是「看起来像 UUID」。而「不飘移」这个真正的要求，签名 id 用一条恒等式就满足了：
+`id` 只由 `uid` 与 `stream_secret` 决定，`uid` 只由 `episode.id` / `merge_group.id` 决定，
+这两样在库的整个生命周期里都不变。
+
+**「不飘移」的可验证形式**（必须有一条测试钉住）：
+
+```
+1. 同一集连续 GET /video/{id}.m3u8 两次 → 两次的 {id} 逐字符相同
+2. 触发一次全量刷新（UpsertEpisode + RebuildEmbyItems）后再取 → {id} 仍然相同
+3. 建/删一个合并组，使某集在 single 与 merged 之间转换 → 该集 old id 返回 **404**
+   （`e<id>` 已不在 `emby_item` 里，签名仍然有效所以要区分 401 与 404）、
+   new id 稳定；**未受影响的其它集 id 一个都不变**
+4. 重启进程（settings 不变）→ 所有 {id} 不变
+```
+
+第 3 条是唯一会让 id 变化的情形，而且是语义上必须变（播放单元变了）。
+只要 `stream_secret` 不变，id 就不会因为「同步 / 重建派生表 / 重启 / 改目录」而飘。
 
 ## `GET /video/{id}.m3u8`
 

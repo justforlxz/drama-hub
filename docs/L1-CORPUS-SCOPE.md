@@ -148,5 +148,7 @@ ffprobe -v error -show_entries format=duration  # duration=10.066667
 但单个分类目录仍有约 21.6 万个子目录。`x/net/webdav` 的 `walkFS` 对一次 `PROPFIND`
 调用 `Readdir(0)` 把**全部**子项读进内存再逐个 `Stat`
 （`x/net/webdav@v0.62.0/webdav/file.go:787`），所以 20 万级子项的目录不是「慢」而是
-「不可列举」。这是 `docs/DIRECTORY-CONTRACT.md` 里 **D2** 要 PL 拍板的唯一一件事，
-不阻塞 stage 2 / 3 / 5（S2/S3/S4/S5 的数据面与调度面与目录形状无关）。
+「不可列举」。对策已定（`docs/DIRECTORY-CONTRACT.md`「D2」）：分类目录下加一层纯函数分片
+（`shard = fnv32a(provider_id) % N`，默认 `N=128`），把最大分类从 21.6 万摊到 ~1.7k。
+具体 `N` 由 S4 全量跑完后的 `SELECT genre, COUNT(*) FROM drama GROUP BY genre` 校准，
+不改 schema、不需要再决策。

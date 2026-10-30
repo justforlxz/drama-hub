@@ -70,9 +70,12 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 ## 配置
 
-> **2.0 新增 8 个 key**（`refresh_interval_sec`、`refresh_batch`、`refresh_timeout_sec`、
-> `cache_dir`、`cache_max_mb`、`cache_lru_days` 与 `plugin.<源>.*` 前缀），取值范围见
-> `docs/SCHEDULER-MODEL.md`「配置」与 `docs/CACHE-MODEL.md`「淘汰」。本表待实现时合并。
+> **2.0 新增 6 个全局 key**（`refresh_interval_sec`、`refresh_batch`、`refresh_timeout_sec`、
+> `cache_dir`、`cache_max_mb`、`cache_lru_days`）**加一族 `plugin.<源>.*`**
+> （`enabled` / `base_url` / `request_timeout_sec` / `refresh_interval_sec`）。
+> 取值范围见 `docs/SCHEDULER-MODEL.md`「配置」与 `docs/CACHE-MODEL.md`「淘汰」。
+> 本表待实现时合并；ADR-0007 已确认缓存上限与 LRU 天数是本服务的配置
+> （`AGENTS.md` 硬约束 5 已同步改写）。
 
 运行时配置只有一张表 `settings(key TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT)`。
 

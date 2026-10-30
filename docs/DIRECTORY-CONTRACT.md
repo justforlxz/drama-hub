@@ -1,8 +1,8 @@
 # 目录契约
 
-状态：定稿 v2（2026-10-30 / MKACG-604，按 lxz 2026-10-30 评论重写）
+状态：定稿 v3（2026-10-30 / MKACG-604）
 v2 变更：**删除 `全部/` 一级目录**，顶层直接是分类目录；挂载点 `/dav/` → `/webdav/`。
-含 1 个待 PL 拍板项（**D2**）。
+v3 变更：**D2 已定 —— 分类目录下加一层分片目录**（原因见「D2」）；分片数 N 待 S4 实测校准。
 前置：`docs/DATA-MODEL.md`（`drama.genre` 是分类键）、`docs/PLAYBACK-CONTRACT.md`（`.strm` 的内容）
 
 ## 要交付的形状
@@ -10,21 +10,25 @@ v2 变更：**删除 `全部/` 一级目录**，顶层直接是分类目录；�
 ```
 /webdav/                     ← 只读虚拟 WebDAV
 ├── 其他/                    ← genre='' 的兜底目录（没有这种剧时不出现）
-│   └── <剧名> (<年份>)/
-│       ├── tvshow.nfo
-│       └── Season 01/
-│           ├── <剧名> - S01E01 - <第1集标签>.strm
-│           └── <剧名> - S01E01 - <第1集标签>.nfo
+│   └── <分片 00–7f>/        ← 纯函数分片，见「D2」
+│       └── <剧名> (<年份>)/
+│           ├── tvshow.nfo
+│           └── Season 01/
+│               ├── <剧名> - S01E01 - <第1集标签>.strm
+│               └── <剧名> - S01E01 - <第1集标签>.nfo
 ├── 家庭/
-│   └── <剧名> (<年份>)/…
+│   └── <分片>/<剧名> (<年份>)/…
 ├── 爱情/
-│   └── <剧名> (<年份>)/…
+│   └── <分片>/<剧名> (<年份>)/…
 └── 都市/
-    └── <剧名> (<年份>)/…
+    └── <分片>/<剧名> (<年份>)/…
 ```
 
 - **顶层只有分类目录，没有 `全部/`。** 一部剧只出现在它自己那一个分类目录下
   （`drama.genre` 是单值），所以**同一部剧在树里只出现一次**。
+- **分类与剧之间有一层纯函数分片目录**（`00`–`7f`，128 个）：`shard = fnv32a(provider_id) % N`，
+  `N` 是代码常量（默认 128），不落配置、不依赖时间、剧改名也不换分片。
+  理由见「D2」——这是让 Emby 能扫描的前提，不是可选项。
 - DAV 挂载点根 = vfs 的 `短剧`（`internal/vfs/tree.go:root`；`internal/webdav/fs.go:resolve`
   已有映射）。vfs 路径是 `短剧/<类型>/…`，DAV 路径是 `/<类型>/…`。
 - 季目录仍只有 `Season 01`（`emby_item.season` 恒为 1，不改）。
@@ -40,18 +44,26 @@ v2 变更：**删除 `全部/` 一级目录**，顶层直接是分类目录；�
 /webdav/
 ├── 其他/                                  ← 仅当有 genre='' 的剧时存在
 ├── 家庭/
-│   └── 嫁进沈家第一天，我把规矩掀了 (2026)/
-│       ├── tvshow.nfo
-│       └── Season 01/
-│           ├── 嫁进沈家第一天，我把规矩掀了 - S01E01 - 第1集.strm
-│           └── 嫁进沈家第一天，我把规矩掀了 - S01E01 - 第1集.nfo
+│   ├── 0a/
+│   │   └── 嫁进沈家第一天，我把规矩掀了 (2026)/
+│   │       ├── tvshow.nfo
+│   │       └── Season 01/
+│   │           ├── 嫁进沈家第一天，我把规矩掀了 - S01E01 - 第1集.strm
+│   │           └── 嫁进沈家第一天，我把规矩掀了 - S01E01 - 第1集.nfo
+│   └── 3f/ …
 ├── 爱情/
-│   └── 一念沉沦，霍总心动了 (2026)/
-│       └── Season 01/…
+│   ├── 1c/
+│   │   └── 一念沉沦，霍总心动了 (2026)/
+│   │       └── Season 01/…
+│   └── 5e/ …
 └── 都市/
-    └── 重返2000，撕毁协议后我成为沪上巨鳄 (2026)/
-        └── Season 01/…
+    └── 72/
+        └── 重返2000，撕毁协议后我成为沪上巨鳄 (2026)/
+            └── Season 01/…
 ```
+
+（分片号是 `fnv32a(provider_id) % 128` 的两位十六进制，只保证均匀与稳定，
+**不承载任何业务含义**——不要试图从中推断任何东西。）
 
 `.strm` 的内容（一行）：
 
@@ -74,7 +86,9 @@ v2 变更：**删除 `全部/` 一级目录**，顶层直接是分类目录；�
 
 ## 同名剧冲突规则
 
-冲突的定义：**同一个父目录下出现两个完全相同的子目录名**。
+冲突的定义：**同一个父目录下出现两个完全相同的子目录名**。加了分片层之后，
+父目录是 `/<类型>/<分片>/`，所以两条同名同年的剧若落在不同分片，**不构成冲突**，
+两边都用基准名——冲突面反而变小了。
 
 1. 基准名 `base = sanitizeName(title) + " (" + year + ")"`（现有 `dramaDir`，不改）。
 2. 若在同一个父目录内 `base` 重复，则该父目录下**所有**冲突成员改用
@@ -92,7 +106,7 @@ v2 变更：**删除 `全部/` 一级目录**，顶层直接是分类目录；�
 | 问题 | 答案 |
 |---|---|
 | 会产生重复条目吗？ | **不会。** 每部剧只在它的分类目录下出现一次（没有 `全部/` 了）。 |
-| Emby 库怎么配？ | **一个「剧集」库，媒体文件夹添加全部 `/<类型>` 目录**（19 个左右）。Emby 支持一个库挂多个文件夹，每个文件夹各自扫剧；`/webdav` 本身**不要**作为库根——那样 `爱情` 目录会被当成一部剧。 |
+| Emby 库怎么配？ | **一个「剧集」库，库根 = `/webdav`**，Emby 逐层往下扫（`分类/分片/剧/Season 01`）。不需要逐个挂 19×128 个文件夹。若 Emby 在 `/webdav` 上不能正确识别（把分类当成剧），退一步挂具体分类目录（`/webdav/爱情` 等，19 个，可接受）。**这条是 S7 的验收项，必须实测**——两种配法本服务的树都支持。 |
 | 集号会变吗？ | **不会。** 集号来自 `emby_item.ep_no`（硬约束 6），本契约只改父级目录。 |
 | 已有库要重建吗？ | 要。路径全变（多一级分类目录），Emby 会当新库重扫。2.0 一次性代价，不做路径兼容层。 |
 | rclone 侧有影响吗？ | `--max-depth` +1（`docs/ACCEPTANCE.md` P2 的 `--max-depth 3` → 4）；**不再需要 `--vfs-cache-mode full`**（播放不经过 rclone，见 ADR-0007）。 |
@@ -114,8 +128,9 @@ v2 变更：**删除 `全部/` 一级目录**，顶层直接是分类目录；�
 ```go
 // List 只返回某一个目录的直接子项，不返回孙子及以下。
 // dir 是相对 vfs 根的路径（"" = vfs 根）；不存在的目录 → ErrNotFound。
-// 成本：根目录 1 次 DISTINCT genre；分类目录 1 次 WHERE genre=? 分页查询；
-//      Season 目录 1 次 ListEmbyItems。与全库规模无关。
+// 成本：根目录 1 次 DISTINCT genre；分类目录 1 次 DISTINCT shard（或直接回 00–7f）；
+//      分片目录 1 次 WHERE genre=? AND shard=? 分页查询；Season 目录 1 次 ListEmbyItems。
+//      与全库规模无关。
 List(ctx context.Context, dir string) ([]Node, error)
 ```
 
@@ -125,56 +140,96 @@ List(ctx context.Context, dir string) ([]Node, error)
   或后缀形态下 `WHERE provider=? AND provider_id=?`。**不许再 `ListDramas` 全表扫**
   （现有 `dramaByDir` 是线性匹配）。
 
-## D2（待 PL 拍板）：分类目录的子项数
+## D2（已定）：分类目录下必须有分片层
 
-删掉 `全部/` 之后，问题没有消失，只是挪到了分类目录上：
+### 问题是什么（一句话）
 
-**实测**：`/category` 全 800 部里「爱情」占 35.5%。按 608,372 部推算，最大的分类目录
-**≈ 21.6 万**个剧目录；19 个分类里平均也有 3 万。
-`golang.org/x/net/webdav@v0.62.0/webdav/file.go:787` 的 `walkFS` 对一次 `PROPFIND`
-无条件 `f.Readdir(0)`——把全部子项读进内存再逐个 `Stat`。21.6 万子项时约 22 MB
-`FileInfo` + 21.6 万次 `Stat` + 约 65 MB 响应体：`PROPFIND Depth:1` 不可用，Emby 扫不动。
+WebDAV 的 `PROPFIND` **没有分页**。客户端说「列出这个目录」，服务端就必须把目录里
+**所有**子项的元数据一次拼成一份 XML 返回。所以「一个目录里放多少东西」不是性能调优，
+而是**能不能列出来**的二值问题。
 
-三个选项：
+### 会具体怎么炸
 
-| 选项 | 树形 | 代价 | 最坏目录子项数 |
-|---|---|---|---|
-| **D2-a（推荐）** | `/<类型>/<分片>/<剧>/…`，分片 `00`–`3f` 共 64 个 | 多一级目录；Emby 媒体文件夹从 ~19 个变成 ~1216 个（一次性配置）；分片名是机器生成的两字符 | ≈ 3.4 k |
-| D2-b | 形状不变，WebDAV 只暴露「显式上架」的剧 | 新概念 + 新表 + 管理面开关，用户要手工上架；与 L1「全部」口径冲突 | 取决于上架量 |
-| D2-c | 形状不变，全量暴露 | stage 4 的产物 Emby 扫不动，等于没做 | 216 k |
+`golang.org/x/net/webdav@v0.62.0/webdav/file.go:787` 的 `walkFS`：
 
-**推荐 D2-a**：
+```go
+fileInfos, err := f.Readdir(0)   // 0 = 要全部，拿到内存里
+for _, fi := range fileInfos {
+    fi, err := fs.Stat(ctx, filename)   // 逐个再 Stat 一次
+```
 
-- 零新状态：`shard = fnv32a(provider_id) % 64` 是纯函数，不落库、不配置、不依赖时间，
-  剧改名也不换目录。
-- 零新概念：不需要用户理解「上架」，只是把同一批目录多切一层。
-- D2-c 不是方案，是承认失败；D2-b 与 L1 口径直接冲突。
+删掉 `全部/` 之后，最大的分类目录里有 **≈ 21.6 万个剧目录**
+（`/category` 800 抽样里「爱情」占 35.5%，按 608,372 部推算；19 个分类平均 3 万）。
+Emby 扫到 `/webdav/爱情` 时会发生：
 
-**若采纳 D2-a，`0002` 要加一列**（否则 `WHERE shard=?` 只能全表扫）：
+1. 服务端先在内存里造出 21.6 万个 `FileInfo`（约 22 MB），
+2. 再对每一个调一次 `Stat`（21.6 万次），
+3. 再拼成一份约 **65 MB** 的 XML 一次性写出去。
+
+`PROPFIND Depth:1` 于是超时/被 Emby 判定失败，扫描停在这一层——**这部剧库根本建不起来**。
+Emby 不会「分批慢慢扫」，协议层没有这个选项。
+
+### 定下来的做法
+
+`/<类型>/<分片>/<剧>/…`，`shard = fnv32a(provider_id) % N`，分片目录名是两位十六进制
+（`00`–`7f`）。默认 `N = 128`。
+
+- 后果：最大分类 ≈ 216k/128 ≈ **1.7k** 个子项/目录，一份 XML 约 500 KB，Emby 正常。
+- 分片是**纯函数**：不落配置、不依赖时间、不随剧改名变化（用 `provider_id` 而非 `title`）。
+- 用户看不出规律，也不需要看出规律：它只是把一批目录摊薄，没有业务含义。
+- 代价只有一处：目录深了一层；rclone `--max-depth` 与 `lsf` 的层数各 +1。
+  **Emby 侧不用多配**：库根仍是 `/webdav`，Emby 会逐层往下扫。
+
+### `N` 怎么定（不用现在拍）
+
+`N` 是代码常量，不是 schema。目标只有一个：**最大分类的子项数 / N ≤ 3000**。
+
+- 现在的 216k 是**抽样推算**，S4 全量跑完后用
+  `SELECT genre, COUNT(*) FROM drama GROUP BY genre` 得到精确值；
+- 若最大分类实测 21 万，`N=128` 给 1.7k（达标）；若实测 40 万，`N=256` 给 1.6k；
+- 改 `N` 只需一条 `UPDATE drama SET shard = …` 重算 + 重扫 Emby，**不改 schema**。
+
+所以 S6 开始前不需要再找你拍板，只要「分片层存在」这个前提，而它已经定了。
+
+### 被否决的两个做法
+
+| 做法 | 为什么不 |
+|---|---|
+| 不分片、按现在的形状全量暴露 | Emby 在分类层就扫不动，stage 4 的产物等于不可用 |
+| WebDAV 只暴露「显式上架」的剧 | 要新增「上架」概念 + 一张表 + 管理面开关，而且把「全部」变成「部分」，与 L1 口径冲突 |
+
+### `0002` 里的落地
+
+分片键要能进 SQL（否则 `WHERE shard=?` 只能全表扫），因此存一列：
 
 ```sql
--- 目录分片键：fnv32a(provider_id) % 64，写库时由框架算好存下。
--- 只服务分类目录的分页列举，不参与任何业务语义。
+-- 目录分片键：fnv32a(provider_id) % N，写库时由框架算好存下。
+-- 只服务分类目录的分页列举，不参与任何业务语义；改 N 时一条 UPDATE 重算。
 ALTER TABLE drama ADD COLUMN shard INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_drama_genre_shard_title ON drama (genre, shard, title);
 ```
 
-（此时 `0002` 里原来的 `idx_drama_genre_title` 与 `idx_drama_title` 被上面这条取代，
-不要两套并存。）
+`idx_drama_title` 仍然保留：`Render` 用 `WHERE title = ? AND year = ?` 做点查，
+那是索引寻址，不需要经过分片（分片只用于「列举一个目录」）。
 
-**不阻塞**：D2 只影响 stage 4（S6）。S2（插件化）、S3（调度）、S4（全量同步）、
-S5（数据字段与缓存）都不依赖它。截止时间：**S6 派单之前**。
+### 对 Emby 与扫描成本的老实话
 
+- 库根 `/webdav`，Emby 递归下去，**不需要挂 19 个文件夹，也不需要挂 128×19 个**。
+- 但全量入库 = Emby 里有 **60 万个剧目录**。一次完整扫描要逐个 `PROPFIND` 剧目录，
+  量级是十几 GB 的 XML 与数小时到数天的机器时间，这是 L1「全部」自带的代价，
+  分片解决的是「扫不进去」，不解决「扫得慢」。
+- 若嫌慢：Emby 库里只挂你想看的几个分类目录（`/webdav/爱情` 等），
+  这是 Emby 自带能力，不需要改本服务任何东西。
 ## 现有实现的改动清单（给 S6 的输入）
 
 | 位置 | 改动 |
 |---|---|
 | `internal/webdav/handler.go` | `MountPath = "/dav/"` → `"/webdav/"`（PROPFIND 的 href 由它生成，无第二处字面量）；测试与 `cmd` 的注册跟着改 |
-| `internal/vfs/tree.go` | 顶层改成分类目录；`List` → `List(ctx, dir)`；`parsePath` 段数 3/4 → 4/5（D2-a 则 5/6）；`dramaByDir` 改走索引 |
+| `internal/vfs/tree.go` | 顶层改成分类目录 + 分片层；`List` → `List(ctx, dir)`；`parsePath` 段数 3/4 → 5/6（`短剧/<分类>/<分片>/<剧>/tvshow.nfo` = 5，`…/Season 01/<文件>` = 6）；`dramaByDir` 改走 `idx_drama_title` |
 | `internal/vfs/render.go` | `renderStrm` 改成 `{strm_prefix}/video/{id}.m3u8`（`docs/PLAYBACK-CONTRACT.md`） |
 | `internal/vfs/tree.go:embyBase` / `embyLabel` / `renderItemNFO` / `renderShowNFO` | **不动** |
 | `internal/webdav/fs.go` | `Tree` 接口改签名；`nodes()` 按路径取子项；`snapshot` 键改成目录 |
-| `internal/store/crud.go` | 新增 `ListGenres(ctx)`（`SELECT DISTINCT genre`）、`ListDramasByGenre(ctx, genre, page)`、剧名→id 的索引查询 |
+| `internal/store/crud.go` | 新增 `ListGenres(ctx)`（`SELECT DISTINCT genre`）、`ListDramasByGenreShard(ctx, genre, shard, page)`、剧名→id 的索引查询；`shard` 列在 `UpsertDrama` 里按 `fnv32a(provider_id) % N` 写入 |
 | `docs/ACCEPTANCE.md` | 路径 `/dav/` → `/webdav/`；`--max-depth` +1；Emby 库配法改成「一个库多个媒体文件夹」 |
 
 ## 2.0 明确不做

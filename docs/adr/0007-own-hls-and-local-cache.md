@@ -1,6 +1,7 @@
 # ADR-0007：播放统一走自造 HLS，分片缓存收回本服务
 
-状态：提议，待 PL 确认（2026-10-30，MKACG-604）
+状态：**已接受**（2026-10-30，MKACG-604）。lxz 2026-10-30 确认：「D1 可以不用 UUID，只要保证不飘移即可」
+「ADR-0007 本服务必须提供一定的缓存业务」。缓存不是可选项，`AGENTS.md` 硬约束 5 已同步改写。
 上游口子：lxz 2026-10-30 评论（原文：「提供 /video 来播放一个uuid的m3u8，strm里填写的就是自己的
 /video/xxxxxx.m3u8 这种结构……需要一个缓存模块，用来本地缓存海报照片和m3u8，因为m3u8里是包含
 多个视频文件的，本服务负责在播放m3u8时提供数据转换和缓冲功能」）
@@ -83,11 +84,11 @@ rclone 从播放链路里退出，只留 WebDAV 只读挂载。
 
 | 文件 | 要改的段落 |
 |---|---|
-| `AGENTS.md` | 硬约束 5 的「缓存上限与 LRU 天数不是本服务的配置」整句删除，改为指向 `docs/CACHE-MODEL.md`；「做」清单加「本地分片缓存」 |
+| `AGENTS.md` | ✅ **已改**：硬约束 5 改为「缓存由本服务自己负责（ADR-0007）」并指向 `docs/CACHE-MODEL.md`；「做」清单改成「本地分片缓存与淘汰」；`internal/cache` 目录说明补上分片 |
 | `docs/DEV-STANDARDS.md` | 「配置」表加 3 个 key；「出流（stream）」整章按 `/video` 重写；「数据源」章的 `play_url` 段落改指向 `docs/PLAYBACK-CONTRACT.md` |
 | `docs/TEST-STANDARDS.md` | 加 `docs/CACHE-MODEL.md`「测试要求」的 6 条 |
 | `docs/ACCEPTANCE.md` | P2/P3/P4 的路径 `/dav/` → `/webdav/`、URL 形态改成 `/video/{id}.m3u8`；P4（缓存代理）改成「本地分片缓存」验收 |
 | `README.md` | HTTP 接口表、接到 Emby 一节（库根与 rclone 配置） |
 
-这些文档的修改属于 S2/S3/S5/S6 的落地范围：本 ADR 只定方向，不与设计稿抢同一份文件。
-`AGENTS.md` 是项目宪法，**由 PL 确认后改**，不由实现方顺手改。
+`AGENTS.md` 已随本 ADR 一起改（它是裁决依据，不跟着改就会与代码打架）。
+其余四份文档属于 S2/S3/S5/S6 的落地范围：本 ADR 只定方向，不与实现抢同一份文件。

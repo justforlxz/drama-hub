@@ -38,11 +38,17 @@ ALTER TABLE drama ADD COLUMN genre TEXT NOT NULL DEFAULT '';
 -- 的保真，不做检索；归类只认 genre 单值。
 ALTER TABLE drama ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
 
--- 目录列举：WHERE genre = ? ORDER BY title 走本索引（同一条索引也覆盖纯 genre 的
--- DISTINCT / GROUP BY，因此不再单建 (genre)）。
-CREATE INDEX IF NOT EXISTS idx_drama_genre_title ON drama (genre, title);
+-- 目录分片键：fnv32a(provider_id) % N（N 是代码常量，默认 128），写库时由框架算好存下。
+-- 只服务分类目录的分页列举，不参与任何业务语义；改 N 时一条 UPDATE 重算，不改 schema。
+-- 为什么必须有分片层：PROPFIND 没有分页，单个目录子项上万时 Emby 扫不动
+-- （docs/DIRECTORY-CONTRACT.md「D2」）。
+ALTER TABLE drama ADD COLUMN shard INTEGER NOT NULL DEFAULT 0;
 
--- /全部/ 目录的列举：ORDER BY title。
+-- 目录列举：WHERE genre = ? AND shard = ? ORDER BY title 走本索引
+-- （同一索引也覆盖纯 genre / 纯 shard 的 DISTINCT 与 GROUP BY）。
+CREATE INDEX IF NOT EXISTS idx_drama_genre_shard_title ON drama (genre, shard, title);
+
+-- 剧目录名 → 行的点查：WHERE title = ? AND year = ?（Render 每个请求一次）。
 CREATE INDEX IF NOT EXISTS idx_drama_title ON drama (title);
 
 -- 数据源级调度状态：每源一行。
@@ -66,8 +72,9 @@ CREATE TABLE IF NOT EXISTS source_state (
 |---|---|---|---|
 | `drama.genre` | `/<类型>/` 一级目录的分类键；一条剧只属一个类型 | 框架（`Work().Genres[0]`） | `internal/vfs` 目录列举 |
 | `drama.tags` | 保真：上游声明的全部标签 | 框架（`Work().Genres`） | 只出现在管理面/AI 检索，不进目录 |
-| `idx_drama_genre_title` | `/<类型>/` 目录的分页列举（`WHERE genre=? ORDER BY title`）；也覆盖 `SELECT DISTINCT genre` 与 `GROUP BY genre` | — | `internal/vfs`、`internal/web` |
-| `idx_drama_title` | `全部/` 目录的分页列举（`ORDER BY title`） | — | `internal/vfs` |
+| `drama.shard` | 分片目录键：`fnv32a(provider_id) % N`，把每个分类目录摊薄到 ≤3000 子项 | 框架（写 `drama` 时算） | `internal/vfs` 分类目录列举 |
+| `idx_drama_genre_shard_title` | `/<类型>/<分片>/` 的分页列举（`WHERE genre=? AND shard=? ORDER BY title`）；也覆盖 `SELECT DISTINCT genre` 与 `GROUP BY genre` | — | `internal/vfs`、`internal/web` |
+| `idx_drama_title` | 剧目录名点查（`WHERE title=? AND year=?`），`Render` 每请求一次 | — | `internal/vfs` |
 | `source_state.cursor` | 枚举断点，38 小时全量灌库续跑 | 调度器（每轮成功后写） | 调度器 |
 | `source_state.last_run_at` | 算 `next_due` 的唯一真值来源（重启可算） | 调度器 | 调度器、状态页 |
 | `source_state.last_ok_at` | 状态页「上次成功」 | 调度器 | 状态页 |
@@ -245,12 +252,12 @@ cd <repo-copy> && go test ./internal/store/ -run TestS1 -v
 二次 applied=0                       # 重复执行幂等
 user_version=4                       # 两次打开后都停在 4
 play_url 已移除: no such column: play_url
-索引 idx_drama_genre_title / idx_drama_title / idx_artifact_kind_last_used 均存在
-默认值 genre="" tags="[]"
+索引 idx_drama_genre_shard_title / idx_drama_title / idx_artifact_kind_last_used 均存在
+默认值 genre="" tags="[]" shard=0
 artifact 允许 kind='segment'；CHECK 拒绝未知 kind
 重建前插入的 cover/index 两行在重建后仍在（逐字段相同，总行数 2）
 迁移 0001 0001_init.sql    (3806 bytes)
-迁移 0002 ...              (1590 bytes)
+迁移 0002 ...              (2099 bytes)
 迁移 0003 ...              (275 bytes)
 迁移 0004 ...              (996 bytes)
 ```
@@ -269,7 +276,7 @@ artifact 允许 kind='segment'；CHECK 拒绝未知 kind
 
 | 文件 | 影响 |
 |---|---|
-| `internal/store/crud.go` | `Drama` 加 `Genre`/`Tags`；`Episode` 删 `PlayURL`/`PlayURLAt`；列清单与 scan 同步 |
+| `internal/store/crud.go` | `Drama` 加 `Genre`/`Tags`/`Shard`；`Episode` 删 `PlayURL`/`PlayURLAt`；列清单与 scan 同步；`UpsertDrama` 写入 `shard` |
 | `internal/store/migrations/0002_*.sql`、`0003_*.sql` | 新增（内容见上） |
 | `internal/store/state.go`（新） | `source_state` 的读写：`LoadState` / `SaveState` |
 | `internal/store/stats.go` | 删 `PlayableEpisodes` |

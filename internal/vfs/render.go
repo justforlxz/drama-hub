@@ -13,10 +13,11 @@ const xmlHeader = `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>` + "
 
 // renderStrm 渲染 strm 内容：一行 URL + 尾换行。
 //
-// 形态 `{strm_prefix}/s/{token}/e/{uid}\n`。uid 取 emby_item.uid（单集
+// 形态 `{strm_prefix}/video/{id}.m3u8\n`（docs/PLAYBACK-CONTRACT.md「.strm 的内容」）：
+// 单集与合并集没有区别，对外统一是 HLS 播放列表。uid 取 emby_item.uid（单集
 // `e<episode.id>`、合并集 `m<group.id>`），派生表的 uid 是唯一真值（硬约束 6）。
-// token 由注入的 TokenFunc 计算；strm_prefix 与 stream_secret 每次现读，改值
-// 即时生效（硬约束 5）。缺 stream_secret 时透传 store.ErrSettingMissing。
+// id 由注入的 IDFunc 计算，`/video` 端点本身属 S8。strm_prefix 与 stream_secret
+// 每次现读，改值即时生效（硬约束 5）。缺 stream_secret 时透传 store.ErrSettingMissing。
 func (t *Tree) renderStrm(ctx context.Context, item store.EmbyItem) ([]byte, error) {
 	prefix, err := t.settings.String(ctx, store.KeyStrmPrefix)
 	if err != nil {
@@ -26,8 +27,7 @@ func (t *Tree) renderStrm(ctx context.Context, item store.EmbyItem) ([]byte, err
 	if err != nil {
 		return nil, fmt.Errorf("读 stream_secret: %w", err)
 	}
-	uid := item.UID
-	return []byte(prefix + "/s/" + t.token(secret, uid) + "/e/" + uid + "\n"), nil
+	return []byte(prefix + "/video/" + t.id(secret, item.UID) + ".m3u8\n"), nil
 }
 
 // episodeNFO 是集 NFO 的 XML 结构，根元素 episodedetails（Emby EpisodeNfoParser 契约）。

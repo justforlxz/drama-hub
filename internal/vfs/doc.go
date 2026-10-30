@@ -1,6 +1,6 @@
 // Package vfs 把数据库里的剧目与集渲染成一棵只读的虚拟文件树。
 //
-// Tree 是本包唯一入口：List 枚举全部目录与文件节点，Render 按路径产出
+// Tree 是本包唯一入口：List 列出**一个目录**的直接子项，Render 按路径产出
 // strm / nfo 的完整字节。树与文件名都是纯函数派生的，不落盘（AGENTS.md
 // 硬约束 1）；渲染结果的长度只有 len(返回值) 一个真值，调用方拿它当
 // Content-Length（硬约束 3），本包不提供独立的长度字段或 Size 方法。
@@ -9,6 +9,9 @@
 // rank 40/50/60 的包可 import 本包；与同为 30 的 plugin/hongguo、sync 同级、
 // 互不 import。
 // 规则见 docs/DEV-STANDARDS.md「代码组织」，由 scripts/check-deps.sh 强制。
+//
+// 目录形状（分类 → 分片 → 剧 → Season 01 → 文件）与命名、同名冲突规则的真值是
+// docs/DIRECTORY-CONTRACT.md。
 //
 // 边界：只读 drama / episode / emby_item 三张表；封面下载、HTTP 处理、
 // 缓存与分页都不在本包。树与文件内容的**数据源是 emby_item 派生表**（硬约束 6：

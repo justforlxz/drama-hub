@@ -13,7 +13,7 @@ import (
 
 // MountPath 是挂载点。cmd 用它注册路由，Handler 用它生成 PROPFIND 的 href
 // （RFC 4918 要求 href 是绝对路径；Prefix 交给 x/net/webdav 处理，不做 StripPrefix）。
-const MountPath = "/dav/"
+const MountPath = "/webdav/"
 
 // Handler 是只读 WebDAV 端点的 http.Handler：Basic 认证 → x/net/webdav → vfs.Tree。
 //

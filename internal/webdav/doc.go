@@ -12,6 +12,6 @@
 // 「代码组织」，由 scripts/check-deps.sh 强制。
 //
 // 边界：只读（Mkdir / RemoveAll / Rename / 写打开一律失败），不含出流、分片、
-// 合并集，不做封面（属 artifact 缓存），不缓存树（每次请求现算）。契约见
-// docs/DEV-STANDARDS.md「WebDAV」。
+// 合并集，不做封面（属 artifact 缓存）。树不跨请求缓存：一次请求内按「列过的目录」
+// 做快照，跨请求每次现算。契约见 docs/DEV-STANDARDS.md「WebDAV」。
 package webdav

@@ -21,14 +21,16 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 未实现的端点返回 **501 Not Implemented**（已规划未实现），不是 404；未装配的
 路径返回 404。
 
-> **2.0 变更中**：`/dav/` 改挂 `/webdav/`；出流统一为 `/video/{id}.m3u8` +
-> `/video/{id}/{seq}.ts`，`/s/*` 退役；`.strm` 里写的是 `/video/{id}.m3u8`。
-> 下表仍是 1.0 的形态，以 `docs/PLAYBACK-CONTRACT.md` 为准。
+> **2.0 变更中**：WebDAV 已改挂 `/webdav/`（`/dav/` 不留兼容别名），目录形状改成
+> `/{分类}/{分片}/{剧名} ({年份})/Season 01/…`，`.strm` 里写的是
+> `{strm_prefix}/video/{id}.m3u8`（`/video` 端点属 S8）。出流侧 `/s/*` 仍是 1.0 形态、
+> 待 S8 退役，以 `docs/PLAYBACK-CONTRACT.md` 为准。
+> 目录契约见 `docs/DIRECTORY-CONTRACT.md`。
 
 | 端点 | 方法 | 状态 | 说明 |
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
-| `/dav/` 及全部子路径 | 任意 | 207/200/401/404/405 | 只读 WebDAV：PROPFIND 207（带 getcontentlength）、GET strm/nfo 200；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401 |
+| `/webdav/` 及全部子路径 | 任意 | 207/200/401/404/405 | 只读 WebDAV：PROPFIND 207（带 getcontentlength）、GET strm/nfo 200；树是 `/{分类}/{分片}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401 |
 | `/s/{token}/e/{uid}` | GET / HEAD | 200/206/416（单集）<br/>200（合并集） | 单集 MP4 出流：HMAC 签名 + Range 透传；**uid 是合并集句柄（`m…`）时返回自造 m3u8** |
 | `/s/{token}/e/{uid}/master.m3u8` | GET | 200/404 | 合并集 playlist 的标准别名 |
 | `/s/{token}/seg/{uid}/{seq}.ts` | GET | 200/404/502/503 | 分片：现转封装 MPEG-TS（单集按片内序、合并集按跨集时间轴），索引未就绪 503 |
@@ -82,7 +84,7 @@ curl -s -X POST -H 'Content-Type: application/json' \
 
 ```bash
 curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}
-curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8080/dav/  # 207 + getcontentlength
+curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8080/webdav/  # 207 + getcontentlength
 ```
 
 每个请求输出一条结构化访问日志（`method` / `path` / `status` / `duration_ms`，见
@@ -94,13 +96,16 @@ curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8
 ## 接到 Emby
 
 ```bash
-rclone config create dramahub webdav url http://127.0.0.1:8080/dav vendor other \
+rclone config create dramahub webdav url http://127.0.0.1:8080/webdav vendor other \
   user <webdav_user> pass <webdav_pass>
 rclone mount dramahub:/ /mnt/dramahub --vfs-cache-mode full --dir-cache-time 30s
-rclone lsf --max-depth 3 dramahub:/     # 剧目录 → Season 01 → strm/nfo
+rclone lsf --max-depth 5 dramahub:/     # 分类 → 分片 → 剧 → Season 01 → strm/nfo
 ```
 
-Emby 库路径指向 `/mnt/dramahub`（DAV 根即剧集库根），类型选「电视节目」。
+Emby 库路径指向 `/mnt/dramahub`（DAV 根即剧集库根），类型选「电视节目」。分片目录
+（`00`–`7f`）只是把每个目录的子项数摊薄到 `PROPFIND` 能列出来的量级，对 Emby 透明——
+库根仍是 `/webdav`，Emby 逐层往下扫。若 Emby 在 DAV 根上把分类当成剧，退一步把具体
+分类目录（`/webdav/爱情` 等）逐个加成媒体文件夹。
 
 ## 开发环境
 

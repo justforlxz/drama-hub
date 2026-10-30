@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/httpx"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
@@ -60,11 +61,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	st := store.NewStore(db.DB)
+	covers := cache.NewCoverCache(st, settings, &http.Client{Timeout: coverTimeout})
+	syncer := sync.New(mustPlugin(plugins, hongguo.Name), covers)
+
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
-		Addr: addr,
-		Handler: newHandler(logger, store.NewStore(db.DB), settings,
-			sync.New(mustPlugin(plugins, hongguo.Name)), sourceList(plugins)),
+		Addr:              addr,
+		Handler:           newHandler(logger, st, settings, syncer, sourceList(plugins)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -144,6 +148,11 @@ func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, 
 
 // 插件配置的兜底值（契约默认值见 docs/PLUGIN-CONTRACT.md「配置」）。
 const defaultPluginTimeoutSec = 30
+
+// coverTimeout 是海报下载单次出站超时。海报是百 KB 量级的图片、来自 CDN，
+// 用插件超时（30 s）会让一张卡住的图拖住整部剧的同步，因此单独取更短的值。
+// 它是代码常量而非 settings：没有用户会为「下载海报等多久」调参（硬约束 5 的反面）。
+const coverTimeout = 15 * time.Second
 
 // newPlugins 显式注册内置插件（ADR-0006 第 5 条：没有 init() 自动注册，装配根逐个
 // Register）。插件配置现读 settings（硬约束 5）：base_url 空 = 用插件内置地址，

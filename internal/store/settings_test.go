@@ -454,3 +454,95 @@ func TestPluginSettingValidation(t *testing.T) {
 		t.Errorf("Bool(plugin.web.base_url) 错误 = %v, 期望 ErrInvalidSetting", err)
 	}
 }
+
+// 刷新调度的三项有默认值；源级间隔覆盖没有默认值（空 = 继承全局），必须用
+// OptionalInt 读——用 Int 读「未设置」要报 ErrSettingMissing，而不是编一个数字。
+func TestRefreshSettingDefaults(t *testing.T) {
+	s := NewSettings(newTestDB(t))
+	ctx := context.Background()
+
+	for key, want := range map[SettingKey]int{
+		KeyRefreshIntervalSec: 3600,
+		KeyRefreshBatch:       1000,
+		KeyRefreshTimeoutSec:  900,
+	} {
+		got, err := s.Int(ctx, key)
+		if err != nil {
+			t.Fatalf("Int(%s): %v", key, err)
+		}
+		if got != want {
+			t.Errorf("Int(%s) = %d, 期望默认 %d", key, got, want)
+		}
+	}
+
+	override := PluginSettingKey("web", PluginItemRefreshInterval)
+	value, found, err := s.OptionalInt(ctx, override)
+	if err != nil {
+		t.Fatalf("OptionalInt(%s): %v", override, err)
+	}
+	if found || value != 0 {
+		t.Errorf("未设置时 OptionalInt(%s) = (%d, %v), 期望 (0, false)（继承全局）", override, value, found)
+	}
+	if _, err := s.Int(ctx, override); !errors.Is(err, ErrSettingMissing) {
+		t.Errorf("Int(%s) 错误 = %v, 期望 ErrSettingMissing", override, err)
+	}
+
+	// 写下去之后 OptionalInt 能读到值。
+	if err := s.Set(ctx, override, "900"); err != nil {
+		t.Fatalf("Set(%s): %v", override, err)
+	}
+	if value, found, err := s.OptionalInt(ctx, override); err != nil || !found || value != 900 {
+		t.Errorf("OptionalInt(%s) = (%d, %v, %v), 期望 (900, true, nil)", override, value, found, err)
+	}
+}
+
+// 刷新间隔的边界：300 与 86400 是闭区间端点，越界一律拒绝且不落库
+// （docs/SCHEDULER-MODEL.md「间隔范围为什么是 300–86400」）。
+func TestRefreshIntervalBounds(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	keys := []SettingKey{KeyRefreshIntervalSec, PluginSettingKey("web", PluginItemRefreshInterval)}
+	for _, key := range keys {
+		for _, raw := range []string{"300", "86400"} {
+			if err := s.Set(ctx, key, raw); err != nil {
+				t.Errorf("Set(%s, %s) = %v, 期望通过（闭区间端点）", key, raw, err)
+			}
+		}
+		value, found, err := s.OptionalInt(ctx, key)
+		if err != nil {
+			t.Fatalf("OptionalInt(%s): %v", key, err)
+		}
+		if key == KeyRefreshIntervalSec && (!found || value != 86400) {
+			t.Errorf("OptionalInt(%s) = (%d, %v), 期望 (86400, true)", key, value, found)
+		}
+	}
+	// hasRow 断言用另一个源名，避免上面写过的合法值干扰。
+	for _, raw := range []string{"299", "86401", "0", "-1", "1h"} {
+		if err := s.Set(ctx, PluginSettingKey("bad", PluginItemRefreshInterval), raw); !errors.Is(err, ErrInvalidSetting) {
+			t.Errorf("Set(plugin.bad.refresh_interval_sec, %q) = %v, 期望 ErrInvalidSetting", raw, err)
+		}
+		if hasRow(t, db, PluginSettingKey("bad", PluginItemRefreshInterval)) {
+			t.Errorf("越界的间隔 %q 被写入了库", raw)
+		}
+	}
+}
+
+// 存量批量 refresh_batch 的边界：0（关闭轮转）到 10000。
+func TestRefreshBatchBounds(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	for _, raw := range []string{"0", "10000"} {
+		if err := s.Set(ctx, KeyRefreshBatch, raw); err != nil {
+			t.Errorf("Set(refresh_batch, %s) = %v, 期望通过", raw, err)
+		}
+	}
+	for _, raw := range []string{"-1", "10001"} {
+		if err := s.Set(ctx, KeyRefreshBatch, raw); !errors.Is(err, ErrInvalidSetting) {
+			t.Errorf("Set(refresh_batch, %s) = %v, 期望 ErrInvalidSetting", raw, err)
+		}
+	}
+}

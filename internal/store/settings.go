@@ -18,7 +18,8 @@ var (
 	ErrUnknownSetting = errors.New("未知的配置项")
 	// ErrInvalidSetting 表示值未通过校验（解析失败、越界、类型不符），此时不落库。
 	ErrInvalidSetting = errors.New("非法的配置值")
-	// ErrSettingMissing 表示必填项在库中不存在。
+	// ErrSettingMissing 表示该项在库中不存在：必填项从未配置，或可选覆盖项按
+	// 「未设置」（继承全局）处理。用 OptionalInt 读可选覆盖项可避开这个错误。
 	ErrSettingMissing = errors.New("必填配置项缺失")
 )
 
@@ -40,6 +41,10 @@ const (
 	KeyWebDAVUser   SettingKey = "webdav_user"
 	KeyWebDAVPass   SettingKey = "webdav_pass"
 	KeyCacheDir     SettingKey = "cache_dir"
+	// 刷新调度的三项（范围与语义见 docs/SCHEDULER-MODEL.md「配置」）。
+	KeyRefreshIntervalSec SettingKey = "refresh_interval_sec"
+	KeyRefreshBatch       SettingKey = "refresh_batch"
+	KeyRefreshTimeoutSec  SettingKey = "refresh_timeout_sec"
 )
 
 // 插件配置的项名（docs/PLUGIN-CONTRACT.md「配置」）。
@@ -47,11 +52,16 @@ const (
 	PluginItemEnabled        = "enabled"
 	PluginItemBaseURL        = "base_url"
 	PluginItemRequestTimeout = "request_timeout_sec"
+	// PluginItemRefreshInterval 是源级刷新间隔覆盖。库中无行 = 继承全局
+	// refresh_interval_sec，所以它必须用 Settings.OptionalInt 读（Int 读到「未设置」
+	// 返回 ErrSettingMissing，避免把「继承」当成某个具体数字）。
+	PluginItemRefreshInterval = "refresh_interval_sec"
 )
 
 // PluginSettingKey 拼出插件配置键 plugin.<源>.<项>。
 //
-// 键的格式与校验都在本包：specFor 只认上面三项，非法源名或未知项返回
+// 键的格式与校验都在本包：specFor 只认上列四项（enabled / base_url /
+// request_timeout_sec / refresh_interval_sec），非法源名或未知项返回
 // ErrUnknownSetting。调用方（装配根、状态页）不自己拼这个字符串。
 func PluginSettingKey(source, item string) SettingKey {
 	return SettingKey("plugin." + source + "." + item)
@@ -165,6 +175,29 @@ func (s *Settings) Bool(ctx context.Context, key SettingKey) (bool, error) {
 	return b, nil
 }
 
+// OptionalInt 读取一个可缺省的整型配置项。
+//
+// 与 Int 的区别只在「库中无该行」：found=false 且不报错，调用方按「未设置」处理
+// （典型场景：plugin.<源>.refresh_interval_sec 空 = 继承全局 refresh_interval_sec）。
+// key 未注册返回 ErrUnknownSetting，非整型 key 返回 ErrInvalidSetting。
+func (s *Settings) OptionalInt(ctx context.Context, key SettingKey) (value int, found bool, err error) {
+	spec, ok := specFor(key)
+	if !ok {
+		return 0, false, fmt.Errorf("%w: %q", ErrUnknownSetting, key)
+	}
+	if spec.kind != kindInt {
+		return 0, false, fmt.Errorf("%w: %s 不是整型配置", ErrInvalidSetting, key)
+	}
+	encoded, found, err := s.load(ctx, key)
+	if err != nil || !found {
+		return 0, false, err
+	}
+	if err := json.Unmarshal([]byte(encoded), &value); err != nil {
+		return 0, false, fmt.Errorf("解码配置 %s: %w", key, err)
+	}
+	return value, true, nil
+}
+
 // value 读取 key 的类型化值：库中有行则 JSON 解码，无行则取默认值或报缺。
 func (s *Settings) value(ctx context.Context, key SettingKey) (any, error) {
 	spec, ok := specFor(key)
@@ -176,7 +209,7 @@ func (s *Settings) value(ctx context.Context, key SettingKey) (any, error) {
 		return nil, err
 	}
 	if !found {
-		if spec.required {
+		if spec.required || spec.optional {
 			return nil, fmt.Errorf("%w: %s", ErrSettingMissing, key)
 		}
 		// 默认值走同一条校验路径，注册表里写错默认值会在这里暴露。
@@ -232,9 +265,12 @@ const (
 //
 // required 为 false 时 def 是默认值的原始文本，读取时会过 parseSetting；
 // required 为 true 时 def 无意义。
+// optional 为 true 表示「库中无行」本身是一种合法状态（覆盖项：空 = 继承/用全局），
+// 只能通过 OptionalInt 读到 found=false；Int / String / Bool 遇到它返回 ErrSettingMissing。
 type settingSpec struct {
 	kind     settingKind
 	required bool
+	optional bool
 	def      string
 	min, max int
 }
@@ -260,6 +296,15 @@ func specFor(key SettingKey) (settingSpec, bool) {
 	case KeyCacheDir:
 		// 缓存根目录：海报等本地资产落 <cache_dir>/cover/…；写盘时按需 MkdirAll。
 		return settingSpec{kind: kindString, def: "./data/cache"}, true
+	case KeyRefreshIntervalSec:
+		// 全局刷新间隔：所有源共用的默认值（docs/SCHEDULER-MODEL.md「配置」）。
+		return settingSpec{kind: kindInt, def: "3600", min: 300, max: 86400}, true
+	case KeyRefreshBatch:
+		// 每轮存量刷新部数；0 = 关闭存量轮转（只剩枚举 + 新增 + 手动）。
+		return settingSpec{kind: kindInt, def: "1000", min: 0, max: 10000}, true
+	case KeyRefreshTimeoutSec:
+		// 单轮预算（context.WithTimeout）。
+		return settingSpec{kind: kindInt, def: "900", min: 60, max: 86400}, true
 	}
 	return pluginSpecFor(string(key))
 }
@@ -286,6 +331,10 @@ func pluginSpecFor(key string) (settingSpec, bool) {
 		return settingSpec{kind: kindURL}, true
 	case PluginItemRequestTimeout:
 		return settingSpec{kind: kindInt, def: "30", min: 5, max: 300}, true
+	case PluginItemRefreshInterval:
+		// 无默认值：空 = 继承全局 refresh_interval_sec，因此没有行就是「未设置」，
+		// 不用某个数字冒充继承（用 OptionalInt 读）。
+		return settingSpec{kind: kindInt, optional: true, min: 300, max: 86400}, true
 	}
 	return settingSpec{}, false
 }

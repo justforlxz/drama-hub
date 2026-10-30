@@ -613,3 +613,57 @@ func TestInTxCommitAndRollback(t *testing.T) {
 		t.Fatalf("事务内 DeleteDrama 缺行 = %v, 期望 ErrNotFound", err)
 	}
 }
+
+// ExistingProviderIDs 与 StaleProviderIDs 是调度器一轮三段的两条查询：
+// 前者算「新剧」，后者挑「最旧的 N 部」。
+func TestSchedulerQueries(t *testing.T) {
+	s := NewStore(newCRUDTestDB(t).DB)
+	ctx := context.Background()
+	seed := func(provider, providerID, syncAt string) {
+		if _, err := s.UpsertDrama(ctx, Drama{
+			Provider: provider, ProviderID: providerID, Title: providerID, SyncAt: syncAt,
+		}); err != nil {
+			t.Fatalf("UpsertDrama %s/%s: %v", provider, providerID, err)
+		}
+	}
+	seed("web", "a", "2026-10-03T00:00:00Z")
+	seed("web", "b", "2026-10-01T00:00:00Z")
+	seed("web", "c", "2026-10-02T00:00:00Z")
+	seed("other", "z", "2026-09-01T00:00:00Z")
+
+	ids, err := s.ExistingProviderIDs(ctx, "web")
+	if err != nil {
+		t.Fatalf("ExistingProviderIDs: %v", err)
+	}
+	if len(ids) != 3 {
+		t.Fatalf("web 的已有标识 = %v, 期望 3 个", ids)
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		if _, ok := ids[id]; !ok {
+			t.Errorf("已有标识里缺 %s", id)
+		}
+	}
+	if _, ok := ids["z"]; ok {
+		t.Error("别的源的剧混进了 web 的已有标识（差集会被算错）")
+	}
+
+	// 最旧优先，只挑本源的；limit 生效、顺序确定。
+	oldest, err := s.StaleProviderIDs(ctx, "web", 2)
+	if err != nil {
+		t.Fatalf("StaleProviderIDs: %v", err)
+	}
+	if len(oldest) != 2 || oldest[0] != "b" || oldest[1] != "c" {
+		t.Errorf("最旧两部 = %v, 期望 [b c]（sync_at 升序）", oldest)
+	}
+
+	// limit <= 0 = 关闭存量轮转，返回空而不是报错。
+	for _, limit := range []int{0, -1} {
+		got, err := s.StaleProviderIDs(ctx, "web", limit)
+		if err != nil {
+			t.Fatalf("StaleProviderIDs(limit=%d): %v", limit, err)
+		}
+		if len(got) != 0 {
+			t.Errorf("limit=%d 返回 %v, 期望空", limit, got)
+		}
+	}
+}

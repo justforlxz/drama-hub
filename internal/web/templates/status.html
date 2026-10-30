@@ -13,11 +13,16 @@
   <div class="scroll">
     <table class="grid">
       <caption class="sr-only">播放源</caption>
-      <thead><tr><th>源</th><th>状态</th><th>说明</th></tr></thead>
+      <thead><tr><th>源</th><th>状态</th><th>上次运行</th><th>上次成功</th><th>下次计划</th><th>错误与配置</th><th>操作</th></tr></thead>
       <tbody id="sources"></tbody>
     </table>
   </div>
-  <p class="hint">配置键为 <code>plugin.&lt;源&gt;.enabled</code> / <code>.base_url</code> / <code>.request_timeout_sec</code>，改完下一次读取即生效。</p>
+  <p class="hint">
+    <code>plugin.&lt;源&gt;.enabled</code> 与 <code>refresh_interval_sec</code>（全局，或
+    <code>plugin.&lt;源&gt;.refresh_interval_sec</code> 覆盖）热读，改完最多 60 秒按新间隔重算；
+    <code>plugin.&lt;源&gt;.base_url</code> 与 <code>.request_timeout_sec</code> 是构造期配置，改后需重启。
+    「下次计划」= 上次运行 + 现读间隔。
+  </p>
 </section>
 
 <section class="block">

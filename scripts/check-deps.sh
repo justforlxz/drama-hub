@@ -12,6 +12,7 @@ internal/web 50
 internal/webdav 40
 internal/stream 40
 internal/segment 40
+internal/scheduler 40
 internal/sync 30
 internal/vfs 30
 internal/httpx 30

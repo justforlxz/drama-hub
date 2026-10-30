@@ -70,12 +70,18 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 ## 配置
 
-> **2.0 还有 5 个全局 key 未实现**（`refresh_interval_sec`、`refresh_batch`、
-> `refresh_timeout_sec`、`cache_max_mb`、`cache_lru_days`），归 S4（MKACG-606）与
-> S7（MKACG-611），取值范围见 `docs/SCHEDULER-MODEL.md`「配置」与
-> `docs/CACHE-MODEL.md`「淘汰」。`plugin.<源>.refresh_interval_sec` 同样属 S4。
-> `cache_dir` 已随 S3（MKACG-608）落地（海报本地化的落盘根目录）；已实现的
-> `plugin.<源>.*` 三项在下表。
+> **2.0 还有 2 个全局 key 未实现**（`cache_max_mb`、`cache_lru_days`），归 S7
+> （MKACG-611），范围见 `docs/CACHE-MODEL.md`「淘汰」。刷新调度的三项
+> （`refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec`）与
+> `plugin.<源>.refresh_interval_sec` 已随 S4（MKACG-606）落地，范围见
+> `docs/SCHEDULER-MODEL.md`「配置」。`cache_dir` 已随 S3（MKACG-608）落地
+> （海报本地化的落盘根目录）。
+>
+> **生效方式分两类**：`plugin.<源>.enabled` 与 `refresh_interval_sec`（全局与源级覆盖）
+> 热读——调度器每次醒来重读 settings，改完最多 60 秒按新值算，不需要重启、也不需要
+> 任何通知机制；`plugin.<源>.base_url` 与 `plugin.<源>.request_timeout_sec` 是构造期
+> 注入的不可变配置（`*http.Client` 的 Timeout 在这里定型，见
+> `docs/PLUGIN-CONTRACT.md` 硬性要求 2），改后需重启。
 
 运行时配置只有一张表 `settings(key TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT)`。
 
@@ -93,9 +99,17 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 | `plugin.<源>.enabled` | `true` | — | 该源是否参与刷新调度（缺失按 `true`，内置源默认启用） |
 | `plugin.<源>.base_url` | `""` | URL 或空 | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
 | `plugin.<源>.request_timeout_sec` | `30` | 5–300 | 单次出站请求超时 |
+| `refresh_interval_sec` | `3600` | 300–86400 | 全局刷新间隔，一轮到期 = `last_run_at` + 本值 |
+| `plugin.<源>.refresh_interval_sec` | 空 = 继承全局 | 300–86400 | 源级间隔覆盖（用 `Settings.OptionalInt` 读，无行即「继承」） |
+| `refresh_batch` | `1000` | 0–10000 | 每轮存量刷新的部数；`0` = 关闭存量轮转 |
+| `refresh_timeout_sec` | `900` | 60–86400 | 单轮预算（`context.WithTimeout`） |
 
 `<源>` 是 `Plugin.Name()`（红果是 `web`），键的格式与校验在 `internal/store`
 （`PluginSettingKey` + `specFor` 的前缀模式），调用方不自己拼字符串。
+
+`plugin.<源>.request_timeout_sec` 的 5–300 范围校验已进注册表，但 2.0 没有 settings
+写接口，所以非法值目前只能由代码侧（`Settings.Set`）拒绝，没有 HTTP 400 的入口；
+写接口属后续阶段。
 
 `cache_max_mb` / `cache_lru_days` 尚未实现：淘汰归 S7（MKACG-611），在它落地前
 本服务不做任何缓存淘汰（ADR-0007 已把缓存收回本服务，淘汰随 S7 一起实现）。
@@ -297,7 +311,8 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 | `internal/sync` | 框架侧写库编排：`Syncer.SyncSeries` | `internal/plugin`、`internal/store` |
 
 插件只做「上游字节 → 领域值」：不写库、不开事务、不保存状态（不存游标、不缓存直链）。
-写库、事务、`emby_item` 重建在 `internal/sync`；刷新调度与游标归 S4（MKACG-606）。
+写库、事务、`emby_item` 重建在 `internal/sync`；刷新调度与游标在 `internal/scheduler`
+（S4，MKACG-606）：本包只提供「按一个作品写一次库」这个幂等动作，调度器按源调它。
 
 ### 红果插件的上游成本
 
@@ -345,6 +360,33 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 来源、裁剪日期与覆盖场景；`internal/sync` 的入库一致性测试读同一份 fixture
 （`../plugin/hongguo/testdata/html`），因为「迁移前后入库结果逐字段一致」必须用同一个页面。
 
+## 刷新调度（internal/scheduler）
+
+契约唯一真值 `docs/SCHEDULER-MODEL.md`（三段、并发取值、`next_due` 推导、错误与超时
+口径）。本节只写实现口径。
+
+| 文件 | 内容 |
+|---|---|
+| `scheduler.go` | 循环（睡 `min(最早 next_due, 60s)` → 重读配置 → 派发到期源）、`Trigger`（手动）、`Status`（状态页）、每源单飞锁 |
+| `round.go` | 一轮三段（枚举 / 新剧灌库 / 存量轮转）+ `source_state` 写回 + 每轮一条结构化日志 |
+| `schedule.go` | 纯函数：`nextDue`（`last_run_at` + interval）、`waitUntil`（夹在 `[0, 60s]`）、时间文本编解码、worker 数 |
+
+- **配置热读**：`configFor` 每次醒来（以及每轮开始）现读 `enabled` /
+  `refresh_interval_sec`（含源级覆盖）/ `refresh_batch` / `refresh_timeout_sec`；
+  没有任何通知机制、不重建插件实例。读失败按默认值继续并 warn（配置错不该让调度停摆）。
+- **单飞**：每源一把 `sync.Mutex`，手动与定时共用；拿不到即 409（手动）/ 跳过（定时）。
+  源之间各一个 goroutine，互不影响。
+- **游标**：枚举按页前推，走完写空串（下一轮从起点重来），被砍断写最后成功推进的位置；
+  只有一轮收尾那次 `SaveState` 会落库，且用 `context.WithoutCancel`，超时也写。
+- **next_due**：库里不存，永远由 `last_run_at + 现读 interval` 现算；失败也照此推进，
+  没有退避表、没有失败计数。
+- **错误分级**照 `docs/PLUGIN-CONTRACT.md` 错误语义表：`ErrNotFound` / `ErrNoStream`
+  只跳过；`ErrUpstream` / 未知错误跳过并记 `last_error`（未知错误另计 `unknown_errors`）；
+  `ErrRejected` 立刻中止本轮；`ErrSchema` 连续 20 次中止本轮。单部失败不影响「本轮完成」。
+- **可观察**：每轮一条 `一轮结束` 日志，字段 `enumerate_ms` / `ingest_ms` / `rotate_ms` /
+  `refs` / `ingested` / `rotated` / `failed` / `unknown_errors` / `err`；状态页读
+  `Status`（`source_state` + 现读配置）。
+
 ## 代码组织
 
 依赖方向单向：内部 import 仅允许 `rank(importer) > rank(importee)`；同级、反向、
@@ -355,7 +397,7 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 |---|---|---|
 | 60 | `cmd/drama-hub` | 全部 internal |
 | 50 | `internal/web` | 40 / 30 / 20 / 10 |
-| 40 | `internal/webdav`、`internal/stream`、`internal/segment` | 30 / 20 / 10 |
+| 40 | `internal/webdav`、`internal/stream`、`internal/segment`、`internal/scheduler` | 30 / 20 / 10 |
 | 30 | `internal/sync`、`internal/vfs`、`internal/httpx` | 20 / 10 |
 | 20 | `internal/plugin/hongguo`、`internal/cache` | 10 |
 | 10 | `internal/plugin`、`internal/store` | 无 |
@@ -521,7 +563,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 |---|---|---|
 | `/` | 剧目 | 按上游剧 id 或 `/player/<id>` 链接同步入库；删剧目（级联删集、合并组、对外集号） |
 | `/merges` | 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即 `ord`）→ 删组 |
-| `/status` | 同步与缓存 | 同步计数与最近同步时间、各播放源状态（是否启用、生效的 `base_url` 与超时、停用原因）、运行配置现状（密钥只报「是否已设置」）、缓存代理建议参数 |
+| `/status` | 同步与缓存 | 同步计数与最近同步时间、各播放源状态（是否启用、正在刷新、上次运行/上次成功/上次错误/下次计划、生效的 `base_url` 与超时、停用原因）、手动「立即刷新」、运行配置现状（密钥只报「是否已设置」）、缓存代理建议参数 |
 
 模板 `templates/*.html` 与 `static/app.css`、`static/app.js` 用 `//go:embed` 进二进制：
 界面没有构建步骤、没有 `package.json`（ADR-0002）。页面 JS 只调下面这些 API，渲染结果
@@ -538,7 +580,8 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | `/api/dramas/{id}/merge-groups` | GET | 该剧合并组与成员（`ord` 即时间轴顺序） |
 | `/api/dramas/{id}/merge-groups` | POST | 建组：`{"label":"…","episode_ids":[…]}`，数组顺序即 `ord`，201 + 整份列表 |
 | `/api/merge-groups/{id}` | DELETE | 删组（同一事务内重建派生表），204 |
-| `/api/status` | GET | 同步计数 + 运行配置 + 各播放源状态 + 缓存面 |
+| `/api/refresh` | POST | 手动跑一轮：`{"source":"web"}` → 202 已启动 / 404 无此源或未启用 / 409 该源正在跑（与定时共用单飞锁） |
+| `/api/status` | GET | 同步计数 + 运行配置 + 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`）+ 缓存面 |
 
 - **「增剧目」的唯一入口是数据源同步**：剧目与集的真值在上游，手工插空剧只会得到一条
   永远没有集的记录。`series_id` 只接受纯数字或 `/player/<id>` 链接 —— 归一后的值会拼进

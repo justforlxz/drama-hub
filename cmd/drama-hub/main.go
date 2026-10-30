@@ -16,6 +16,7 @@ import (
 	"github.com/justforlxz/drama-hub/internal/httpx"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
+	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/segment"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
@@ -62,18 +63,36 @@ func main() {
 	}
 
 	st := store.NewStore(db.DB)
-	covers := cache.NewCoverCache(st, settings, &http.Client{Timeout: coverTimeout})
-	syncer := sync.New(mustPlugin(plugins, hongguo.Name), covers)
+	sourcePlugins := pluginList(plugins)
+	syncers := newSyncers(sourcePlugins, st, settings)
+	syncer := syncers[hongguo.Name]
+	sched := scheduler.New(st, settings, sourcePlugins, syncers, logger)
 
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           newHandler(logger, st, settings, syncer, sourceList(plugins)),
+		Handler:           newHandler(logger, st, settings, syncer, sched, sourceList(plugins)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 调度器与 HTTP 服务同寿命：ctx 一取消它就停派新轮，并等手上的轮收尾。
+	schedCtx, stopScheduler := context.WithCancel(ctx)
+	schedulerDone := make(chan struct{})
+	go func() {
+		defer close(schedulerDone)
+		sched.Run(schedCtx)
+	}()
+	defer func() {
+		stopScheduler()
+		select {
+		case <-schedulerDone:
+		case <-time.After(schedulerStopTimeout):
+			logger.Warn("调度器未在时限内退出", "timeout", schedulerStopTimeout)
+		}
+	}()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -113,7 +132,7 @@ func main() {
 //
 // 请求日志中间件只在装配根挂一次：/healthz、/dav/、/s/、/ 与未知路径都经它，
 // 每请求恰一条访问日志（token 段掩码，见 internal/httpx）。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, sources []web.Source) http.Handler {
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source) http.Handler {
 	cutter := segment.NewCutter(st, settings, logger, stream.Verify)
 	streamSrv := stream.NewServer(st, settings, logger)
 
@@ -142,8 +161,34 @@ func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, 
 	mux.Handle(segment.Route, cutter)
 	// `/s/` 兜底：未单独注册的 `/s/` 子路径仍是 501（「已规划未实现」的既有语义）。
 	mux.Handle("/s/", streamSrv)
-	mux.Handle("/", web.NewServer(st, settings, syncer, sources, logger))
+	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, sources, logger))
 	return httpx.RequestLogger(logger, mux)
+}
+
+// schedulerStopTimeout 是关闭时等调度器收尾的上限：手上的轮收到 ctx 取消后只剩
+// 一次状态写回，正常远小于这个值。
+const schedulerStopTimeout = 5 * time.Second
+
+// pluginList 按注册顺序把注册表翻成 []plugin.Plugin（调度器按它决定调度哪些源）。
+func pluginList(reg *plugin.Registry) []plugin.Plugin {
+	out := make([]plugin.Plugin, 0, len(reg.Names()))
+	for _, name := range reg.Names() {
+		out = append(out, mustPlugin(reg, name))
+	}
+	return out
+}
+
+// newSyncers 给每个源造一个写库编排（一个源的剧只写进它自己的 provider）。
+//
+// 海报本地化对每个源共用同一个 cache.CoverCache：落盘布局按 (provider, provider_id)
+// 分文件，不同源不会互相覆盖。
+func newSyncers(sources []plugin.Plugin, st *store.Store, settings *store.Settings) map[string]scheduler.Syncer {
+	covers := cache.NewCoverCache(st, settings, &http.Client{Timeout: coverTimeout})
+	out := make(map[string]scheduler.Syncer, len(sources))
+	for _, p := range sources {
+		out[p.Name()] = sync.New(p, covers)
+	}
+	return out
 }
 
 // 插件配置的兜底值（契约默认值见 docs/PLUGIN-CONTRACT.md「配置」）。

@@ -11,7 +11,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/justforlxz/drama-hub/internal/plugin"
+	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
@@ -50,6 +53,27 @@ func (f *fakeSyncer) SyncSeries(ctx context.Context, st *store.Store, sid string
 	return err
 }
 
+// fakeSchedule 是调度依赖的替身：状态页要显示的调度现状由用例直接给定，
+// 手动触发只记下被要求刷新的源名与要返回的错误。
+//
+// 真实的三段、单飞锁与游标由 internal/scheduler 自己覆盖；这里只关心管理面
+// 「点了立即刷新之后 API 回了什么」。
+type fakeSchedule struct {
+	status    []scheduler.SourceStatus
+	statusErr error
+	trigger   error
+	triggered []string
+}
+
+func (f *fakeSchedule) Trigger(_ context.Context, source string) error {
+	f.triggered = append(f.triggered, source)
+	return f.trigger
+}
+
+func (f *fakeSchedule) Status(context.Context) ([]scheduler.SourceStatus, error) {
+	return f.status, f.statusErr
+}
+
 // newTestServer 起一套真实依赖：临时 SQLite + 真 handler。不 mock 自己的 handler。
 func newTestServer(t *testing.T) (*Server, *store.Store, *fakeSyncer) {
 	t.Helper()
@@ -63,7 +87,7 @@ func newTestServer(t *testing.T) (*Server, *store.Store, *fakeSyncer) {
 	syncer := &fakeSyncer{}
 	// 状态页的播放源清单由装配根给（生产里来自注册表），测试固定一个源。
 	sources := []Source{{Name: "web", Label: "红果官网 SSR"}}
-	return NewServer(st, store.NewSettings(db.DB), syncer, sources, slog.New(slog.DiscardHandler)), st, syncer
+	return NewServer(st, store.NewSettings(db.DB), syncer, &fakeSchedule{}, sources, slog.New(slog.DiscardHandler)), st, syncer
 }
 
 // do 发一个真实请求，返回响应。
@@ -478,4 +502,185 @@ func TestAPI_StatusSourceDisabled(t *testing.T) {
 	if !strings.Contains(got.Sources[0].Reason, string(key)+"=false") {
 		t.Errorf("reason = %q, 期望带上停用的配置键", got.Sources[0].Reason)
 	}
+}
+
+// scheduleOf 取出 newTestServer 装上的假调度依赖。
+func scheduleOf(srv *Server) *fakeSchedule { return srv.schedule.(*fakeSchedule) }
+
+// TestAPI_Refresh 覆盖手动触发的状态码矩阵（docs/SCHEDULER-MODEL.md「手动触发」）：
+// 202 已启动 / 409 该源正在跑 / 404 无此源或未启用 / 400 请求体非法。
+func TestAPI_Refresh(t *testing.T) {
+	cases := []struct {
+		name    string
+		trigger error
+		body    string
+		want    int
+	}{
+		{"已启动", nil, `{"source":"web"}`, http.StatusAccepted},
+		{"正在跑", scheduler.ErrSourceBusy, `{"source":"web"}`, http.StatusConflict},
+		{"没有这个源", scheduler.ErrSourceNotFound, `{"source":"web"}`, http.StatusNotFound},
+		{"已停用", scheduler.ErrSourceDisabled, `{"source":"web"}`, http.StatusNotFound},
+		{"请求体非法", nil, `不是 JSON`, http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv, _, _ := newTestServer(t)
+			sched := scheduleOf(srv)
+			sched.trigger = c.trigger
+
+			rec := do(t, srv, http.MethodPost, "/api/refresh", c.body)
+			if rec.Code != c.want {
+				t.Fatalf("状态码 = %d, 期望 %d（body=%s）", rec.Code, c.want, rec.Body.String())
+			}
+			if c.trigger == nil && c.body == `{"source":"web"}` {
+				got := decode[refreshView](t, rec)
+				if got.Source != "web" || !got.Started {
+					t.Errorf("响应 = %+v, 期望 web + started", got)
+				}
+				if len(sched.triggered) != 1 || sched.triggered[0] != "web" {
+					t.Errorf("触发记录 = %v, 期望 [web]", sched.triggered)
+				}
+			}
+		})
+	}
+}
+
+// TestAPI_StatusSchedule 覆盖状态页的调度字段：上次运行 / 上次成功 / 上次错误 /
+// 正在跑 / 生效间隔 / 下次时间全部来自调度器，时间是 UTC RFC3339 文本。
+func TestAPI_StatusSchedule(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	lastRun := time.Date(2026, 10, 30, 9, 0, 0, 0, time.UTC)
+	lastOK := lastRun.Add(5 * time.Minute)
+	nextDue := lastRun.Add(15 * time.Minute)
+	scheduleOf(srv).status = []scheduler.SourceStatus{{
+		Name: "web", Enabled: true, Running: true,
+		LastRunAt: lastRun, LastOkAt: lastOK,
+		LastError:   "2026-10-30T10:00:00Z 读取 sitemap 超时",
+		IntervalSec: 900, NextDueAt: nextDue,
+	}}
+
+	got := decode[statusView](t, do(t, srv, http.MethodGet, "/api/status", ""))
+	if len(got.Sources) != 1 {
+		t.Fatalf("sources = %+v, 期望 1 个源", got.Sources)
+	}
+	src := got.Sources[0]
+	if !src.Running || src.IntervalSec != 900 {
+		t.Errorf("调度字段 = %+v, 期望 running + 900 秒", src)
+	}
+	if src.LastRunAt != "2026-10-30T09:00:00Z" || src.LastOkAt != "2026-10-30T09:05:00Z" ||
+		src.NextDueAt != "2026-10-30T09:15:00Z" {
+		t.Errorf("时间字段 = %q / %q / %q", src.LastRunAt, src.LastOkAt, src.NextDueAt)
+	}
+	if !strings.Contains(src.LastError, "读取 sitemap 超时") {
+		t.Errorf("last_error = %q", src.LastError)
+	}
+}
+
+// TestAPI_CreateDrama_DisabledSourceStillWorks 锁定 PL 裁定：plugin.<源>.enabled=false
+// 的语义是「不参与刷新调度」，手工单剧补录（POST /api/dramas）照常可用。
+func TestAPI_CreateDrama_DisabledSourceStillWorks(t *testing.T) {
+	srv, _, syncer := newTestServer(t)
+	if err := srv.settings.Set(context.Background(),
+		store.PluginSettingKey("web", store.PluginItemEnabled), "false"); err != nil {
+		t.Fatalf("Set enabled: %v", err)
+	}
+
+	rec := do(t, srv, http.MethodPost, "/api/dramas", `{"series_id":"1001"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("停用源的 POST /api/dramas 状态码 = %d, 期望 201（body=%s）", rec.Code, rec.Body.String())
+	}
+	if syncer.calls != 1 {
+		t.Errorf("数据源调用次数 = %d, 期望 1", syncer.calls)
+	}
+}
+
+// realSource 是「手动触发 + 真调度器」用例里的数据源：一页一个标识。
+type realSource struct{ gotRefs int }
+
+func (s *realSource) Name() string { return "web" }
+
+func (s *realSource) Enumerate(ctx context.Context, _ *plugin.Cursor) (plugin.Page, error) {
+	s.gotRefs++
+	if s.gotRefs > 1 {
+		return plugin.Page{}, nil
+	}
+	return plugin.Page{Refs: []plugin.WorkRef{{Plugin: "web", ID: "1001"}}}, nil
+}
+
+func (s *realSource) Work(context.Context, plugin.WorkRef) (plugin.WorkDetail, error) {
+	return plugin.WorkDetail{}, errors.New("Work 不参与调度测试")
+}
+
+func (s *realSource) Resolve(context.Context, plugin.WorkRef, int) (plugin.Stream, error) {
+	return plugin.Stream{}, plugin.ErrNoStream
+}
+
+func (s *realSource) Health(context.Context) error { return nil }
+
+// gatedSyncer 让一轮停在写库阶段，好让第二次手动触发真的撞上单飞锁。
+type gatedSyncer struct {
+	entered chan struct{}
+	gate    chan struct{}
+}
+
+func (g *gatedSyncer) SyncSeries(ctx context.Context, _ *store.Store, _ string) error {
+	g.entered <- struct{}{}
+	select {
+	case <-g.gate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// 端到端：真调度器 + 真 handler 验证「手动触发 202 → 撞车 409 → 跑完再 202」。
+// 409 来自调度器的单飞锁，经过 internal/web 的哨兵映射，不靠假实现对齐。
+func TestAPI_Refresh_RealScheduler(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "refresh.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	syncer := &gatedSyncer{entered: make(chan struct{}, 2), gate: make(chan struct{})}
+	sched := scheduler.New(st, settings,
+		[]plugin.Plugin{&realSource{}},
+		map[string]scheduler.Syncer{"web": syncer},
+		slog.New(slog.DiscardHandler))
+	srv := NewServer(st, settings, syncer, sched, []Source{{Name: "web", Label: "红果官网 SSR"}},
+		slog.New(slog.DiscardHandler))
+
+	if rec := do(t, srv, http.MethodPost, "/api/refresh", `{"source":"web"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("第一次手动触发状态码 = %d, 期望 202（body=%s）", rec.Code, rec.Body.String())
+	}
+	<-syncer.entered // 一轮已经进到写库阶段
+
+	if rec := do(t, srv, http.MethodPost, "/api/refresh", `{"source":"web"}`); rec.Code != http.StatusConflict {
+		t.Fatalf("撞车的第二次触发状态码 = %d, 期望 409（body=%s）", rec.Code, rec.Body.String())
+	}
+
+	close(syncer.gate)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !statusOf(t, srv).Running {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if rec := do(t, srv, http.MethodPost, "/api/refresh", `{"source":"web"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("轮结束后的触发状态码 = %d, 期望 202", rec.Code)
+	}
+}
+
+// statusOf 读一次 /api/status 里唯一的源。
+func statusOf(t *testing.T, srv *Server) sourceView {
+	t.Helper()
+	got := decode[statusView](t, do(t, srv, http.MethodGet, "/api/status", ""))
+	if len(got.Sources) != 1 {
+		t.Fatalf("sources = %+v, 期望 1 个源", got.Sources)
+	}
+	return got.Sources[0]
 }

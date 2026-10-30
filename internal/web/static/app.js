@@ -356,7 +356,51 @@ function initStatus() {
     return el('span', { class: set ? 'tag' : 'tag warn', text: set ? '已设置' : '未设置' });
   }
 
-  api('GET', '/api/status').then((status) => {
+  // sourceRow 渲染一个播放源：调度状态（上次运行/上次成功/下次/上次错误）来自
+  // /api/status 的调度字段，说明与配置来自 settings 现状。
+  function sourceRow(src) {
+    const state = src.running
+      ? el('span', { class: 'tag', text: '正在刷新' })
+      : src.enabled
+        ? el('span', { class: 'tag', text: '已启用' })
+        : el('span', { class: 'tag warn', text: '已停用' });
+    const note = src.reason !== '' ? src.reason
+      : 'base_url ' + (src.base_url === '' ? '用插件默认地址' : src.base_url) +
+        '，请求超时 ' + src.request_timeout_sec + ' 秒，间隔 ' + src.interval_sec + ' 秒';
+    const error = src.last_error === ''
+      ? '—'
+      : el('span', { class: 'mono', text: src.last_error });
+    return el('tr', {},
+      el('td', { text: src.label === src.name ? src.name : src.name + '（' + src.label + '）' }),
+      el('td', {}, state),
+      el('td', { class: 'mono', text: fmtTime(src.last_run_at) }),
+      el('td', { class: 'mono', text: fmtTime(src.last_ok_at) }),
+      el('td', { class: 'mono', text: fmtTime(src.next_due_at) }),
+      el('td', { class: 'hint' }, el('div', { text: note }), error),
+      el('td', { class: 'num' },
+        el('button', {
+          type: 'button', class: 'btn ghost', text: '立即刷新',
+          disabled: src.running || !src.enabled,
+          onclick: (event) => refreshSource(src, event.currentTarget),
+        })));
+  }
+
+  // refreshSource 打手动触发端点：202 = 一轮已派出去，409 = 该源正在跑，
+  // 404 = 没有这个源或已停用。结果都回读 /api/status（不猜这一轮的结局）。
+  async function refreshSource(src, button) {
+    button.disabled = true;
+    say('已请求刷新 ' + src.name + ' …', 'busy');
+    try {
+      await api('POST', '/api/refresh', { source: src.name });
+      say('已派出 ' + src.name + ' 的一轮刷新，结果看「上次运行」与「上次错误」', 'ok');
+    } catch (err) {
+      fail(err);
+    }
+    await load();
+  }
+
+  async function load() {
+    const status = await api('GET', '/api/status');
     const t = status.totals;
     totalsBox.replaceChildren(
       stat('剧目', String(t.dramas)),
@@ -380,14 +424,7 @@ function initStatus() {
       row('WebDAV 用户', flag(c.webdav_user_set), 'webdav_user'),
       row('WebDAV 密码', flag(c.webdav_pass_set), 'webdav_pass'));
 
-    sourcesBody.replaceChildren(...status.sources.map((src) => row(
-      src.label === src.name ? src.name : src.name + '（' + src.label + '）',
-      src.enabled
-        ? el('span', { class: 'tag', text: '已启用' })
-        : el('span', { class: 'tag warn', text: '已停用' }),
-      src.reason !== '' ? src.reason
-        : 'base_url ' + (src.base_url === '' ? '用插件默认地址' : src.base_url) +
-          '，请求超时 ' + src.request_timeout_sec + ' 秒')));
+    sourcesBody.replaceChildren(...status.sources.map(sourceRow));
 
     const cache = status.cache;
     cacheBody.replaceChildren(
@@ -398,7 +435,9 @@ function initStatus() {
       row('建议保留', cache.max_age, '--vfs-cache-max-age 的建议值，不参与本服务运行逻辑'),
       row('rclone 参数', cache.flags, '缓存代理启动参数（--vfs-cache-mode full 起）', true));
     cacheNote.textContent = cache.note;
-  }).catch(fail);
+  }
+
+  load().catch(fail);
 }
 
 // ---- 分派 ----

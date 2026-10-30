@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -51,12 +50,16 @@ func (c *CoverCache) LocalizeCover(ctx context.Context, provider, providerID, ur
 	if url == "" {
 		return nil
 	}
-	key := provider + "/" + providerID
+	key := CoverKey(provider, providerID)
 
 	// 已在本地：不碰网络。文件在、行在 = 命中；行里的 path 以库为准（可能来自
 	// 旧版布局）。
 	if row, err := c.st.ArtifactByKey(ctx, store.ArtifactKindCover, key); err == nil {
 		if fileExists(row.Path) {
+			// 命中即 touch（契约 MUST）：不 touch 的海报会被 cache_lru_days 当过期
+			// 删掉，下次刷新就得重下——源图失效时直接丢封面。touch 失败只让这条更早
+			// 过期，不影响本次结果，因此忽略。
+			_ = c.st.TouchArtifact(ctx, store.ArtifactKindCover, key, stamp(c.now()))
 			return nil
 		}
 	} else if !errors.Is(err, store.ErrNotFound) {
@@ -68,14 +71,16 @@ func (c *CoverCache) LocalizeCover(ctx context.Context, provider, providerID, ur
 		return err
 	}
 
-	dir, err := c.coverDir(ctx)
+	root, err := cacheRoot(ctx, c.settings)
 	if err != nil {
 		return err
 	}
-	sum := sha256.Sum256([]byte(key))
-	hash := hex.EncodeToString(sum[:])
-	target := filepath.Join(dir, hash[:2], hash+ext)
-	if err := writeFileAtomic(target, body); err != nil {
+	l := layoutOf(root)
+	target, err := l.file(store.ArtifactKindCover, cacheHash(store.ArtifactKindCover, key), ext)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(l.tmpDir(), target, body); err != nil {
 		return fmt.Errorf("写入海报文件 %s: %w", target, err)
 	}
 
@@ -118,15 +123,6 @@ func (c *CoverCache) fetch(ctx context.Context, url string) (body []byte, ext st
 	return body, coverExt(resp.Header.Get("Content-Type"), url), nil
 }
 
-// coverDir 读 cache_dir（每次现读，硬约束 5：改完即时生效）并返回海报目录。
-func (c *CoverCache) coverDir(ctx context.Context) (string, error) {
-	root, err := c.settings.String(ctx, store.KeyCacheDir)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(root, "cover"), nil
-}
-
 // coverExt 由 Content-Type 推扩展名；认不出的 type 退回 URL 后缀，再退回 ".img"。
 // 扩展名只影响本地文件名，不影响任何契约。
 func coverExt(contentType, url string) string {
@@ -147,39 +143,6 @@ func coverExt(contentType, url string) string {
 		}
 	}
 	return ".img"
-}
-
-// writeFileAtomic 在同目录写临时文件再 rename：内容和路径都只由键决定，同名并发
-// 写同一份内容无害（docs/CACHE-MODEL.md「并发」）。
-func writeFileAtomic(path string, body []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	cleanup := func() { _ = os.Remove(name) }
-	if _, err := tmp.Write(body); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := os.Chmod(name, 0o644); err != nil {
-		cleanup()
-		return err
-	}
-	if err := os.Rename(name, path); err != nil {
-		cleanup()
-		return err
-	}
-	return nil
 }
 
 // fileExists 判断路径是否是存在的普通文件。

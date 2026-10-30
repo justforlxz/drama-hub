@@ -27,8 +27,7 @@ var (
 //
 // 注册表认两组 key：下面列出的固定 key，以及插件配置的前缀模式
 // plugin.<源>.<项>（真值见 docs/DEV-STANDARDS.md「配置」表与
-// docs/PLUGIN-CONTRACT.md「配置」）。缓存上限与 LRU 天数（cache_max_mb /
-// cache_lru_days）由 S7 实现，本包暂不注册。
+// docs/PLUGIN-CONTRACT.md「配置」）。
 type SettingKey string
 
 // settings 表的 key 常量。
@@ -41,6 +40,8 @@ const (
 	KeyWebDAVUser   SettingKey = "webdav_user"
 	KeyWebDAVPass   SettingKey = "webdav_pass"
 	KeyCacheDir     SettingKey = "cache_dir"
+	KeyCacheMaxMB   SettingKey = "cache_max_mb"
+	KeyCacheLRUDays SettingKey = "cache_lru_days"
 	// 刷新调度的三项（范围与语义见 docs/SCHEDULER-MODEL.md「配置」）。
 	KeyRefreshIntervalSec SettingKey = "refresh_interval_sec"
 	KeyRefreshBatch       SettingKey = "refresh_batch"
@@ -294,8 +295,14 @@ func specFor(key SettingKey) (settingSpec, bool) {
 	case KeyWebDAVPass:
 		return settingSpec{kind: kindString, required: true}, true
 	case KeyCacheDir:
-		// 缓存根目录：海报等本地资产落 <cache_dir>/cover/…；写盘时按需 MkdirAll。
+		// 缓存根目录：海报/分片/关键帧索引落 <cache_dir>/{cover,seg,index}/…；写盘时按需 MkdirAll。
 		return settingSpec{kind: kindString, def: "./data/cache"}, true
+	case KeyCacheMaxMB:
+		// 分片缓存上限（MB）：0 = 不按大小淘汰，只受 cache_lru_days 约束。
+		return settingSpec{kind: kindInt, def: "8192", min: 0, max: 1048576}, true
+	case KeyCacheLRUDays:
+		// 超过 N 天未命中的缓存条目（三种 kind 都算）删除。
+		return settingSpec{kind: kindInt, def: "30", min: 1, max: 365}, true
 	case KeyRefreshIntervalSec:
 		// 全局刷新间隔：所有源共用的默认值（docs/SCHEDULER-MODEL.md「配置」）。
 		return settingSpec{kind: kindInt, def: "3600", min: 300, max: 86400}, true

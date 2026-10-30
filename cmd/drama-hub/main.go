@@ -78,6 +78,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 缓存淘汰与 HTTP 服务同寿命：启动即跑一轮，之后每 5 分钟一轮，ctx 一取消就停
+	// （docs/CACHE-MODEL.md「淘汰」）。与请求路径无关，失败只记录、下一轮重试。
+	caches := cache.New(st, settings, logger)
+	go caches.RunEviction(ctx)
+
 	// 调度器与 HTTP 服务同寿命：ctx 一取消它就停派新轮，并等手上的轮收尾。
 	schedCtx, stopScheduler := context.WithCancel(ctx)
 	schedulerDone := make(chan struct{})

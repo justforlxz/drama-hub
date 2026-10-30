@@ -178,9 +178,10 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
 - **不新增列、不新增表**：复用现有 `artifact`（`kind='cover'`）。
 - **key 约定**：`<provider>/<provider_id>`（确定性派生，无需在 `drama` 上加外键列）。
 - **为什么复用 `artifact` 而不是加 `drama.cover_path`**：`internal/cache` 已经在管理
-  `artifact`（`kind IN ('cover','index')`），封面下载/落盘/读回已有实现；
-  并且 `artifact` 不被淘汰（ADR-0004 只让 rclone 淘汰视频分片），满足
-  「源图失效不影响已入库海报」。
+  `artifact`（`kind IN ('cover','index')`），封面下载/落盘/读回已有实现。
+  淘汰口径（ADR-0007 把缓存收回本服务后）：海报**不参与** `cache_max_mb` 的体积淘汰
+  （只有分片参与），但**参与** `cache_lru_days` 的过期淘汰——命中即 touch，所以天天
+  在用的海报不会被当成过期；「源图失效不影响已入库海报」仍然成立（只要它还在用）。
 - `drama.cover_url` 保留为**上游原值**（溯源用），不做本地路径回填：两列表达两件事。
 - 上游封面地址无签名、不过期（实测），所以「源图失效」目前不是红果的问题；
   本地资产仍要做，理由是第二个源可能会给短时签名链。

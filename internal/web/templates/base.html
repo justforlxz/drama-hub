@@ -1,0 +1,23 @@
+{{define "base"}}<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · drama-hub</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-page="{{.Page}}">
+<header class="topbar">
+  <span class="wordmark">drama-hub</span>
+  <nav class="tabs" aria-label="管理页">
+    <a href="/"{{if eq .Page "dramas"}} aria-current="page"{{end}}>剧目</a>
+    <a href="/merges"{{if eq .Page "merges"}} aria-current="page"{{end}}>合并编排</a>
+    <a href="/status"{{if eq .Page "status"}} aria-current="page"{{end}}>同步与缓存</a>
+  </nav>
+</header>
+<main id="main">
+{{template "content" .}}
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>{{end}}

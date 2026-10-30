@@ -1,0 +1,39 @@
+{{define "content"}}
+<section class="block">
+  <div class="block-head">
+    <h1>剧目</h1>
+    <p class="hint">按上游剧 id 同步入库。删剧会连带删掉它的集、合并组与对外集号。</p>
+  </div>
+  <form class="row-form" id="drama-form">
+    <label class="field">
+      <span>上游剧 id 或 /player/ 链接</span>
+      <input id="series-id" name="series_id" required autocomplete="off" spellcheck="false"
+             placeholder="7503745441910017049">
+    </label>
+    <button type="submit" class="btn primary" id="sync-btn">同步入库</button>
+  </form>
+  <p class="notice" id="notice" role="status" aria-live="polite"></p>
+</section>
+
+<section class="block">
+  <div class="scroll">
+    <table class="grid">
+      <caption class="sr-only">剧目列表</caption>
+      <thead>
+        <tr>
+          <th>剧名</th>
+          <th class="num">年份</th>
+          <th class="num">集 / 上游</th>
+          <th class="num">可播</th>
+          <th class="num">对外集</th>
+          <th class="num">合并组</th>
+          <th>同步时间</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="dramas"></tbody>
+    </table>
+  </div>
+  <p class="empty" id="dramas-empty" hidden>还没有剧目，先同步一部。</p>
+</section>
+{{end}}

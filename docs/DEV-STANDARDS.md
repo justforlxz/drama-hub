@@ -443,6 +443,56 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 真机 `rclone lsf` / Emby 扫描仍在 `docs/ACCEPTANCE.md` 的 P2 手工清单里，
 是验收层（人工、一次性），不是 `make test` 的组成部分。
 
+## 管理界面（internal/web）
+
+挂载点 `/`（装配根注册）。三页界面与管理 API 是同一个 handler：完整路径原样传入
+本包（ServeMux 不剥前缀），未登记路径由本包 mux 返回 404 —— 「未知路径 → 404」
+的语义不变，只是兜底者从顶层 mux 换成 web 的 mux。`/dav/`、`/s/` 的 pattern 比
+`/` 更具体，不受影响。
+
+### 页面
+
+| 路径 | 页面 | 能干的事 |
+|---|---|---|
+| `/` | 剧目 | 按上游剧 id 或 `/player/<id>` 链接同步入库；删剧目（级联删集、合并组、对外集号） |
+| `/merges` | 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即 `ord`）→ 删组 |
+| `/status` | 同步与缓存 | 同步计数与最近同步时间、运行配置现状（密钥只报「是否已设置」）、缓存代理建议参数 |
+
+模板 `templates/*.html` 与 `static/app.css`、`static/app.js` 用 `//go:embed` 进二进制：
+界面没有构建步骤、没有 `package.json`（ADR-0002）。页面 JS 只调下面这些 API，渲染结果
+与 API 返回一一对应；页面响应同样给出精确 `Content-Length`（渲染成字节 → 再写响应）。
+
+### 管理 API
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/dramas` | GET | 剧目列表：drama 行 + `episodes` / `playable_episodes` / `emby_items` / `merge_groups` 计数 |
+| `/api/dramas` | POST | 新增剧目：`{"series_id":"<上游剧 id 或 /player/ 链接>"}`，同步入库后返回 201 + 整份列表 |
+| `/api/dramas/{id}` | DELETE | 删剧目（级联删集与合并组），204；不存在 404 |
+| `/api/dramas/{id}/episodes` | GET | 该剧全部集（`ep_no` 升序）；`has_play_url` 只报真假，不回传直链 |
+| `/api/dramas/{id}/merge-groups` | GET | 该剧合并组与成员（`ord` 即时间轴顺序） |
+| `/api/dramas/{id}/merge-groups` | POST | 建组：`{"label":"…","episode_ids":[…]}`，数组顺序即 `ord`，201 + 整份列表 |
+| `/api/merge-groups/{id}` | DELETE | 删组（同一事务内重建派生表），204 |
+| `/api/status` | GET | 同步计数 + 运行配置 + 缓存面 |
+
+- **「增剧目」的唯一入口是数据源同步**：剧目与集的真值在上游，手工插空剧只会得到一条
+  永远没有集的记录。`series_id` 只接受纯数字或 `/player/<id>` 链接 —— 归一后的值会拼进
+  上游路径，放宽字符集等于把路径注入带进来。
+- **同步失败统一 502**（数据源在远端，失败几乎总是上游/页面结构问题），错误原因进响应体；
+  provider 的错误文本不含直链与签名。
+- **业务规则不复制到本包**：合并编排的「至少 2 集、同剧、不重复、不与已有组重叠」全部由
+  `store.CreateMergeGroup` 校验，本包只做 `store.ErrInvalid` → 400、`store.ErrNotFound`
+  → 404 的映射。
+- **计数不做 N+1**：`store.ListDramaStats` 一条聚合查询取全库（标量子查询，不用多表
+  JOIN，避免行数相乘）。
+
+### 缓存面（ADR-0004）
+
+视频缓存由缓存代理负责淘汰，本服务不实现淘汰，也不设缓存上限/保留期运行参数。看板只做
+两件事：显示 `strm_prefix` 是否指向代理（空 = 直连，播放字节不经缓存），并给出
+`--vfs-cache-mode full --vfs-cache-max-size 200G --vfs-cache-max-age 720h` 这份建议值
+（取自设计基线 Q5，一次性输出、不参与运行逻辑）。改这两个数字属设计变更，不是配置调整。
+
 ## 提交
 
 `<类型>(<范围>): <祈使句>`，正文说明「为什么」而不是「改了什么」。范围用包名（`stream`、`vfs`、`store`）。格式化与重命名单独提交。

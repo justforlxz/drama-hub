@@ -7,15 +7,16 @@ import (
 
 // DramaStats 是一部剧的派生计数，供管理面的剧目列表与看板使用。
 //
-// 各项与表的关系：Episodes 是 episode 行数、PlayableEpisodes 是其中
-// play_url 非空的行数（同步不写 play_url，见 docs/DEV-STANDARDS.md）、
-// EmbyItems 是 emby_item 派生表行数、MergeGroups 是 merge_group 行数。
+// 各项与表的关系：Episodes 是 episode 行数、EmbyItems 是 emby_item 派生表行数、
+// MergeGroups 是 merge_group 行数。
+//
+// 不再有「可播集数」：直链不落库（0004 已删 play_url），「这一集现在能不能播」
+// 只有请求时向插件解析才知道，库里没有可数的真值。
 type DramaStats struct {
-	DramaID          int64
-	Episodes         int
-	PlayableEpisodes int
-	EmbyItems        int
-	MergeGroups      int
+	DramaID     int64
+	Episodes    int
+	EmbyItems   int
+	MergeGroups int
 }
 
 // ListDramaStats 返回全部剧的派生计数，按 drama.id 升序。
@@ -27,7 +28,6 @@ func (s *Store) ListDramaStats(ctx context.Context) ([]DramaStats, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT d.id,
 		       (SELECT COUNT(*) FROM episode e WHERE e.drama_id = d.id),
-		       (SELECT COUNT(*) FROM episode e WHERE e.drama_id = d.id AND e.play_url <> ''),
 		       (SELECT COUNT(*) FROM emby_item i WHERE i.drama_id = d.id),
 		       (SELECT COUNT(*) FROM merge_group g WHERE g.drama_id = d.id)
 		FROM drama d
@@ -40,7 +40,7 @@ func (s *Store) ListDramaStats(ctx context.Context) ([]DramaStats, error) {
 	out := make([]DramaStats, 0)
 	for rows.Next() {
 		var st DramaStats
-		if err := rows.Scan(&st.DramaID, &st.Episodes, &st.PlayableEpisodes, &st.EmbyItems, &st.MergeGroups); err != nil {
+		if err := rows.Scan(&st.DramaID, &st.Episodes, &st.EmbyItems, &st.MergeGroups); err != nil {
 			return nil, fmt.Errorf("读取剧目计数行: %w", err)
 		}
 		out = append(out, st)

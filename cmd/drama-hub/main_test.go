@@ -11,11 +11,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
+	"github.com/justforlxz/drama-hub/internal/cache"
+	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/store"
@@ -33,7 +35,7 @@ func shardOf(providerID string) string {
 }
 
 // newTestHandler 与 main 用同一条装配路径：httptest 起真实 handler，不 mock 自己的
-// handler。出流端点需要数据库（settings / episode 表），因此开一个临时库装配。
+// handler。播放面需要数据库（settings / episode 表），因此开一个临时库装配。
 func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
 	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "cmd.db"))
@@ -41,7 +43,53 @@ func newTestHandler(t *testing.T) http.Handler {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return newHandler(slog.New(slog.DiscardHandler), store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer(), fakeSchedule{}, testSources())
+	return newAssembly(slog.New(slog.DiscardHandler), store.NewStore(db.DB), store.NewSettings(db.DB),
+		testSyncer(), fakeSchedule{}, testSources(), nil)
+}
+
+// newAssembly 按 main 的装配顺序造 handler：缓存实例 + 直链解析器 + 路由表。
+// reg 为 nil 时用一个空注册表（任何 Resolve 都会失败，播放面据此回 502）。
+func newAssembly(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, reg *plugin.Registry) http.Handler {
+	if reg == nil {
+		reg = plugin.NewRegistry()
+	}
+	return newHandler(logger, st, settings, syncer, schedule, sources,
+		cache.New(st, settings, logger), stream.NewResolver(st, reg))
+}
+
+// stubSource 是装配测试用的最小插件：Resolve 恒给同一个直链。
+//
+// 它让「播放面装配」不必打真上游：playlist 200 只需要解析出一个合法 URL
+// （分片索引在测试里直接写库，不必真 ffprobe）。
+type stubSource struct {
+	name string
+	url  string
+}
+
+func (s stubSource) Name() string { return s.name }
+
+func (s stubSource) Enumerate(context.Context, *plugin.Cursor) (plugin.Page, error) {
+	return plugin.Page{}, nil
+}
+
+func (s stubSource) Work(context.Context, plugin.WorkRef) (plugin.WorkDetail, error) {
+	return plugin.WorkDetail{}, nil
+}
+
+func (s stubSource) Resolve(context.Context, plugin.WorkRef, int) (plugin.Stream, error) {
+	return plugin.Stream{URL: s.url}, nil
+}
+
+func (s stubSource) Health(context.Context) error { return nil }
+
+// stubRegistry 造一个只含 stubSource 的注册表（源名与库里的 provider 对齐）。
+func stubRegistry(t *testing.T, name, directURL string) *plugin.Registry {
+	t.Helper()
+	reg := plugin.NewRegistry()
+	if err := reg.Register(stubSource{name: name, url: directURL}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	return reg
 }
 
 // testSyncer 是管理 API 的数据源依赖。cmd 的测试不触发同步，只为满足装配参数；
@@ -88,15 +136,16 @@ func TestHandler_Healthz(t *testing.T) {
 	}
 }
 
-// TestHandler_UnimplementedMounts 覆盖仍是占位的挂载点语义：
-// `/s/` 子树里未实现的路径任意方法都是 501。
-// /webdav/ 已在 M4 接上真实 WebDAV（契约归 internal/webdav），`/` 在 R1 接上管理面
-// （契约归 internal/web，见 TestHandler_ManagementSurface）。
-func TestHandler_UnimplementedMounts(t *testing.T) {
+// TestHandler_RetiredPlaybackPaths 覆盖「/dav/ 与 /s/{token}/* 已退役、不留兼容层」：
+// 两条老路径都落到管理面的 404 兜底，不再是 501、也不再有任何 handler。
+func TestHandler_RetiredPlaybackPaths(t *testing.T) {
 	h := newTestHandler(t)
-	for _, method := range []string{http.MethodGet, http.MethodPost} {
-		if rec := serve(t, h, method, "/s/x"); rec.Code != http.StatusNotImplemented {
-			t.Errorf("%s /s/x 状态码 = %d, 期望 %d", method, rec.Code, http.StatusNotImplemented)
+	for _, path := range []string{
+		"/s/x", "/s/abc/e/e1", "/s/abc/seg/e1/0.ts", "/s/abc/e/m1/master.m3u8",
+		"/dav/", "/dav/短剧",
+	} {
+		if rec := serve(t, h, http.MethodGet, path); rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s 状态码 = %d, 期望 404（退役路径没有 handler）", path, rec.Code)
 		}
 	}
 }
@@ -155,8 +204,8 @@ func TestHandler_LogsRequests(t *testing.T) {
 				t.Fatalf("store.Open: %v", err)
 			}
 			defer func() { _ = db.Close() }()
-			h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
-				store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer(), fakeSchedule{}, testSources())
+			h := newAssembly(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+				store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer(), fakeSchedule{}, testSources(), nil)
 
 			rec := serve(t, h, http.MethodGet, c.path)
 			if rec.Code != c.wantCode {
@@ -192,151 +241,9 @@ func TestHandler_LogsRequests(t *testing.T) {
 	}
 }
 
-// TestHandler_StreamEpisode 覆盖 AC13 与 AC10：装配后的 `/s/{token}/e/{uid}`
-// 真的走到出流（不是只剩 501）；每请求恰一条 `http request` 日志，token 段被
-// 掩码为 {token}，全部日志里都不出现 token 明文。
-func TestHandler_StreamEpisode(t *testing.T) {
-	body := bytes.Repeat([]byte("drama"), 1024) // 5120 字节
-	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.ServeContent(w, r, "video.mp4", time.Time{}, bytes.NewReader(body))
-	}))
-	t.Cleanup(cdn.Close)
-
-	const secret = "0123456789abcdef0123456789abcdef"
-	buf := &bytes.Buffer{}
-	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "stream.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	st := store.NewStore(db.DB)
-	settings := store.NewSettings(db.DB)
-	if err := settings.Set(context.Background(), store.KeyStreamSecret, secret); err != nil {
-		t.Fatalf("Set stream_secret: %v", err)
-	}
-	dramaID, err := st.UpsertDrama(context.Background(), store.Drama{Provider: "web", ProviderID: "p1", Title: "测试剧"})
-	if err != nil {
-		t.Fatalf("UpsertDrama: %v", err)
-	}
-	epID, err := st.UpsertEpisode(context.Background(), store.Episode{
-		DramaID: dramaID, EpNo: 1, Source: "web", Vid: "v1", PlayURL: cdn.URL + "/video.mp4",
-	})
-	if err != nil {
-		t.Fatalf("UpsertEpisode: %v", err)
-	}
-	uid := "e" + strconv.FormatInt(epID, 10)
-	token := stream.Sign([]byte(secret), uid)
-	h := newHandler(logger, st, settings, testSyncer(), fakeSchedule{}, testSources())
-
-	rec := serve(t, h, http.MethodGet, "/s/"+token+"/e/"+uid)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("状态码 = %d, 期望 200（/s/ 仍返回 501 说明装配没接上）", rec.Code)
-	}
-	if rec.Body.Len() != len(body) {
-		t.Errorf("body 长度 = %d, 期望 %d", rec.Body.Len(), len(body))
-	}
-	if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(len(body)) {
-		t.Errorf("Content-Length = %q, 期望 %d", cl, len(body))
-	}
-
-	// AC10：`http request` 日志恰一条，且路径掩码。
-	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
-	requestLogs := 0
-	for _, line := range lines {
-		var entry struct {
-			Msg  string `json:"msg"`
-			Path string `json:"path"`
-		}
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			t.Fatalf("日志不是合法 JSON: %v（line=%q）", err, line)
-		}
-		if entry.Msg == "http request" {
-			requestLogs++
-			if want := "/s/{token}/e/" + uid; entry.Path != want {
-				t.Errorf("日志 path = %q, 期望 %q", entry.Path, want)
-			}
-		}
-	}
-	if requestLogs != 1 {
-		t.Errorf("http request 日志条数 = %d, 期望 1（buf=%q）", requestLogs, buf.String())
-	}
-	if strings.Contains(buf.String(), token) {
-		t.Errorf("日志里出现 token 明文")
-	}
-
-	// /s/x 仍 501（既有语义不变）。
-	if rec := serve(t, h, http.MethodGet, "/s/x"); rec.Code != http.StatusNotImplemented {
-		t.Errorf("GET /s/x 状态码 = %d, 期望 %d", rec.Code, http.StatusNotImplemented)
-	}
-}
-
-// TestHandler_SegmentRoute 覆盖 M6 的装配：分片端点挂在 `/s/` 子树下、比
-// stream.Server 的 `/s/` 更具体，因此命中切片 handler（不是 501）；`/s/` 其余
-// 路径仍是 501。签名校验用 cmd 注入的 stream.Verify，所以错 token → 401。
-func TestHandler_SegmentRoute(t *testing.T) {
-	const secret = "0123456789abcdef0123456789abcdef"
-	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "seg.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	st := store.NewStore(db.DB)
-	settings := store.NewSettings(db.DB)
-	if err := settings.Set(context.Background(), store.KeyStreamSecret, secret); err != nil {
-		t.Fatalf("Set stream_secret: %v", err)
-	}
-	buf := &bytes.Buffer{}
-	h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), st, settings, testSyncer(), fakeSchedule{}, testSources())
-
-	// 正确签名 + 库中不存在的集：走到 handler 后是 404，而不是 501 兜底。
-	uid := "e999"
-	token := stream.Sign([]byte(secret), uid)
-	rec := serve(t, h, http.MethodGet, "/s/"+token+"/seg/"+uid+"/0.ts")
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("分片端点状态码 = %d, 期望 404（501 说明装配没接上）", rec.Code)
-	}
-
-	// 错签名 → 401（证明校验用的是注入的 stream.Verify）。
-	rec = serve(t, h, http.MethodGet, "/s/bogus/seg/"+uid+"/0.ts")
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("错 token 状态码 = %d, 期望 401", rec.Code)
-	}
-
-	// `/s/` 其余子路径仍 501（M5 语义不回归）。
-	if rec = serve(t, h, http.MethodGet, "/s/x"); rec.Code != http.StatusNotImplemented {
-		t.Errorf("GET /s/x 状态码 = %d, 期望 501", rec.Code)
-	}
-
-	// 访问日志：分片路径的 token 段被掩码，且日志里不出现 token 明文。
-	var sawSeg bool
-	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
-		var entry struct {
-			Msg  string `json:"msg"`
-			Path string `json:"path"`
-		}
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			t.Fatalf("日志不是合法 JSON: %v（line=%q）", err, line)
-		}
-		if entry.Msg == "http request" && strings.Contains(entry.Path, "/seg/") {
-			sawSeg = true
-			if want := "/s/{token}/seg/" + uid + "/0.ts"; entry.Path != want {
-				t.Errorf("分片日志 path = %q, 期望 %q", entry.Path, want)
-			}
-		}
-	}
-	if !sawSeg {
-		t.Error("没有看到分片请求的访问日志")
-	}
-	if strings.Contains(buf.String(), token) {
-		t.Error("日志里出现 token 明文")
-	}
-}
-
-// TestHandler_WebDAV 覆盖装配面：`/webdav/` 已从占位 501 换成真实 WebDAV
-// （无认证 401；带认证 Depth:1 207；strm 里的 id 由装配根的 signID 生成、与
-// internal/stream 的 stream.ID 一致——这条断言能挡住 IDFunc 接错）。
+// TestHandler_WebDAV 覆盖元数据面：`/webdav/` 是只读虚拟 WebDAV（无认证 401、
+// 带认证 Depth:1 207）；`.strm` 的内容是 `/video/{id}.m3u8`，id 由装配根的 signID
+// 生成、与 stream.ID 一致 —— 这条断言能挡住 IDFunc 接错。
 func TestHandler_WebDAV(t *testing.T) {
 	ctx := context.Background()
 	const (
@@ -372,14 +279,14 @@ func TestHandler_WebDAV(t *testing.T) {
 	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
 		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
-	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources())
+	h := newAssembly(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources(), nil)
 
 	// 无认证 → 401（不是 501：说明 /webdav/ 已接上真实 handler）。
-	if rec := serve(t, h, "PROPFIND", "/webdav/"); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("PROPFIND /webdav/（无认证）状态码 = %d, 期望 401", rec.Code)
+	if rec := serve(t, h, http.MethodGet, "/webdav/"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /webdav/（无认证）状态码 = %d, 期望 401", rec.Code)
 	}
 
-	// 带认证 PROPFIND → 207。
+	// 带认证 → 207。
 	req := httptest.NewRequest("PROPFIND", "/webdav/", nil)
 	req.SetBasicAuth(user, pass)
 	req.Header.Set("Depth", "1")
@@ -389,8 +296,6 @@ func TestHandler_WebDAV(t *testing.T) {
 		t.Fatalf("PROPFIND /webdav/ 状态码 = %d, 期望 207", rec.Code)
 	}
 
-	// strm 指向 `/video/{id}.m3u8`，id = uid + "-" + 签名的前 12 个十六进制字符；
-	// 这里用装配根的 signID（stream.ID）独立算一遍，挡住 IDFunc 接错。
 	// 文件名含空格与中文，请求目标必须是转义后的形式（真实客户端也这样发）。
 	path := "/webdav/" + url.PathEscape("爱情") + "/" + shardOf("p1") + "/" +
 		url.PathEscape("测试剧 (2024)") + "/Season%2001/" +
@@ -403,99 +308,259 @@ func TestHandler_WebDAV(t *testing.T) {
 		t.Fatalf("GET %s 状态码 = %d, 期望 200", path, rec.Code)
 	}
 	uid := "e" + strconv.FormatInt(epID, 10)
-	want := "/video/" + stream.ID(secret, uid) + ".m3u8\n"
-	if rec.Body.String() != want {
-		t.Errorf("strm 内容 = %q, 期望 %q", rec.Body.String(), want)
+	body := rec.Body.String()
+	if want := "/video/" + stream.ID(secret, uid) + ".m3u8\n"; body != want {
+		t.Errorf("strm 内容 = %q, 期望 %q", body, want)
+	}
+	// 契约的 .strm 形态：`^.*/video/[em][0-9]+-[0-9a-f]{12}.m3u8$`（单行 + 尾换行）。
+	strmRE := regexp.MustCompile(`^.*/video/[em][0-9]+-[0-9a-f]{12}\.m3u8\n$`)
+	if !strmRE.MatchString(body) {
+		t.Errorf("strm 内容不符合契约正则 %s：%q", strmRE, body)
 	}
 	if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(rec.Body.Len()) {
 		t.Errorf("Content-Length = %q, body 长度 = %d", cl, rec.Body.Len())
 	}
 }
 
-// TestHandler_MergedPlaylist 覆盖 M7 的装配面：合并集 uid 走自造 m3u8（不是单集
-// MP4 透传、也不是 501），playlist 里带 DISCONTINUITY，且分片 URL 指回分片端点。
-func TestHandler_MergedPlaylist(t *testing.T) {
+// TestHandler_PlaybackSurface 覆盖 2.0 播放面的装配：两个口子挂在 `/video`，
+// 单集与合并集同一路径形态；签名错 401、uid 不存在 404；每请求恰一条访问日志。
+func TestHandler_PlaybackSurface(t *testing.T) {
 	ctx := context.Background()
 	const secret = "0123456789abcdef0123456789abcdef"
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "m7.db"))
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "video.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	st := store.NewStore(db.DB)
 	settings := store.NewSettings(db.DB)
-	if err := settings.Set(ctx, store.KeyStreamSecret, secret); err != nil {
-		t.Fatalf("Set stream_secret: %v", err)
+	for k, v := range map[store.SettingKey]string{
+		store.KeyStreamSecret: secret,
+		store.KeyCacheDir:     filepath.Join(t.TempDir(), "cache"),
+	} {
+		if err := settings.Set(ctx, k, v); err != nil {
+			t.Fatalf("Set %s: %v", k, err)
+		}
 	}
-	dramaID, err := st.UpsertDrama(ctx, store.Drama{Provider: "web", ProviderID: "m7", Title: "合并剧", Year: 2026})
+	dramaID, err := st.UpsertDrama(ctx, store.Drama{Provider: "web", ProviderID: "p1", Title: "测试剧", Year: 2026})
 	if err != nil {
 		t.Fatalf("UpsertDrama: %v", err)
 	}
 	var ids []int64
-	for i := 1; i <= 2; i++ {
+	for i := 1; i <= 3; i++ {
 		id, err := st.UpsertEpisode(ctx, store.Episode{DramaID: dramaID, EpNo: i, Source: "web", Vid: "v"})
 		if err != nil {
 			t.Fatalf("UpsertEpisode: %v", err)
 		}
 		ids = append(ids, id)
 	}
-	// 装配根不预置索引（那是索引任务的事），这里直接写两集各 2 片，让时间轴可用。
+	// 索引由 S8 按需建立；装配面测试不跑 ffprobe，直接写每集各 2 片。
 	for _, id := range ids {
 		if err := st.ReplaceSegments(ctx, id, []store.Segment{
-			{EpisodeID: id, StartSec: 0, Dur: 4, Keyframe: true, Mode: "copy"},
-			{EpisodeID: id, StartSec: 4, Dur: 2, Keyframe: true, Mode: "copy"},
+			{EpisodeID: id, StartSec: 0, Dur: 4, Keyframe: true, Mode: "copy", CodecSig: "h264/High/40/yuv420p/[0][0][0][0]/1/12800"},
+			{EpisodeID: id, StartSec: 4, Dur: 2, Keyframe: true, Mode: "copy", CodecSig: "h264/High/40/yuv420p/[0][0][0][0]/1/12800"},
 		}); err != nil {
 			t.Fatalf("ReplaceSegments: %v", err)
 		}
 	}
-	gid, err := st.CreateMergeGroup(ctx, dramaID, "第1-2集", ids)
+	// 播放单元只认派生表；CreateMergeGroup 会重建它，这里先把单集形态建出来。
+	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
+	}
+	gid, err := st.CreateMergeGroup(ctx, dramaID, "第2-3集", []int64{ids[1], ids[2]})
 	if err != nil {
 		t.Fatalf("CreateMergeGroup: %v", err)
 	}
-	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources())
 
-	uid := "m" + strconv.FormatInt(gid, 10)
-	token := stream.Sign([]byte(secret), uid)
+	buf := &bytes.Buffer{}
+	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	h := newAssembly(logger, st, settings, testSyncer(), fakeSchedule{}, testSources(),
+		stubRegistry(t, "web", "http://127.0.0.1:1/direct.mp4"))
 
-	// 合并集 uid 在 `/s/{token}/e/{uid}` 上返回 playlist，不是 501、不是 MP4。
-	rec := serve(t, h, http.MethodGet, "/s/"+token+"/e/"+uid)
+	singleUID := "e" + strconv.FormatInt(ids[0], 10)
+	mergedUID := "m" + strconv.FormatInt(gid, 10)
+
+	// 单集：合法 VOD playlist，分片 URI 指回 /video/{id}/{seq}.ts，没有 DISCONTINUITY。
+	singleID := stream.ID(secret, singleUID)
+	rec := serve(t, h, http.MethodGet, "/video/"+singleID+".m3u8")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("合并集出流状态码 = %d, 期望 200（501 说明装配没接上）", rec.Code)
+		t.Fatalf("单集 playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "application/vnd.apple.mpegurl" {
 		t.Errorf("Content-Type = %q, 期望 application/vnd.apple.mpegurl", ct)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "#EXT-X-DISCONTINUITY") {
-		t.Errorf("合并集 playlist 缺集边界 DISCONTINUITY：\n%s", body)
+	if !strings.HasPrefix(body, "#EXTM3U\n") || !strings.HasSuffix(body, "#EXT-X-ENDLIST\n") {
+		t.Errorf("单集 playlist 不是完整 VOD：\n%s", body)
 	}
-	if !strings.Contains(body, "/s/"+token+"/seg/"+uid+"/0.ts") {
-		t.Errorf("playlist 分片 URL 未指回分片端点：\n%s", body)
+	if !strings.Contains(body, "/video/"+singleID+"/0.ts") {
+		t.Errorf("playlist 分片 URI 没指回 /video/{id}/{seq}.ts：\n%s", body)
+	}
+	if strings.Contains(body, "#EXT-X-DISCONTINUITY") {
+		t.Errorf("单集 playlist 不该有 DISCONTINUITY：\n%s", body)
 	}
 	if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(rec.Body.Len()) {
 		t.Errorf("Content-Length = %q, body = %d 字节", cl, rec.Body.Len())
 	}
 
-	// /master.m3u8 别名同样返回 playlist；单集 uid 走别名是 404。
-	rec = serve(t, h, http.MethodGet, "/s/"+token+"/e/"+uid+"/master.m3u8")
+	// 合并集：同一路径形态，集边界带 DISCONTINUITY。
+	mergedID := stream.ID(secret, mergedUID)
+	rec = serve(t, h, http.MethodGet, "/video/"+mergedID+".m3u8")
 	if rec.Code != http.StatusOK {
-		t.Errorf("master.m3u8 别名状态码 = %d, 期望 200", rec.Code)
+		t.Fatalf("合并集 playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
 	}
-	singleUID := "e" + strconv.FormatInt(ids[0], 10)
-	singleTok := stream.Sign([]byte(secret), singleUID)
-	if rec = serve(t, h, http.MethodGet, "/s/"+singleTok+"/e/"+singleUID+"/master.m3u8"); rec.Code != http.StatusNotFound {
-		t.Errorf("单集 uid 请求 master.m3u8 状态码 = %d, 期望 404", rec.Code)
+	if !strings.Contains(rec.Body.String(), "#EXT-X-DISCONTINUITY") {
+		t.Errorf("合并集 playlist 缺集边界 DISCONTINUITY：\n%s", rec.Body.String())
 	}
 
-	// 单集 uid 仍走 MP4 透传（不回归成 playlist）：play_url 为空 → 上游失败类别 502。
-	if rec = serve(t, h, http.MethodGet, "/s/"+singleTok+"/e/"+singleUID); rec.Code != http.StatusBadGateway {
-		t.Errorf("单集 uid 状态码 = %d, 期望 502（play_url 为空，说明仍走单集出流）", rec.Code)
+	// 签名错 → 401；uid 在库里不存在 → 404；没有 .m3u8 后缀 → 404。
+	if rec := serve(t, h, http.MethodGet, "/video/"+singleUID+"-000000000000.m3u8"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("坏签名状态码 = %d, 期望 401", rec.Code)
+	}
+	if rec := serve(t, h, http.MethodGet, "/video/"+stream.ID(secret, "e9999")+".m3u8"); rec.Code != http.StatusNotFound {
+		t.Errorf("未知剧集状态码 = %d, 期望 404", rec.Code)
+	}
+	if rec := serve(t, h, http.MethodGet, "/video/"+singleID); rec.Code != http.StatusNotFound {
+		t.Errorf("缺 .m3u8 后缀状态码 = %d, 期望 404", rec.Code)
 	}
 
-	// 坏签名的合并集请求 → 401（装配根注入的 stream.Verify 生效）。
-	if rec = serve(t, h, http.MethodGet, "/s/bogus/e/"+uid); rec.Code != http.StatusUnauthorized {
-		t.Errorf("坏签名合并集状态码 = %d, 期望 401", rec.Code)
+	// 每请求恰一条访问日志，path 就是 /video 的真实路径（id 里没有 secret）。
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	requestLogs := 0
+	for _, line := range lines {
+		var entry struct {
+			Msg  string `json:"msg"`
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("日志不是合法 JSON: %v（line=%q）", err, line)
+		}
+		if entry.Msg == "http request" && entry.Path == "/video/"+singleID+".m3u8" {
+			requestLogs++
+		}
 	}
+	if requestLogs != 1 {
+		t.Errorf("/video playlist 的 http request 日志条数 = %d, 期望 1（buf=%q）", requestLogs, buf.String())
+	}
+}
+
+// TestIDStability 覆盖契约的「{id} 不飘移」四条：
+// 1. 重复取一致；2. 全量刷新（UpsertEpisode + RebuildEmbyItems）后一致；
+// 3. 建/删合并组只让受影响那一集的 id 变化（旧 id 404、其它集 id 一个都不变）；
+// 4. 重启进程（settings 不变）后一致。
+func TestIDStability(t *testing.T) {
+	ctx := context.Background()
+	const secret = "0123456789abcdef0123456789abcdef"
+	path := filepath.Join(t.TempDir(), "stable.db")
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	for k, v := range map[store.SettingKey]string{
+		store.KeyStreamSecret: secret,
+		store.KeyCacheDir:     filepath.Join(t.TempDir(), "cache"),
+	} {
+		if err := settings.Set(ctx, k, v); err != nil {
+			t.Fatalf("Set %s: %v", k, err)
+		}
+	}
+	dramaID, err := st.UpsertDrama(ctx, store.Drama{Provider: "web", ProviderID: "p1", Title: "稳定剧", Year: 2026})
+	if err != nil {
+		t.Fatalf("UpsertDrama: %v", err)
+	}
+	var ids []int64
+	for i := 1; i <= 3; i++ {
+		id, err := st.UpsertEpisode(ctx, store.Episode{DramaID: dramaID, EpNo: i, Source: "web", Vid: "v"})
+		if err != nil {
+			t.Fatalf("UpsertEpisode: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
+	}
+
+	// idsOf 把派生表的 uid 翻成对外 id（生产方与校验方共用 stream.ID）。
+	idsOf := func(st *store.Store) map[string]string {
+		t.Helper()
+		items, err := st.ListEmbyItems(ctx, dramaID)
+		if err != nil {
+			t.Fatalf("ListEmbyItems: %v", err)
+		}
+		out := make(map[string]string, len(items))
+		for _, item := range items {
+			out[item.UID] = stream.ID(secret, item.UID)
+		}
+		return out
+	}
+	assertSame := func(name string, got, want map[string]string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s：条目数从 %d 变为 %d", name, len(want), len(got))
+		}
+		for uid, id := range want {
+			if got[uid] != id {
+				t.Errorf("%s：uid %s 的 id 从 %q 变为 %q", name, uid, id, got[uid])
+			}
+		}
+	}
+
+	before := idsOf(st)
+	// 1. 重复取一致。
+	assertSame("重复取", idsOf(st), before)
+	if len(before) != 3 {
+		t.Fatalf("对外剧集数 = %d, 期望 3", len(before))
+	}
+
+	// 2. 全量刷新（同一批 UpsertEpisode + RebuildEmbyItems）后一致。
+	for i, id := range ids {
+		if _, err := st.UpsertEpisode(ctx, store.Episode{ID: id, DramaID: dramaID, EpNo: i + 1, Source: "web", Vid: "v"}); err != nil {
+			t.Fatalf("再次 UpsertEpisode: %v", err)
+		}
+	}
+	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+		t.Fatalf("再次 RebuildEmbyItems: %v", err)
+	}
+	assertSame("全量刷新后", idsOf(st), before)
+
+	// 4. 重启（重开库、重建 Store / Settings，secret 不变）后一致。
+	db2, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("重开库: %v", err)
+	}
+	t.Cleanup(func() { _ = db2.Close() })
+	assertSame("重启后", idsOf(store.NewStore(db2.DB)), before)
+
+	// 3. 建合并组：只让被合并的两集从单集 uid 空间消失，第 1 集的 id 不变。
+	gid, err := st.CreateMergeGroup(ctx, dramaID, "第2-3集", []int64{ids[1], ids[2]})
+	if err != nil {
+		t.Fatalf("CreateMergeGroup: %v", err)
+	}
+	merged := idsOf(st)
+	firstUID := "e" + strconv.FormatInt(ids[0], 10)
+	mergedUID := "m" + strconv.FormatInt(gid, 10)
+	if merged[firstUID] != before[firstUID] {
+		t.Errorf("未受影响的第 1 集 id 变了：%q → %q", before[firstUID], merged[firstUID])
+	}
+	if len(merged) != 2 {
+		t.Fatalf("建组后对外剧集数 = %d, 期望 2（单集 + 合并集）：%v", len(merged), merged)
+	}
+	if _, ok := merged[mergedUID]; !ok {
+		t.Fatalf("合并集 uid %s 不在派生表里：%v", mergedUID, merged)
+	}
+	// 旧 id 仍合法签名，但对应 uid 已不在库里 → 404（与 401 区分开）。
+	h := newAssembly(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources(), nil)
+	if rec := serve(t, h, http.MethodGet, "/video/"+before["e"+strconv.FormatInt(ids[1], 10)]+".m3u8"); rec.Code != http.StatusNotFound {
+		t.Errorf("被合并集的旧 id 状态码 = %d, 期望 404", rec.Code)
+	}
+
+	// 删组后回到 3 条单集，id 与建组前逐个相同（旧 id 复活而不是换新值）。
+	if err := st.DeleteMergeGroup(ctx, gid); err != nil {
+		t.Fatalf("DeleteMergeGroup: %v", err)
+	}
+	assertSame("删组后", idsOf(st), before)
 }
 
 // 装配根显式注册插件（不用 init()），并且 plugin.<源>.* 配置真的进到插件：
@@ -533,7 +598,7 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 	if !ok {
 		t.Fatalf("注册表里没有 %q：装配根必须显式注册内置插件", hongguo.Name)
 	}
-	h := newHandler(logger, st, settings, sync.New(p, nil), fakeSchedule{}, sourceList(reg))
+	h := newAssembly(logger, st, settings, sync.New(p, nil), fakeSchedule{}, sourceList(reg), reg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/dramas", strings.NewReader(`{"series_id":"7503745441910017049"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -602,7 +667,7 @@ func TestPluginDisabledStillStarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("停用时 newPlugins 报错：%v", err)
 	}
-	h := newHandler(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name), nil), fakeSchedule{}, sourceList(reg))
+	h := newAssembly(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name), nil), fakeSchedule{}, sourceList(reg), reg)
 
 	rec := serve(t, h, http.MethodGet, "/api/status")
 	var status struct {

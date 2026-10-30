@@ -26,7 +26,6 @@ const (
 type totalsView struct {
 	Dramas      int    `json:"dramas"`
 	Episodes    int    `json:"episodes"`
-	Playable    int    `json:"playable_episodes"`
 	EmbyItems   int    `json:"emby_items"`
 	MergeGroups int    `json:"merge_groups"`
 	LastSyncAt  string `json:"last_sync_at"`
@@ -101,7 +100,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	totals := totalsView{Dramas: len(dramas)}
 	for _, st := range stats {
 		totals.Episodes += st.Episodes
-		totals.Playable += st.PlayableEpisodes
 		totals.EmbyItems += st.EmbyItems
 		totals.MergeGroups += st.MergeGroups
 	}

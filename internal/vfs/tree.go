@@ -43,7 +43,7 @@ type Store interface {
 // 不 import internal/stream（rank 40），HMAC 算法在装配根接上。
 type IDFunc func(secret, uid string) string
 
-// NewTree 构造 Tree。id 与 logger 不可为 nil（渲染 strm 与报告被跳过的脏分类必需）。
+// NewTree 构造 Tree。id 与 logger 不可为 nil（渲染 strm 与报告「分类名转义后同名」必需）。
 func NewTree(st Store, settings *store.Settings, id IDFunc, logger *slog.Logger) *Tree {
 	return &Tree{st: st, settings: settings, id: id, logger: logger}
 }
@@ -126,28 +126,25 @@ func splitDir(dir string) ([]string, bool) {
 // 分类目录集合 = SELECT DISTINCT genre；兜底名「其他」与上游同名的分类合并成
 // 一个目录（两份 genre 值落同一个目录名）。
 //
-// 含路径分隔符的分类名不转义（docs/DIRECTORY-CONTRACT.md「分类名不做转义」），
-// 但它无法成为一个路径段：强行拼进去会在根目录里产出跨段节点，x/net/webdav 的
-// walkFS 在给它 Stat 时失败、整份 multistatus 被截断——整个挂载点对客户端不可解析。
-// 因此这类脏分类跳过并记一条 warn（该分类下的剧在挂载点里不可见），
-// 让父目录列举始终保持可解析。
+// 目录名一律过 sanitizeName（docs/DIRECTORY-CONTRACT.md「分类名按文件名规则转义」）：
+// 含路径分隔符的脏 tags[0]（如 `剧情/古装`）转义成 `剧情_古装`，于是它能作为一个
+// 普通路径段被列举、被 Stat；不转义的话跨段节点会让 x/net/webdav 的 walkFS 在 Stat
+// 时失败、整份 multistatus 被截断，整个挂载点对客户端不可解析。
+// 转义后同名的两个分类（`剧情/古装` 与 `剧情_古装`）并进同一个目录，记一条 debug。
 func (t *Tree) listGenres(ctx context.Context) ([]Node, error) {
 	genres, err := t.st.ListGenres(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("列分类: %w", err)
 	}
-	seen := make(map[string]struct{}, len(genres))
+	seen := make(map[string]string, len(genres))
 	out := make([]Node, 0, len(genres))
 	for _, g := range genres {
-		name := genreDirName(g)
-		if !pathSafeName(name) {
-			t.logger.Warn("跳过含路径分隔符的分类（不能作为目录段）", "genre", g)
+		name := genreDir(g)
+		if prev, dup := seen[name]; dup {
+			t.logger.Debug("分类名转义后同名，已合并为同一目录", "dir", name, "genre_a", prev, "genre_b", g)
 			continue
 		}
-		if _, dup := seen[name]; dup {
-			continue
-		}
-		seen[name] = struct{}{}
+		seen[name] = g
 		out = append(out, Node{Path: Root + "/" + name, IsDir: true})
 	}
 	sortNodes(out)
@@ -232,8 +229,10 @@ func (t *Tree) listSeason(ctx context.Context, genreDir, shardDir, dramaDir stri
 // genresForDir 返回某个分类目录名对应的库内 genre 原值集合。
 //
 // 目录名 → 取值集合是**纯映射**：兜底名「其他」对应 genre 为空串 与「上游真的叫
-// 其他」两种取值（契约要求合并），其余目录名就是 genre 原值。因此这里只做存在性
-// 判断（`GenreExists`，`EXISTS` 点查，O(log n)），不做任何列举式查询。
+// 其他」两种取值（契约要求合并），其余目录名就是 `sanitizeName(genre)`。因此这里
+// 先做存在性判断（`GenreExists`，`EXISTS` 点查，O(log n)），不做列举式查询；
+// 点查全落空时（目录名是转义形态，如 `剧情_古装`）才退回一次 `ListGenres`
+// 筛「转义后等于目录名」的分类——这条路径只在脏分类目录与不存在的目录上付代价。
 //
 // 不要退回 `SELECT DISTINCT genre FROM drama` 再过滤：那是整条覆盖索引全扫
 // （60 万行约 74ms），而且每层列举都得付一次——这正是上一轮 Review 抓到的
@@ -251,6 +250,18 @@ func (t *Tree) genresForDir(ctx context.Context, name string) ([]string, error) 
 			return nil, fmt.Errorf("查分类 %q: %w", g, err)
 		}
 		if ok {
+			out = append(out, g)
+		}
+	}
+	if len(out) > 0 {
+		return out, nil
+	}
+	genres, err := t.st.ListGenres(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("列分类: %w", err)
+	}
+	for _, g := range genres {
+		if genreDir(g) == name {
 			out = append(out, g)
 		}
 	}
@@ -315,8 +326,8 @@ func (t *Tree) locateDrama(ctx context.Context, genreDir, shardDir, name string)
 }
 
 // located 判断一部剧是否就落在这个「分类/分片/目录名」上（点查结果的归属校验）。
-func located(d store.Drama, genreDir string, shard int, name string) bool {
-	if genreDirName(d.Genre) != genreDir || d.Shard != shard {
+func located(d store.Drama, genreDirName string, shard int, name string) bool {
+	if genreDir(d.Genre) != genreDirName || d.Shard != shard {
 		return false
 	}
 	return dramaDir(d) == name || conflictDir(d) == name
@@ -330,13 +341,11 @@ func genreDirName(genre string) string {
 	return genre
 }
 
-// pathSafeName 报告一个目录名能不能当**一个**路径段。
-//
-// 含 `/` 或 `\` 的名字不能：它会把节点变成跨段路径，父目录列举随之无法 Stat 它。
-// 分类名按契约不转义，这类脏值由 listGenres 跳过并记日志；剧名与文件名用
-// sanitizeName 替换成 `_`，因此它们总是安全的。
-func pathSafeName(name string) bool {
-	return !strings.ContainsAny(name, `/\`)
+// genreDir 是一级目录名的唯一算法：兜底映射后按文件名规则转义
+// （`剧情/古装` → `剧情_古装`）。列举、进入目录、归属校验三处都调它，杜绝两处
+// 各拼一遍导致的「列得出来但进不去」。
+func genreDir(genre string) string {
+	return sanitizeName(genreDirName(genre))
 }
 
 // shardDirName 是分片目录名：两位小写十六进制（00–7f，N=128）。

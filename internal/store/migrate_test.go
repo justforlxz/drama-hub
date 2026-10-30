@@ -330,6 +330,16 @@ func TestOpenInvalidPath(t *testing.T) {
 	}
 }
 
+// sortedMapKeys 把 map 的键排成稳定顺序，供 t.Logf 输出。
+func sortedMapKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // sortedNames 把索引名集合排成稳定顺序，供 t.Logf 输出。
 func sortedNames(set map[string]bool) []string {
 	names := make([]string, 0, len(set))
@@ -409,9 +419,10 @@ func columnDefaults(t *testing.T, db *sql.DB, table string) map[string]string {
 	return out
 }
 
-// AC：本段只落 0002（genre/tags/shard + 两索引 + source_state）与 0003（artifact
-// 重建），所以空库 applied=3、user_version=3；删列由 S8 以 0004 落地。
-func TestMigrateStopsAtS3(t *testing.T) {
+// AC：S3 段落 0002（genre/tags/shard + 两索引 + source_state）与 0003（artifact
+// 重建），S8 段再落 0004（删 episode.play_url / play_url_at）。空库 applied=4、
+// user_version=4，且 episode 表里两列真的没了（docs/DATA-MODEL.md 0003 块）。
+func TestMigrateStopsAtS8(t *testing.T) {
 	db := openRaw(t, filepath.Join(t.TempDir(), "s3.db"))
 	ctx := context.Background()
 
@@ -419,13 +430,27 @@ func TestMigrateStopsAtS3(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	if applied != 3 {
-		t.Fatalf("首次 applied = %d, 期望 3（0001+0002+0003）", applied)
+	if applied != 4 {
+		t.Fatalf("首次 applied = %d, 期望 4（0001+0002+0003+0004）", applied)
 	}
-	if got := userVersion(t, db); got != 3 {
-		t.Fatalf("user_version = %d, 期望 3", got)
+	if got := userVersion(t, db); got != 4 {
+		t.Fatalf("user_version = %d, 期望 4", got)
 	}
 	t.Logf("空库首次 applied=%d user_version=%d", applied, userVersion(t, db))
+
+	// 0004：直链两列必须消失（PRAGMA table_info 是唯一真值，不看迁移文本）。
+	episodeCols := columnDefaults(t, db, "episode")
+	for _, gone := range []string{"play_url", "play_url_at"} {
+		if _, ok := episodeCols[gone]; ok {
+			t.Errorf("episode 仍有列 %s（0004 没生效）", gone)
+		}
+	}
+	for _, kept := range []string{"id", "drama_id", "ep_no", "title", "duration_sec", "source", "vid"} {
+		if _, ok := episodeCols[kept]; !ok {
+			t.Errorf("episode 缺列 %s（删列时丢多了）", kept)
+		}
+	}
+	t.Logf("episode 列: %v", sortedMapKeys(episodeCols))
 
 	applied, err = migrate(ctx, db)
 	if err != nil {
@@ -434,8 +459,8 @@ func TestMigrateStopsAtS3(t *testing.T) {
 	if applied != 0 {
 		t.Fatalf("第二次 applied = %d, 期望 0", applied)
 	}
-	if got := userVersion(t, db); got != 3 {
-		t.Fatalf("第二次 user_version = %d, 期望 3", got)
+	if got := userVersion(t, db); got != 4 {
+		t.Fatalf("第二次 user_version = %d, 期望 4", got)
 	}
 	t.Logf("二次执行 applied=%d user_version=%d", applied, userVersion(t, db))
 }
@@ -531,8 +556,8 @@ func TestArtifactRebuildKeepsRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	if applied != 1 {
-		t.Fatalf("重建段 applied = %d, 期望 1（只剩 0003）", applied)
+	if applied != 2 {
+		t.Fatalf("重建段 applied = %d, 期望 2（只剩 0003 + 0004）", applied)
 	}
 
 	for _, want := range before {

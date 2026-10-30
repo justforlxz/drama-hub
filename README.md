@@ -21,20 +21,19 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 未实现的端点返回 **501 Not Implemented**（已规划未实现），不是 404；未装配的
 路径返回 404。
 
-> **2.0 变更中**：WebDAV 已改挂 `/webdav/`（`/dav/` 不留兼容别名），目录形状改成
-> `/{分类}/{分片}/{剧名} ({年份})/Season 01/…`，`.strm` 里写的是
-> `{strm_prefix}/video/{id}.m3u8`（`/video` 端点属 S8）。出流侧 `/s/*` 仍是 1.0 形态、
-> 待 S8 退役，以 `docs/PLAYBACK-CONTRACT.md` 为准。
-> 目录契约见 `docs/DIRECTORY-CONTRACT.md`。
+> **2.0 口径**：WebDAV 挂在 `/webdav/`（`/dav/` 不留兼容别名），目录形状是
+> `/{分类}/{分片}/{剧名} ({年份})/Season 01/…`；播放面只有 `/video` 两个口子，
+> `.strm` 里写的是 `{strm_prefix}/video/{id}.m3u8`（单集与合并集同一形态）。
+> 1.0 的 `/s/{token}/*` 已退役、不留兼容层。契约真值：`docs/PLAYBACK-CONTRACT.md`；
+> 目录形状：`docs/DIRECTORY-CONTRACT.md`。
 
 | 端点 | 方法 | 状态 | 说明 |
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
 | `/webdav/` 及全部子路径 | 任意 | 207/200/401/404/405 | 只读 WebDAV：PROPFIND 207（带 getcontentlength）、GET strm/nfo 200；树是 `/{分类}/{分片}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401 |
-| `/s/{token}/e/{uid}` | GET / HEAD | 200/206/416（单集）<br/>200（合并集） | 单集 MP4 出流：HMAC 签名 + Range 透传；**uid 是合并集句柄（`m…`）时返回自造 m3u8** |
-| `/s/{token}/e/{uid}/master.m3u8` | GET | 200/404 | 合并集 playlist 的标准别名 |
-| `/s/{token}/seg/{uid}/{seq}.ts` | GET | 200/404/502/503 | 分片：现转封装 MPEG-TS（单集按片内序、合并集按跨集时间轴），索引未就绪 503 |
-| `/s/` 其余子路径 | 任意 | 501 | 已规划未实现 |
+| `/video/{id}.m3u8` | GET / HEAD | 200/401/404/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
+| `/video/{id}/{seq}.ts` | GET / HEAD | 200/206/401/404/502/503 | MPEG-TS 分片：本地缓存命中即回，未命中现切并落缓存 |
+| `/s/{token}/…`、`/dav/…` | 任意 | 404 | 已退役（不留兼容层） |
 | `/`、`/merges`、`/status` | GET | 200 | 管理界面三页：剧目 / 合并编排 / 同步与缓存看板 |
 | `/static/app.css`、`/static/app.js` | GET | 200 | 内嵌样式与脚本（随二进制，无构建步骤） |
 | `/api/dramas` | GET / POST | 200 / 201 | 剧目列表（含计数）/ 按上游剧 id 同步入库 |
@@ -45,22 +44,29 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 | `/api/status` | GET | 200 | 同步计数、运行配置现状、缓存代理建议参数 |
 | 其它未登记路径 | 任意 | 404 | 由 web 的 mux 兜底 |
 
-出流 token 是 HMAC 常量签名（ADR-0003）：`token = base64url( HMAC-SHA256(secret,
-"stream:"+uid) )`，secret 取 `settings.stream_secret`。错误签名 → 401；uid 非法或
-不存在 → 404；`play_url` 为空或上游失败 → 502。`Range` 原样透传到上游，206/416
-由上游判定后透传回。
+对外 id 是 HMAC 常量签名（ADR-0003）：`id = uid + "-" + hex(HMAC-SHA256(secret,
+uid))[:12]`，`uid` 是 `e<episode.id>`（单集）或 `m<merge_group.id>`（合并集），secret 取
+`settings.stream_secret`。一个 id 同时给 playlist 与分片用，无过期、无 token 表、不落库；
+签名错 → 401，`uid` 不在派生表里 → 404，解析不到直链或上游失败 → 502。
 
-分片端点同样按该 token 鉴权。分片索引由 `internal/segment` 用 `ffprobe
--skip_frame nokey` 预扫源、把切点对齐到关键帧后写入 `segment` 表（未索引 → 503 +
-`Retry-After`）；切片走 `ffmpeg -ss <切点> -t <片长> -c copy -f mpegts`，单片
-返回 `video/mp2t` 并带 `Cache-Control: public, max-age=86400`。ffmpeg 失败 → 502，
-失败结果不落库、不缓存。
+**直链只在请求时解析**：`episode.play_url` / `play_url_at` 已由 `0004` 迁移删除（直链是
+短时凭据，落库就是过期链接），每次播放请求现调插件 `Resolve`，换链后下一次请求自然拿到
+新链。
 
-合并集（`uid = m<group_id>`）是虚拟 HLS 分片聚合：strm 指向合并集时返回自造
-playlist（`#EXT-X-VERSION:4` + `#EXT-X-DISCONTINUITY` 在集边界），分片 URL 指回
-`/s/{token}/seg/{uid}/{seq}.ts`，seq 是跨集连续时间轴；切片按 `seq → (集号, 集内秒)`
-解析，`-output_ts_offset` 保证跨集时间戳连续。合并编排（N 集并 1）在管理界面
-`/merges` 里做，重建 `emby_item` 派生表。
+关键帧索引由 `internal/segment` 在**第一次播放某个 uid 时**用 `ffprobe -skip_frame
+nokey` 预扫建立（切点对齐关键帧后写入 `segment` 表），30 秒硬上限、超时 503 +
+`Retry-After`；**不做批量预建**（库里 2847 万集）。切片走 `ffmpeg -ss <切点> -t <片长>
+-c copy -f mpegts`，单片返回 `video/mp2t` 并带 `Cache-Control: public, max-age=86400`；
+ffmpeg 失败 → 502 且不写缓存。
+
+分片缓存归本服务（ADR-0007）：键 `sha256(uid | seq | codec_sig)`，落
+`<cache_dir>/seg/`，命中零外呼、并发同一片只生成一次（single-flight），按
+`cache_max_mb` / `cache_lru_days` 淘汰（`docs/CACHE-MODEL.md`）。
+
+合并集（`uid = m<group_id>`）是虚拟 HLS 分片聚合：playlist 在集边界插
+`#EXT-X-DISCONTINUITY`，分片 URL 是 `/video/{id}/{seq}.ts`，seq 是跨集连续时间轴；切片
+按 `seq → (集号, 集内秒)` 解析，`-output_ts_offset` 保证跨集时间戳连续。合并编排
+（N 集并 1）在管理界面 `/merges` 里做，重建 `emby_item` 派生表。
 
 ## 管理界面
 
@@ -70,7 +76,7 @@ playlist（`#EXT-X-VERSION:4` + `#EXT-X-DISCONTINUITY` 在集边界），分片 
 |---|---|
 | `/` 剧目 | 粘贴上游剧 id 或 `https://hongguoduanju.com/player/<id>` 链接同步入库；删剧目（连带集、合并组、对外集号） |
 | `/merges` 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即时间轴顺序）→ 删组；已入组的集不可重复选 |
-| `/status` 同步与缓存 | 剧目/集/可播/对外集/合并组计数与最近同步时间、运行配置现状（密钥只显示是否已设置）、缓存代理建议参数 |
+| `/status` 同步与缓存 | 剧目/集/对外集/合并组计数与最近同步时间、运行配置现状（密钥只显示是否已设置）、缓存代理建议参数 |
 
 页面里的每个操作都直接落到上面的 `/api/` 端点，渲染结果与 API 返回一致。缓存面只做
 展示：视频缓存由缓存代理淘汰（ADR-0004），看板给出 `--vfs-cache-max-size 200G
@@ -88,7 +94,7 @@ curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8
 ```
 
 每个请求输出一条结构化访问日志（`method` / `path` / `status` / `duration_ms`，见
-`internal/httpx`）；出流路径里的签名 token 段被掩码为 `{token}`，query 不进日志。
+`internal/httpx`）；只记路径、不记 query，也不记带签名的上游直链。
 错误响应统一为 `{"code":"<kind>","message":"..."}`（404/400/401/502/503，其余 500）。
 
 需要的运行环境：`ffmpeg`、`ffprobe` 在 `PATH` 里。

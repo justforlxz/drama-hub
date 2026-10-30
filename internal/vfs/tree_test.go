@@ -410,51 +410,89 @@ func TestGenreFallbackMergesUpstreamOther(t *testing.T) {
 	}
 }
 
-// AC：含路径分隔符的分类名不转义（契约），但也不能污染父目录列举——跳过并记日志。
+// AC（S8 / PL 2026-10-30 裁决）：含路径分隔符的分类名按 sanitizeName 转义，
+// 转义后的目录「能列、能进、能取 .strm」——不再跳过。
 //
-// 依据：x/net/webdav 的 walkFS 会在根目录里对每个子项 Stat，一旦有子项是跨段路径
-// （`短剧/剧情/古装`），Stat 失败会让整份 multistatus 被截断（客户端拿到非法 XML，
-// 整个挂载点不可用）。所以这类脏分类按契约「不做转义」处理，只跳过。
-func TestListGenresSkipsPathSeparatorGenre(t *testing.T) {
+// 依据：不转义时该分类无法成为一个路径段，硬拼会让 x/net/webdav 的 walkFS 在 Stat
+// 时失败、整份 multistatus 被截断；「跳过 + warn」则让这批剧在挂载点里静默不可达。
+func TestListGenresEscapesPathSeparatorGenre(t *testing.T) {
 	f := seed(t, "")
-	for _, d := range []store.Drama{
-		{Provider: "web", ProviderID: "dirty1", Title: "斜杠分类剧", Year: 2026, Genre: "剧情/古装"},
-		{Provider: "web", ProviderID: "dirty2", Title: "反斜杠分类剧", Year: 2026, Genre: `剧情\古装`},
-	} {
-		f.addDrama(t, d)
+	ctx := context.Background()
+	dirty := f.addDrama(t, store.Drama{
+		Provider: "web", ProviderID: "dirty1", Title: "斜杠分类剧", Year: 2026, Genre: "剧情/古装",
+	})
+	// 反斜杠是另一个脏字符，转义后与上面同名：两个分类并进同一个目录。
+	f.addDrama(t, store.Drama{
+		Provider: "web", ProviderID: "dirty2", Title: "反斜杠分类剧", Year: 2026, Genre: `剧情\古装`,
+	})
+	epID, err := f.store().UpsertEpisode(ctx, store.Episode{DramaID: dirty, EpNo: 1, Source: "web", Vid: "v1"})
+	if err != nil {
+		t.Fatalf("UpsertEpisode: %v", err)
+	}
+	if _, err := f.store().RebuildEmbyItems(ctx, dirty); err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
 
 	buf := &bytes.Buffer{}
 	tree := NewTree(store.NewStore(f.db.DB), store.NewSettings(f.db.DB), stubID,
-		slog.New(slog.NewTextHandler(buf, nil)))
+		slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
-	nodes, err := tree.List(context.Background(), "")
+	// 1) 根目录能列出转义后的分类，且每个子项仍是一个路径段。
+	nodes, err := tree.List(ctx, "")
 	if err != nil {
 		t.Fatalf("List(根): %v", err)
 	}
-	// 结构不变量：根目录的每个子项都是一个路径段（不含 '/'）。
+	got := make(map[string]bool, len(nodes))
 	for _, n := range nodes {
+		got[n.Path] = true
 		if strings.Contains(strings.TrimPrefix(n.Path, Root+"/"), "/") {
 			t.Errorf("根目录子项含路径分隔符（会把父目录列举打挂）：%q", n.Path)
 		}
 	}
-	// 干净分类照常在；两个脏分类都被跳过。
-	got := map[string]bool{}
-	for _, n := range nodes {
-		got[n.Path] = true
+	escaped := Root + "/剧情_古装"
+	if !got[escaped] {
+		t.Fatalf("转义后的分类目录 %s 不在根目录里：%v", escaped, nodes)
 	}
-	for _, want := range []string{Root + "/" + otherGenre, Root + "/" + genreA} {
-		if !got[want] {
-			t.Errorf("缺干净分类 %s：%v", want, got)
+
+	// 2) 目录能进：分片层能列。
+	shardNodes, err := tree.List(ctx, escaped)
+	if err != nil {
+		t.Fatalf("List(%s): %v", escaped, err)
+	}
+	if len(shardNodes) != store.ShardCount {
+		t.Errorf("分片目录数 = %d, 期望 %d", len(shardNodes), store.ShardCount)
+	}
+
+	// 3) 该分类下的剧真的在这个目录里（两部脏分类都并进来）。
+	shardDir := shardOf("dirty1")
+	dirs, err := tree.List(ctx, escaped+"/"+shardDir)
+	if err != nil {
+		t.Fatalf("List(%s): %v", escaped+"/"+shardDir, err)
+	}
+	want := escaped + "/" + shardDir + "/斜杠分类剧 (2026)"
+	found := false
+	for _, n := range dirs {
+		if n.Path == want {
+			found = true
 		}
 	}
-	if len(nodes) != 2 {
-		t.Errorf("根目录子项 = %v, 期望只有两个干净分类", nodes)
+	if !found {
+		t.Fatalf("转义后的分类目录里没有这部剧：%v（期望含 %s）", dirs, want)
 	}
-	// 跳过必须留痕（否则脏数据在挂载点里静默消失，排障无从下手）。
-	logged := buf.String()
-	if !strings.Contains(logged, "剧情/古装") || !strings.Contains(logged, "剧情\\古装") {
-		t.Errorf("没有为被跳过的脏分类记日志：%q", logged)
+
+	// 4) .strm 能取：内容仍是 {strm_prefix}/video/{id}.m3u8。
+	body, err := tree.Render(ctx, want+"/Season 01/斜杠分类剧 - S01E01 - 第1集.strm")
+	if err != nil {
+		t.Fatalf("Render(.strm): %v", err)
+	}
+	wantStrm := "/video/" + stubID(testSecret, "e"+strconv.FormatInt(epID, 10)) + ".m3u8\n"
+	if string(body) != wantStrm {
+		t.Errorf("strm 内容 = %q, 期望 %q", body, wantStrm)
+	}
+
+	// 5) 转义后同名的两个分类合并时留一条 debug 日志（脏数据可追溯）。
+	if logged := buf.String(); !strings.Contains(logged, "剧情") {
+		t.Errorf("转义合并没有留日志：%q", logged)
 	}
 }
 

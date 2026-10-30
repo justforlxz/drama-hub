@@ -102,9 +102,9 @@ func do(t *testing.T, s *Server, method, path, body string) *httptest.ResponseRe
 	return rec
 }
 
-// seedDrama 插入一部剧及其集（vids 的数量即集数；playable 指定前几集带直链），
-// 并重建派生表 —— 与生产里同步完成后的状态一致。
-func seedDrama(t *testing.T, st *store.Store, providerID, title string, vids []string, playable int) int64 {
+// seedDrama 插入一部剧及其集（vids 的数量即集数），并重建派生表 —— 与生产里
+// 同步完成后的状态一致。直链不落库（0004 已删 play_url），这里没有可播集的概念。
+func seedDrama(t *testing.T, st *store.Store, providerID, title string, vids []string) int64 {
 	t.Helper()
 	ctx := context.Background()
 	id, err := st.UpsertDrama(ctx, store.Drama{
@@ -116,10 +116,6 @@ func seedDrama(t *testing.T, st *store.Store, providerID, title string, vids []s
 	}
 	for i, vid := range vids {
 		ep := store.Episode{DramaID: id, EpNo: i + 1, Title: "第 " + vid + " 集", Source: "web", Vid: vid}
-		if i < playable {
-			ep.PlayURL = "https://cdn.example/" + vid + ".mp4"
-			ep.PlayURLAt = "2026-10-30T08:00:00Z"
-		}
 		if _, err := st.UpsertEpisode(ctx, ep); err != nil {
 			t.Fatalf("UpsertEpisode: %v", err)
 		}
@@ -143,11 +139,11 @@ func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 	return out
 }
 
-// TestAPI_ListDramas 覆盖剧目列表的形状与计数：episodes / playable_episodes /
-// emby_items / merge_groups 都来自库内真实数据。
+// TestAPI_ListDramas 覆盖剧目列表的形状与计数：episodes / emby_items /
+// merge_groups 都来自库内真实数据。
 func TestAPI_ListDramas(t *testing.T) {
 	srv, st, _ := newTestServer(t)
-	id := seedDrama(t, st, "1001", "宴律", []string{"a", "b", "c"}, 1)
+	id := seedDrama(t, st, "1001", "宴律", []string{"a", "b", "c"})
 	if _, err := st.CreateMergeGroup(context.Background(), id, "第 2-3 集", []int64{
 		mustEpisodeID(t, st, id, 2), mustEpisodeID(t, st, id, 3),
 	}); err != nil {
@@ -168,9 +164,6 @@ func TestAPI_ListDramas(t *testing.T) {
 	}
 	if d.EpisodeTotal != 3 || d.Episodes != 3 {
 		t.Errorf("集数 = %d/%d, 期望 3/3", d.Episodes, d.EpisodeTotal)
-	}
-	if d.Playable != 1 {
-		t.Errorf("可播集 = %d, 期望 1", d.Playable)
 	}
 	// 3 集里两集并成 1 条对外剧集 + 剩下 1 集 = 2。
 	if d.EmbyItems != 2 {
@@ -255,7 +248,7 @@ func TestAPI_CreateDrama_SyncFails(t *testing.T) {
 // TestAPI_DeleteDrama 覆盖删剧目：204、列表清空、级联删集、重复删除 404、坏 id 400。
 func TestAPI_DeleteDrama(t *testing.T) {
 	srv, st, _ := newTestServer(t)
-	id := seedDrama(t, st, "2002", "带删除的剧", []string{"a", "b"}, 0)
+	id := seedDrama(t, st, "2002", "带删除的剧", []string{"a", "b"})
 
 	rec := do(t, srv, http.MethodDelete, "/api/dramas/"+strconv.Itoa(int(id)), "")
 	if rec.Code != http.StatusNoContent {
@@ -280,10 +273,10 @@ func TestAPI_DeleteDrama(t *testing.T) {
 	}
 }
 
-// TestAPI_Episodes 覆盖合并编排页的集列表：按 ep_no 升序、has_play_url 只报真假。
+// TestAPI_Episodes 覆盖合并编排页的集列表：按 ep_no 升序、只回库里的字段。
 func TestAPI_Episodes(t *testing.T) {
 	srv, st, _ := newTestServer(t)
-	id := seedDrama(t, st, "3003", "选集的剧", []string{"a", "b", "c"}, 2)
+	id := seedDrama(t, st, "3003", "选集的剧", []string{"a", "b", "c"})
 
 	got := decode[episodeList](t, do(t, srv, http.MethodGet, "/api/dramas/"+strconv.Itoa(int(id))+"/episodes", ""))
 	if len(got.Episodes) != 3 {
@@ -293,9 +286,8 @@ func TestAPI_Episodes(t *testing.T) {
 		if ep.EpNo != i+1 {
 			t.Errorf("第 %d 项 ep_no = %d", i, ep.EpNo)
 		}
-		wantPlayable := i < 2
-		if ep.HasPlayURL != wantPlayable {
-			t.Errorf("ep_no=%d has_play_url = %v, 期望 %v", ep.EpNo, ep.HasPlayURL, wantPlayable)
+		if ep.Vid != []string{"a", "b", "c"}[i] {
+			t.Errorf("ep_no=%d vid = %q", ep.EpNo, ep.Vid)
 		}
 	}
 	if rec := do(t, srv, http.MethodGet, "/api/dramas/99999/episodes", ""); rec.Code != http.StatusNotFound {
@@ -307,7 +299,7 @@ func TestAPI_Episodes(t *testing.T) {
 // 校验失败 400 且不落库、删除后列表清空。
 func TestAPI_MergeGroups(t *testing.T) {
 	srv, st, _ := newTestServer(t)
-	dramaID := seedDrama(t, st, "4004", "编排的剧", []string{"a", "b", "c", "d"}, 0)
+	dramaID := seedDrama(t, st, "4004", "编排的剧", []string{"a", "b", "c", "d"})
 	path := "/api/dramas/" + strconv.Itoa(int(dramaID)) + "/merge-groups"
 	e1, e2, e3, e4 := mustEpisodeID(t, st, dramaID, 1), mustEpisodeID(t, st, dramaID, 2),
 		mustEpisodeID(t, st, dramaID, 3), mustEpisodeID(t, st, dramaID, 4)
@@ -372,7 +364,7 @@ func TestAPI_Status(t *testing.T) {
 	if err := srv.settings.Set(context.Background(), store.KeyStreamSecret, secret); err != nil {
 		t.Fatalf("Set stream_secret: %v", err)
 	}
-	seedDrama(t, st, "5005", "看板的剧", []string{"a", "b"}, 1)
+	seedDrama(t, st, "5005", "看板的剧", []string{"a", "b"})
 
 	rec := do(t, srv, http.MethodGet, "/api/status", "")
 	if rec.Code != http.StatusOK {
@@ -382,7 +374,7 @@ func TestAPI_Status(t *testing.T) {
 		t.Error("响应体里出现 stream_secret 明文")
 	}
 	got := decode[statusView](t, rec)
-	if got.Totals.Dramas != 1 || got.Totals.Episodes != 2 || got.Totals.Playable != 1 ||
+	if got.Totals.Dramas != 1 || got.Totals.Episodes != 2 ||
 		got.Totals.EmbyItems != 2 || got.Totals.LastSyncAt != "2026-10-30T08:00:00Z" {
 		t.Errorf("totals = %+v", got.Totals)
 	}

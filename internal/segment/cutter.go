@@ -12,38 +12,44 @@ import (
 	"strings"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/httpx"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
-// VerifyFunc 校验出流签名 token（ADR-0003）：secret 是 settings.stream_secret 的
-// 字节，uid 是 URL 里的句柄。由装配根注入（cmd 传 stream.Verify），避免本包
-// 反向依赖同 rank 的 internal/stream（check-deps 会判同级依赖）。
-type VerifyFunc func(secret []byte, uid, token string) bool
+// ResolveFunc 在请求时解析一集的直链（装配根注入 stream.Resolver.DirectURL）。
+//
+// 契约要求直链只在请求时解析、任何列都不存（docs/PLAYBACK-CONTRACT.md）：
+// 本包不 import plugin，解析能力由上层以函数注入，错误原样透出。
+type ResolveFunc func(ctx context.Context, ep store.Episode) (string, error)
 
-// Route 是分片端点在装配根的注册 pattern。`{file}` 形如 `<seq>.ts`；seq 从 0 起，
-// 前导零也接受（缓存代理按整串 URL 做 key，本包不改写客户端 URL）。
-// Go 的路由 pattern 不支持段内通配（`{seq}.ts` 非法），因此用 `{file}` 承载整段。
-const Route = "GET /s/{token}/seg/{uid}/{file}"
-
-// Cutter 是分片引擎：关键帧索引、时间轴映射与切片端点共用同一个实例
-// （store / settings / 并发闸只构造一次）。st / settings 不可为 nil。
+// Cutter 是播放面的中枢：`/video/{id}.m3u8` 与 `/video/{id}/{seq}.ts` 的 handler、
+// 按需建立的关键帧索引、以及分片缓存共用同一个实例（store / settings / 缓存 /
+// 并发闸只构造一次）。st / settings / caches / resolve 不可为 nil。
 type Cutter struct {
 	st       *store.Store
 	settings *store.Settings
 	logger   *slog.Logger
-	verify   VerifyFunc
+	caches   *cache.Cache
+	resolve  ResolveFunc
 	gate     chan struct{}
+	// indexTimeout 是「按需建立索引」的硬上限，生产固定 indexDeadline；
+	// 测试把它调短，才能在 5 分钟测试预算里验证 503 那条路径。
+	indexTimeout time.Duration
 }
 
-// NewCutter 装配分片引擎。verify 由装配根注入（ADR-0003，见 VerifyFunc）。
-func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, verify VerifyFunc) *Cutter {
+// NewCutter 装配播放面。caches 是 S7 的本地缓存（分片落盘 + single-flight），
+// resolve 由装配根注入（stream.Resolver.DirectURL）。
+func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc) *Cutter {
 	return &Cutter{
 		st:       st,
 		settings: settings,
 		logger:   logger,
-		verify:   verify,
+		caches:   caches,
+		resolve:  resolve,
 		gate:     make(chan struct{}, ffmpegSlots()),
+
+		indexTimeout: indexDeadline,
 	}
 }
 
@@ -74,46 +80,46 @@ func (c *Cutter) acquire(ctx context.Context) error {
 
 func (c *Cutter) release() { <-c.gate }
 
-// Index 用 ffprobe 预扫某集的源，把切点对齐到关键帧后整体写入 segment 表，
-// 返回该集的分片索引。
+// indexDeadline 是「按需建立关键帧索引」的硬上限（docs/PLAYBACK-CONTRACT.md：
+// 30 s，超时 503 + Retry-After）。只有第一次播放某个 uid 时会走到这里。
+const indexDeadline = 30 * time.Second
+
+// ensureSegments 返回某集的分片索引；库里还没有（该 uid 第一次被播放）就同步
+// ffprobe 建一次并落库。
 //
-// 调用点：索引是「一次预扫、非每次播放」的派生数据，触发方属 M7（合并编排）
-// 与 R1（管理面）；本模块负责能力与持久化，不在请求路径上自动触发。
-//
-// 幂等：同一源反复调用得到同一份切点（ReplaceSegments 一事务内先删后插）。
-// 失败不写任何行——探测失败时库里保留旧索引（或保持为空），不落半套切点：
-// 半套/错误的切点会让后续切片错位，而「失败结果不缓存」是硬性验收。
-//
-// 错误：剧集不存在返回 store.ErrNotFound；源地址为空或 ffprobe 失败返回
-// httpx.ErrUpstream；settings 读失败、写库失败按原样带上下文返回（500）。
-func (c *Cutter) Index(ctx context.Context, episodeID int64) ([]store.Segment, error) {
-	ep, err := c.st.EpisodeByID(ctx, episodeID)
+// 索引按需建立、禁止批量预建（库里 2847 万集，全库预扫不可完成）。建立超时
+// （indexDeadline）返回 httpx.ErrUnavailable —— 边界包据此回 503 + Retry-After，
+// 不出半截时间轴。探测失败不写任何行（库里保留旧索引或保持为空）。
+func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, playURL string) ([]store.Segment, error) {
+	segs, err := c.st.ListSegments(ctx, ep.ID)
 	if err != nil {
-		return nil, err // store.ErrNotFound 透传，调用方映射 404
+		return nil, fmt.Errorf("读分片索引 episode_id=%d: %w", ep.ID, err)
 	}
-	if ep.PlayURL == "" {
-		return nil, fmt.Errorf("剧集 %d 没有播放地址: %w", episodeID, httpx.ErrUpstream)
+	if len(segs) > 0 {
+		return segs, nil
 	}
 	target, err := c.settings.Int(ctx, store.KeySegTargetSec)
 	if err != nil {
 		return nil, fmt.Errorf("读 seg_target_sec: %w", err)
 	}
-
 	if err := c.acquire(ctx); err != nil {
 		return nil, err
 	}
-	info, err := probe(ctx, ep.PlayURL)
+	info, probeErr := probe(ctx, playURL)
 	c.release()
-	if err != nil {
-		return nil, err
+	if probeErr != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("剧集 %d 的关键帧索引建立超时: %w", ep.ID, httpx.ErrUnavailable)
+		}
+		return nil, probeErr
 	}
 
-	segs := planSegments(info, episodeID, float64(target))
-	if err := c.st.ReplaceSegments(ctx, episodeID, segs); err != nil {
-		return nil, fmt.Errorf("写入分片索引: %w", err)
+	segs = planSegments(info, ep.ID, float64(target))
+	if err := c.st.ReplaceSegments(ctx, ep.ID, segs); err != nil {
+		return nil, fmt.Errorf("写入分片索引 episode_id=%d: %w", ep.ID, err)
 	}
-	c.logger.InfoContext(ctx, "segment index rebuilt",
-		"episode_id", episodeID, "segments", len(segs), "duration_sec", info.durationSec)
+	c.logger.InfoContext(ctx, "segment index built",
+		"episode_id", ep.ID, "segments", len(segs), "duration_sec", info.durationSec)
 	return segs, nil
 }
 

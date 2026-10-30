@@ -28,7 +28,7 @@ type MergeMember struct {
 
 // EmbyItem 是 emby_item 派生表的一行：Emby 看到的一条剧集（单集或合并集）。
 //
-// 派生表由 RebuildEmbyItems 幂等重建，uid 是 /s/{token}/e/{uid} 的句柄：
+// 派生表由 RebuildEmbyItems 幂等重建，uid 是 `/video/{id}` 里 `{id}` 的 uid 段：
 // 单集 `e<episode.id>`、合并集 `m<merge_group.id>`（两个空间互不匹配，DESIGN D3）。
 type EmbyItem struct {
 	ID         int64
@@ -332,6 +332,25 @@ func (s *Store) rebuildEmbyItems(ctx context.Context, dramaID int64) error {
 
 // embyItemColumns 是 emby_item 表的显式列清单（不含渲染辅助的 EpFrom/EpTo）。
 const embyItemColumns = `SELECT id, drama_id, season, ep_no, kind, uid, runtime_sec FROM emby_item`
+
+// EmbyItemByUID 按 uid 查一条对外剧集（单集 `e<episode.id>` / 合并集 `m<group.id>`）。
+//
+// 播放面的 `/video/{id}` 用它判断「这个播放单元现在还在不在」：uid 只在派生表里
+// 存在才算合法（docs/PLAYBACK-CONTRACT.md「不飘移」第 3 条 —— 某集被并进合并组后
+// 它的 `e<id>` 立刻不再是播放单元，旧 URL 得到 404 而不是播到别的形态）。
+// 无行返回 ErrNotFound。
+func (s *Store) EmbyItemByUID(ctx context.Context, uid string) (EmbyItem, error) {
+	var it EmbyItem
+	err := s.db.QueryRowContext(ctx, embyItemColumns+` WHERE uid = ?`, uid).
+		Scan(&it.ID, &it.DramaID, &it.Season, &it.EpNo, &it.Kind, &it.UID, &it.RuntimeSec)
+	if errors.Is(err, sql.ErrNoRows) {
+		return EmbyItem{}, ErrNotFound
+	}
+	if err != nil {
+		return EmbyItem{}, fmt.Errorf("按 uid 查对外剧集 %q: %w", uid, err)
+	}
+	return it, nil
+}
 
 // ListEmbyItems 返回某部剧的对外剧集，按对外集号升序。
 //

@@ -87,16 +87,12 @@ function initDramas() {
         type: 'button', class: 'btn ghost', text: '删除',
         onclick: () => removeDrama(drama),
       });
-      const playable = drama.playable_episodes === 0
-        ? el('span', { class: 'tag warn', text: '0' })
-        : String(drama.playable_episodes);
       tbody.append(el('tr', {},
         el('td', {}, el('div', { class: 'title-cell' },
           el('span', { text: drama.title }),
           el('span', { class: 'sub', text: drama.provider + ':' + drama.provider_id }))),
         el('td', { class: 'num', text: drama.year === 0 ? '—' : String(drama.year) }),
         el('td', { class: 'num', text: drama.episodes + ' / ' + drama.episode_total }),
-        el('td', { class: 'num' }, playable),
         el('td', { class: 'num', text: String(drama.emby_items) }),
         el('td', { class: 'num', text: String(drama.merge_groups) }),
         el('td', { class: 'mono', text: fmtTime(drama.sync_at) }),
@@ -405,14 +401,9 @@ function initStatus() {
     totalsBox.replaceChildren(
       stat('剧目', String(t.dramas)),
       stat('集', String(t.episodes)),
-      stat('可播集', String(t.playable_episodes)),
       stat('对外集', String(t.emby_items)),
       stat('合并组', String(t.merge_groups)),
       stat('最近同步', fmtTime(t.last_sync_at), true));
-    if (t.playable_episodes === 0 && t.episodes > 0) {
-      say('库里还没有可用播放源：同步只保证剧与集齐全，episode.play_url 由出流按需解析。', 'busy');
-    }
-
     const c = status.config;
     configBody.replaceChildren(
       row('strm 前缀', c.strm_prefix === '' ? '空（直连本服务）' : c.strm_prefix,

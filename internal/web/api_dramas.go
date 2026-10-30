@@ -22,7 +22,6 @@ type dramaView struct {
 	ProviderID   string `json:"provider_id"`
 	EpisodeTotal int    `json:"episode_total"`
 	Episodes     int    `json:"episodes"`
-	Playable     int    `json:"playable_episodes"`
 	EmbyItems    int    `json:"emby_items"`
 	MergeGroups  int    `json:"merge_groups"`
 	SyncAt       string `json:"sync_at"`
@@ -33,15 +32,14 @@ type dramaList struct {
 	Dramas []dramaView `json:"dramas"`
 }
 
-// episodeView 是一集的视图。has_play_url 只报真假，不回传直链本身
-// （直链带上游签名，不该进管理面响应）。
+// episodeView 是一集的视图。只剩库里的字段：直链不落库（0004 已删 play_url），
+// 「能不能播」由 /video 请求时向插件解析，管理面不冒充知道。
 type episodeView struct {
 	ID          int64  `json:"id"`
 	EpNo        int    `json:"ep_no"`
 	Title       string `json:"title"`
 	DurationSec int    `json:"duration_sec"`
 	Vid         string `json:"vid"`
-	HasPlayURL  bool   `json:"has_play_url"`
 }
 
 // episodeList 是某剧集列表的响应体。
@@ -75,7 +73,6 @@ func (s *Server) dramaViews(ctx context.Context) ([]dramaView, error) {
 			ProviderID:   d.ProviderID,
 			EpisodeTotal: d.EpisodeTotal,
 			Episodes:     st.Episodes,
-			Playable:     st.PlayableEpisodes,
 			EmbyItems:    st.EmbyItems,
 			MergeGroups:  st.MergeGroups,
 			SyncAt:       d.SyncAt,
@@ -166,7 +163,6 @@ func (s *Server) handleListEpisodes(w http.ResponseWriter, r *http.Request) {
 			Title:       ep.Title,
 			DurationSec: ep.DurationSec,
 			Vid:         ep.Vid,
-			HasPlayURL:  ep.PlayURL != "",
 		})
 	}
 	writeJSON(w, http.StatusOK, episodeList{Episodes: out})

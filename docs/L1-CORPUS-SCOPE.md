@@ -100,7 +100,7 @@ ffprobe -v error -show_entries format=duration  # duration=10.066667
 另外抽 88 部剧的 `seriesDetail`：`protectedPlayback=true`、`pay_type=0`、
 `accessible_episode_cnt=3` 三项 **88/88 全部一致**，没有任何一部是整集可播的。
 
-这与 `docs/DEV-STANDARDS.md`「`play_url` 留空的契约」的 2026-10-29 结论一致，
+这与 `docs/DEV-STANDARDS.md`「直链不落库的契约（0004 之后）」的结论一致，
 并补上了两点原文档没写的：**第 2..N 集不是「暂缺」而是结构性不公开**；
 **第 4 集起连页面本身都 404**。
 

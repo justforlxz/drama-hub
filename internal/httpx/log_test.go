@@ -102,22 +102,19 @@ func TestRequestLogger_StatusCapture(t *testing.T) {
 	}
 }
 
-// TestRequestLogger_MasksStreamToken 覆盖 AC5：/s/{token}/… 的 token 段掩码，
-// 日志全文不含明文 token。
-func TestRequestLogger_MasksStreamToken(t *testing.T) {
+// TestRequestLogger_KeepsPlaybackPath 覆盖 AC5（2.0 口径）：播放面路径原样入日志
+// —— `/video/{id}` 里的 id 是签名 id，不是密钥。
+func TestRequestLogger_KeepsPlaybackPath(t *testing.T) {
 	logger, buf := captureLogger()
 	serveLogged(t, logger, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
-		http.MethodGet, "/s/SUPERSECRET/e/42")
+		http.MethodGet, "/video/e42-9f3a1c02b7d4.m3u8")
 
-	if out := buf.String(); strings.Contains(out, "SUPERSECRET") {
-		t.Errorf("日志泄露 token 明文: %s", out)
-	}
 	records := loggedRecords(t, buf)
 	if len(records) != 1 {
 		t.Fatalf("日志条数 = %d, 期望 1", len(records))
 	}
-	if records[0]["path"] != "/s/{token}/e/42" {
-		t.Errorf("path = %v, 期望 /s/{token}/e/42", records[0]["path"])
+	if records[0]["path"] != "/video/e42-9f3a1c02b7d4.m3u8" {
+		t.Errorf("path = %v, 期望原样的播放路径", records[0]["path"])
 	}
 }
 
@@ -136,26 +133,5 @@ func TestRequestLogger_DropsQuery(t *testing.T) {
 	}
 	if records[0]["path"] != "/api/x" {
 		t.Errorf("path = %v, 期望 /api/x", records[0]["path"])
-	}
-}
-
-// TestRedactPath 表驱动覆盖掩码规则（AC5）：仅 /s/ 的首段被替换。
-func TestRedactPath(t *testing.T) {
-	cases := []struct {
-		in   string
-		want string
-	}{
-		{"/s/SECRET/e/42", "/s/{token}/e/42"},
-		{"/s/SECRET/seg/7/12.ts", "/s/{token}/seg/7/12.ts"},
-		{"/s/SECRET", "/s/{token}"},
-		{"/s/", "/s/"},
-		{"/healthz", "/healthz"},
-		{"/dav/x", "/dav/x"},
-		{"/", "/"},
-	}
-	for _, c := range cases {
-		if got := redactPath(c.in); got != c.want {
-			t.Errorf("redactPath(%q) = %q, 期望 %q", c.in, got, c.want)
-		}
 	}
 }

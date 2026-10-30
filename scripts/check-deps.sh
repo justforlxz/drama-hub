@@ -10,7 +10,6 @@ set -eu
 RANKS="cmd/drama-hub 60
 internal/web 50
 internal/webdav 40
-internal/stream 40
 internal/segment 40
 internal/scheduler 40
 internal/sync 30
@@ -18,6 +17,7 @@ internal/vfs 30
 internal/httpx 30
 internal/plugin/hongguo 20
 internal/cache 20
+internal/stream 20
 internal/plugin 10
 internal/store 10"
 

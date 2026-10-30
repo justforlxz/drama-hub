@@ -36,8 +36,8 @@ internal/scheduler/     刷新调度：一轮三段、同源单飞、间隔热�
 internal/store/         SQLite、迁移、派生表重建
 internal/vfs/           虚拟文件树 → strm/nfo/图片 渲染
 internal/webdav/        x/net/webdav 自定义 FileSystem
-internal/stream/        出流：HEAD/GET/Range/token
-internal/segment/       关键帧索引、播放列表生成、分片转封装
+internal/stream/        播放 id 签名（HMAC）与请求时直链解析（不碰 HTTP）
+internal/segment/       播放面 handler：关键帧索引、播放列表、分片转封装与缓存编排
 internal/cache/         本地缓存（封面/关键帧索引/分片）+ 淘汰 + pin 预取驱动（ADR-0007）
 internal/web/           管理 API + 页面模板
 docs/                   规范与 ADR

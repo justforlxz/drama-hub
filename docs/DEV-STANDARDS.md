@@ -121,159 +121,100 @@ ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（�
 
 新增参数必须同 PR 更新上表，并在 `settings` 里给默认值 + 范围校验。写非法值返回 400，不静默纠正。
 
-## 出流（stream）
+## 播放面（`/video`）
 
-> **2.0 定稿已改这一章的口径，本节待实现时重写。** 以 `docs/PLAYBACK-CONTRACT.md`
-> 与 `docs/CACHE-MODEL.md` 为准（ADR-0007）：`/dav/` → `/webdav/`，出流统一为
-> `/video/{id}.m3u8` + `/video/{id}/{seq}.ts`，`/s/*` 退役，分片缓存归本服务。
-
-
-模块 `internal/stream` 与 `internal/segment`（合并集部分），装配在 `/s/` 前缀下：
+契约真值：`docs/PLAYBACK-CONTRACT.md`（S8 / MKACG-612 落地）。本节只写实现口径。
+两个口子由 `internal/segment` 提供 handler、装配根注册：
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/s/{token}/e/{uid}` | GET / HEAD | 单集 MP4 字节中继，Range 透传；**uid 是合并集句柄时返回自造 m3u8**（M7，由装配根按 uid 分派） |
-| `/s/{token}/e/{uid}/master.m3u8` | GET | 合并集 playlist 的标准别名（部分客户端会自行追加） |
-| `/s/{token}/seg/{uid}/{seq}.ts` | GET | 分片：单集按片内序、合并集按跨集时间轴（M6/M7），MPEG-TS |
-| `/s/` 子树其余路径 | 任意 | 501（已规划未实现） |
+| `/video/{id}.m3u8` | GET / HEAD | 播放列表；单集与合并集**同一路径形态** |
+| `/video/{id}/{seq}.ts` | GET / HEAD | MPEG-TS 分片：查本地缓存 → 未命中现切、落缓存、再回 |
 
-`GET` 路由模式同时匹配 `HEAD`（Go 1.22 ServeMux 行为），不单独注册；`HEAD` 与
-`GET` 对同一 URL 的上游响应必须给出同一 `Content-Length`，且 `HEAD` 不读上游 body。
+- `/dav/`、`/s/{token}/*` 与 `/s/*/master.m3u8` **已退役、不留兼容层**：`.strm` 是按
+  请求渲染的，下一次读取就是新内容，没有存量文件需要兼容。
+- `internal/stream`（rank 20）只剩两件事：`ID` / `ParseID`（对外 id 的 HMAC 签名）与
+  `Resolver`（请求时向插件解析直链）。它不碰 HTTP —— 状态码映射在
+  `internal/segment`。
 
-### uid 规则
-
-- 单集 `uid = "e" + strconv.FormatInt(episode.id, 10)`（如 `e42`），派生自稳定的
-  `episode.id`，不读 `emby_item`：那是幂等重建的派生表，而签名 URL 的缓存键必须
-  长期稳定。
-- 合并集 `uid = "m" + strconv.FormatInt(merge_group.id, 10)`（如 `m3`）。**合并集
-  uid 不得匹配 `^e[0-9]+$`**（DESIGN D3：uid 区分内容类型，装配根靠前缀分派）。
-- 单集 uid 只由 stream 消费；合并集 uid 的存续由 `emby_item` 派生表的 rebuild 保证
-  （`merge_group.id` 稳定，组删除后派生表重建、uid 不再出现）。
-
-uid 只是出流 URL 的句柄，与硬约束 6（对外集号只由 `emby_item` 决定）无关；
-stream 不读、不写 `emby_item`。
-
-### 合并集（M7）
-
-合并集 = 虚拟 HLS 分片聚合（ADR-0001，AGENTS 硬约束 2），实现分三层：
-
-1. **编排**（`internal/store/merge.go`）：`CreateMergeGroup` / `DeleteMergeGroup` /
-   `RebuildEmbyItems` 维护 `merge_group` / `merge_item` / `emby_item` 三张表。
-   合并变更与同步完成是派生表重建的两个调用点（硬约束 6：对外集号只由派生表
-   决定，合并调整只重建派生表、不动 `drama` / `episode`）。
-2. **时间轴**（`internal/segment/timeline.go` + `merged.go`）：`NewTimeline` 按成员
-   顺序把各集分片拼成连续 seq 空间，回答 `seq → (集号, 集内秒, 绝对起点)`。
-3. **端点**：playlist 渲染 `BuildPlaylist`（`#EXT-X-DISCONTINUITY` 插在集边界），
-   分片按时间轴解析后 `-c copy` 现切；切片的 `-output_ts_offset` 用绝对起点保证
-   跨集 DTS 连续（否则播放器在集边界因时间戳回退丢帧）。
-
-错误矩阵与单集一致：索引未就绪 503 + `Retry-After`（不出半截流，ADR-0001）；
-坏签名 401；未知组/越界 seq 404。
-
-### 鉴权
+### id 规则
 
 ```
-token = base64url_nopad( HMAC-SHA256( secret, "stream:" + uid ) )
+id  = uid + "-" + hex(HMAC-SHA256(stream_secret, uid))[:12]
+uid ∈ { "e<episode.id>", "m<merge_group.id>" }
 ```
 
-`stream.Sign` / `stream.Verify` 按 ADR-0003 逐字节实现，编码固定
-`base64.RawURLEncoding`（43 字符、无 `=`），比较用 `crypto/hmac.Equal`。
-secret 取 `settings.stream_secret`，**每请求读一次不缓存**（硬约束 5：改完即时
-生效；换 secret 后旧 URL 立即失效，是 ADR-0003 的既定后果）。无过期、无状态、
-无 token 表。
+- 生产方是 vfs 的 `.strm` 渲染（`cmd` 注入 `stream.ID`），校验方是 `/video`
+  （`stream.ParseID`）：两侧同一个实现，不各写一份 HMAC 拼接。
+- `uid` 只依赖 `episode.id` / `merge_group.id`，两者在库的整个生命周期里不变 →
+  URL 不随同步、重建派生表、重启、改目录而漂；换 `stream_secret` 后所有 URL 失效
+  （ADR-0003 的既定后果）。secret 每请求读一次，不缓存（硬约束 5）。
+- **播放单元的合法性由 `emby_item` 派生表判定**（`store.EmbyItemByUID`）：`e<id>` 只在
+  它是一条现存单集时有效；某集被并进合并组后，它的 `e<id>` 立即 404 —— 这是契约
+  「不飘移」第 3 条，也是 401（签名不对）与 404（播放单元不存在）的分界。
+- 状态码矩阵里没有 302、没有过期时间、没有 token 表。
+
+### 关键帧索引（按需建立）
+
+`ensureSegments` 在**第一次播放某个 uid** 时同步 `ffprobe -skip_frame nokey` 预扫源，
+把切点按 `seg_target_sec` 对齐到关键帧后整体写入 `segment` 表：
+
+- **切点规则**：首片从 0 起；之后每个切点取第一个 `>= 当前切点 + seg_target_sec`
+  的关键帧。切点都落在关键帧上，`-c copy` 切片内部才不会漂移（实测「目标 10 s
+  实际 10.66 s」就是这条规则）。
+- **总时长**：Σ `dur` == 源时长（±一帧）。`Timeline` 把有序的各集分片拼成连续 seq
+  空间，`seq → (集号, 集内秒, 绝对起点)` 供合并集 O(1) 定位。
+- **按需、不预建**：库里有 2847 万集，全库 ffprobe 不可完成，代码里没有任何批量
+  预建入口（索引只在请求路径上按需建立）。
+- **30 s 硬上限**：整次建立（`indexDeadline`）走一个 `context.WithTimeout`，超时回
+  503 + `Retry-After: 5`（`httpx.ErrUnavailable`），不出半截时间轴。
+- **幂等与失败**：`ReplaceSegments` 一事务内先删后插；探测失败不写任何行（库里保留
+  旧索引或保持为空）。
 
 ### 状态码矩阵
 
-| 情形 | 响应 |
-|---|---|
-| 上游 200 | 200 + `Content-Length` + `Content-Type` + `Accept-Ranges`，body 透传 |
-| 上游 206 | 206 + 上述 + `Content-Range`，body 透传 |
-| 上游 416 | 416 原样透传（含上游的 `Content-Range`，若给了） |
-| 上游其它 4xx / 5xx（含 403、404） | 502（`httpx.ErrUpstream`），**不转发上游 body** |
-| 传输错误 / 超时 | 502 |
-| secret 读失败 | 500（响应体与日志都不含 secret） |
-| 签名不匹配 | 401（`httpx.ErrUnauthorized`） |
-| uid 非法 / 剧集不存在 | 404（`httpx.ErrNotFound`） |
-| `play_url` 为空 | 502（`httpx.ErrUpstream`） |
-| 客户端断开（ctx 取消） | 不写响应，仅记日志 |
+| 情形 | `/video/{id}.m3u8` | `/video/{id}/{seq}.ts` |
+|---|---|---|
+| 正常 | 200 + `application/vnd.apple.mpegurl` | 200 + `video/mp2t` + `Content-Length` + `Cache-Control` |
+| id 签名不对 / 缺 `-` | 401（`httpx.ErrUnauthorized`） | 401 |
+| 路径不是 `.m3u8` | 404 | — |
+| `uid` 不在派生表 / seq 越界 / 分片名非法 | 404（`httpx.ErrNotFound`） | 404 |
+| 解析不到直链（`ErrNoStream` 等） | 502（`httpx.ErrUpstream`） | 502 |
+| 索引建立超时 | 503 + `Retry-After: 5` | 503 + `Retry-After: 5` |
+| secret 读失败 | 500（响应体与日志都不含 secret） | 500 |
 
-- **Range 纯透传，不在本地合成 206 / 416**：两者都由上游判定（实测红果 CDN
-  都正确）。请求的 `Range` 头原样转发给上游。
-- **不做 302**（硬约束 7）：Go 默认 client 在内部跟随上游重定向（≤10 次）并
-  保留 `Range`；任何 3xx 都不会发给客户端。
-- 回传给客户端的头**只有** `Content-Type`、`Content-Length`、`Content-Range`、
-  `Accept-Ranges`；其余上游头一律丢弃。
-- **先拿到上游响应并定下状态码，再写任何客户端字节**：所有上游失败都产出干净的
-  502，不会先写 200 再失败。
-- **上游必须给出精确 `Content-Length`**：chunked（无长度）响应让 HEAD 与 GET
-  拿不到一致长度，直接打掉「长度精确」——此时返回 502，不给无长度的 200/206。
+- **直链只在请求时解析**（`stream.Resolver.DirectURL`）：不落库（0004 已删
+  `episode.play_url` / `play_url_at`）、不缓存、不跨请求复用 —— 上游换链后下一次请求
+  自然拿到新链。解析失败一律 502，且不写库、不写缓存。
+- playlist 是 `segment` 表的**纯函数视图**（`BuildPlaylist`）：不落盘、不缓存
+  （理由见 `docs/CACHE-MODEL.md`「为什么 m3u8 文本不缓存」）。
+- HEAD 与 GET 的 `Content-Length` 一致（硬约束 3）：playlist 手写长度；分片走
+  `http.ServeContent`（Range 也由它处理，分片是完整不可变对象，不需要分段生成）。
+- 分片字节先完整收进内存再生效（单片 10 s 约 2–5 MB）：ffmpeg 中途失败时客户端看到
+  干净的 502，不是截断流。
 
-### 出站客户端
+### 分片缓存
 
-```go
-&http.Client{Transport: &http.Transport{
-    DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-    ResponseHeaderTimeout: 15 * time.Second,
-    DisableCompression:    true,
-}}
-```
+`GET /video/{id}/{seq}.ts` 的顺序是「查缓存 → 命中即回；未命中生成、落盘、再回」：
 
-- **`DisableCompression: true` 是硬要求**：Go 默认 Transport 会给无 `Range` 的
-  GET 自动加 `Accept-Encoding: gzip` 并透明解压，把响应里的 `Content-Length`
-  抹掉 → 「长度精确」直接失效（本地 httptest 对照实验实测）。
-- **禁止 `Client.Timeout`**：那是对整个响应体（含长视频）计时，会截断大文件。
-  连不上 / 不回头由 `DialContext` 与 `ResponseHeaderTimeout` 覆盖，body 传输交给
-  请求 ctx（客户端断开即取消），仍满足「出站 HTTP 一律带 timeout 或 ctx 超时」。
-- 客户端实例挂在 `Server` 字段上，禁止包级可变变量。
-
-### 已知边界
-
-上游在 body 传输**中途**失败时响应头已发出，无法改写成 502，客户端看到截断。
-不为此引入全量缓冲（缓冲整集字节是错误设计）。
-
-## 分片（segment）
-
-> **2.0 定稿已改这一章的口径，本节待实现时重写。** 以 `docs/PLAYBACK-CONTRACT.md`
-> 与 `docs/CACHE-MODEL.md` 为准（ADR-0007）：`/dav/` → `/webdav/`，出流统一为
-> `/video/{id}.m3u8` + `/video/{id}/{seq}.ts`，`/s/*` 退役，分片缓存归本服务。
-
-
-模块 `internal/segment`，装配在 `/s/` 子树下：`segment.Cutter` 用比 `/s/` 更具体的
-pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `<seq>.ts`
-（seq 从 0 起、允许前导零；缓存代理按整串 URL 做 key，本服务不改写）。签名校验用
-装配根注入的 `stream.Verify`（segment 与 stream 同 rank 40，不能互相 import）。
-
-### 关键帧索引
-
-`Cutter.Index(episodeID)` 用 `ffprobe -skip_frame nokey` 预扫源，把切点按目标时长
-对齐到关键帧后整体写入 `segment` 表：
-
-- **切点规则**：首片从 0 起；之后每个切点取第一个 `>= 当前切点 + seg_target_sec`
-  的关键帧。切点都落在关键帧上，`-c copy` 切片内部才不会漂移（实测「目标 10s
-  实际 10.66s」就是这条规则）。
-- **总时长**：Σ `dur` == 源时长（±一帧）。`Timeline` 把有序的各集分片拼成连续
-  seq 空间，`seq → (集号, 集内秒)` 供合并集（M7）O(1) 定位。
-- **幂等与失败**：`ReplaceSegments` 一事务内先删后插，重复索引幂等；探测或切片
-  失败**不写库、不缓存失败结果**（库里保留旧索引或保持为空）。
-- **触发点**：索引不在请求路径上自动触发（ADR-0001：索引缺失一律 503）。调用
-  `Cutter.Index` 的任务属 M7（合并编排）与 R1（管理面）。
-
-### 分片端点状态码矩阵
-
-| 情形 | 响应 |
-|---|---|
-| 正常切片 | 200 + `Content-Type: video/mp2t` + `Content-Length` + `Cache-Control` |
-| 签名不匹配 | 401（`httpx.ErrUnauthorized`） |
-| uid 非法 / 剧集不存在 / seq 越界 / 文件名非法 | 404（`httpx.ErrNotFound`） |
-| `play_url` 为空、ffprobe/ffmpeg 失败 | 502（`httpx.ErrUpstream`），不缓存失败结果 |
-| 索引未就绪（`segment` 表无该集行） | 503 + `Retry-After: 5`（`httpx.ErrUnavailable`），不出半截流 |
-
-- 切片把完整 TS 字节收进内存再写响应（单片 10s 约 2–5 MB，DESIGN §2），ffmpeg
-  中途失败时客户端看到干净的 502 而非截断流。
+- 键 `sha256(uid \x1f seq \x1f codec_sig)`（`cache.SegmentKey`），落
+  `<cache_dir>/seg/<hash 前 2 位>/<hash>.ts`；`artifact(kind='segment')` 是索引行。
+- 并发同一个 `(id, seq)` 只生成一次（`Cache.GetOrGenerate` 的 single-flight）；
+  **返回的 `[]byte` 是共享只读**，调用方不得就地改写。
+- 生成失败 → 502，**不写缓存**（失败结果绝不进缓存）；缓存自身故障按 500 报，
+  不冒充上游问题。
+- 淘汰归 `internal/cache`（每 5 分钟一轮，`cache_max_mb` / `cache_lru_days`，
+  `docs/CACHE-MODEL.md`）。
 - ffmpeg/ffprobe 一律带硬超时（`timeoutProbe=30s` / `timeoutCut=60s`）；stderr 尾部
-  只进日志，不落响应体；日志只记源 host，不落完整直链（可能带签名）。
-- 并发闸：ffmpeg/ffprobe 调用排队过 `min(4, max(1, NumCPU/2))` 的闸，超出的请求
-  排队不丢弃；客户端断开时放弃排队并结束请求。
+  只进日志，不落响应体；日志只记源 host，不落完整直链。并发闸
+  `min(4, max(1, NumCPU/2))`，超出的请求排队不丢弃。
+
+### 合并集
+
+`uid = m<group_id>`：`Timeline` 按 `merge_item.ord` 把成员分片拼成连续 seq 空间，
+playlist 在集边界插 `#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 用绝对起点保证
+跨集 DTS 连续（否则播放器在集边界因时间戳回退丢帧）。分片端点只解析它要切的那一集，
+不把整组都解析一遍。
 
 ## 日志
 
@@ -289,16 +230,15 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `method` | string | `r.Method` |
-| `path` | string | `r.URL.Path` 经 `httpx.redactPath` 掩码 |
+| `path` | string | `r.URL.Path` 原样（不含 query） |
 | `status` | int | 响应状态码（未显式 `WriteHeader` 时 200）|
 | `duration_ms` | int | 处理耗时（毫秒）|
 
 级别按状态：5xx → Error，4xx → Warn，其余 Info。
 
-**掩码规则**：出流路径形的 token 在路径段里（ADR-0003：`/s/{token}/e/{uid}`、
-`/s/{token}/seg/{uid}/{seq}.ts`，cache-key 稳定性要求它可见），因此以 `/s/` 开头的路径，
-把紧随其后的一段替换为 `{token}`（`/s/SECRET/e/42` → `/s/{token}/e/42`）。日志只记
-`r.URL.Path`，天然不含 query，`?token=…` 这类参数不会落盘。
+**不再掩码路径**：2.0 之后 URL 里没有凭据段 —— `/video/{id}` 是签名 id（本身不是
+密钥），WebDAV 凭据在 `Authorization` 头里。日志只记 `r.URL.Path`，天然不含 query，
+`?token=…` 这类参数不会落盘；**禁止记录**完整带签名的上游直链（可能带短时凭据）。
 
 中间件只允许挂一次：在 `web` / `stream` / `webdav` 内再挂一层会让同一请求产生两条日志。
 
@@ -356,11 +296,19 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
   可选接口 `sync.WorkWithEpisodeKeys` —— 插件实现就一次调用同时拿到详情与每集源侧标识，
   不实现则 `episode.vid` 留空（不编造）。红果实现了它。
 
-### `play_url` 留空的契约
+### 直链不落库的契约（0004 之后）
 
-**同步不写 `episode.play_url` / `play_url_at`。** 实测（2026-10-29，9 部剧逐一 ffprobe）：列表页 `vid_list` 给全全部集，但单集页 SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **实际时长恒为 10.08 秒**（JSON-LD 却声明整集时长 1m48s–3m38s），第 2..N 集 `contentUrl` 为空字符串、`publicVideoSeo: null`。把预览链写进 `play_url` 等于「整库每集只播 10 秒」，比留空更有害。
+**库里没有直链列。** `0004_drop_play_url.sql` 删掉了 `episode.play_url` /
+`play_url_at`：直链是请求时向插件解析的短时凭据，持久化等于把过期链接写进库。
 
-因此：同步只保证「剧与集齐全、`vid`/`ep_no` 正确」；`play_url` 为空表示**尚无可用播放源**。真直链按需走 `Plugin.Resolve`（S8 / MKACG-612 接到 `/video/{id}/{seq}.ts` 上）。整集字节来源属 M5 及之后的范围（见 MKACG-592 的 PL 决策项）。
+实测（2026-10-29，9 部剧逐一 ffprobe）：列表页 `vid_list` 给全全部集，但单集页 SSR 的
+`contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **实际时长恒为 10.08 秒**（JSON-LD
+却声明整集时长）。1.0 因此从不写这两列，读它们的出流端点（`/s/{token}/e/{uid}`）在真实
+库上恒 502 —— 那条断链在 S8 直接接在 `/video` 上：**每次播放请求现调
+`plugin.Resolve`**（`internal/stream` 的 `Resolver`），失败一律 502、不写库不缓存。
+
+同步只保证「剧与集齐全、`vid` / `ep_no` 正确」；`/api/dramas` 也不再报「可播集数」：
+那个数字在当前实现里恒为 0，删列只是让它别再骗人。
 
 ### 测试
 
@@ -407,9 +355,9 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 |---|---|---|
 | 60 | `cmd/drama-hub` | 全部 internal |
 | 50 | `internal/web` | 40 / 30 / 20 / 10 |
-| 40 | `internal/webdav`、`internal/stream`、`internal/segment`、`internal/scheduler` | 30 / 20 / 10 |
+| 40 | `internal/webdav`、`internal/segment`、`internal/scheduler` | 30 / 20 / 10 |
 | 30 | `internal/sync`、`internal/vfs`、`internal/httpx` | 20 / 10 |
-| 20 | `internal/plugin/hongguo`、`internal/cache` | 10 |
+| 20 | `internal/stream`、`internal/plugin/hongguo`、`internal/cache` | 10 |
 | 10 | `internal/plugin`、`internal/store` | 无 |
 
 `internal/httpx` 是 HTTP 边界的横切层：只依赖标准库、不 import 任何 internal 包；
@@ -454,7 +402,8 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 - 集号 `S%02dE%02d`：**对外集号取 `emby_item.ep_no`**（硬约束 6），不是 `episode.ep_no`。
 - `<标签>` = `embyLabel`：单集取源集标题、空则 `第<对外集号>集`；**合并集取
   `第 A-B 集`**（A/B 是组内最小/最大源集号，A==B 时退化为 `第 A 集`）。
-- 目录名与文件名里的 `/ \ : * ? " < > |` 一律替换为 `_`（Windows + WebDAV 非法字符集）。
+- 目录名（含分类目录）与文件名里的 `/ \ : * ? " < > |` 一律替换为 `_`（Windows + WebDAV
+  非法字符集）：分类名转义是 S8 / PL 2026-10-30 的裁决，见下「含路径分隔符的分类名」。
 - 路径以 `/` 分隔、相对 vfs 根、无前导 `/`；`""` 与 `短剧` 都表示根。
 
 **数据源是 `emby_item` 派生表**（`store.ListEmbyItems`），不是 `episode`：一个合并组
@@ -491,15 +440,20 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
   的全部索引行，183k 行约 44ms）。根目录是唯一必须拿到全部分类的地方，所以只有它付
   这一次全扫。
 - 这条口径由 `internal/vfs` 的 `TestListDoesNotScanAllGenres` 用**数 store 方法调用**
-  的方式钉住（不是数 SQL 文本）：根目录 1 次 `ListGenres`，其余层 0 次。SQL 文本测试
-  抓不住「点查写了但没接线」——上一轮 Review 就是这么抓到的。
+  的方式钉住（不是数 SQL 文本）：根目录 1 次 `ListGenres`，其余层 0 次（除非目录名是
+  转义形态，见下）。SQL 文本测试抓不住「点查写了但没接线」——上一轮 Review 就是这么
+  抓到的。
 
-含路径分隔符的分类名（上游脏 `tags[0]`，如 `剧情/古装`）按契约「分类名不做转义」
-处理，不被转义，但它无法成为一个路径段：强行拼进根目录会产出跨段节点，
-`x/net/webdav` 的 `walkFS` 给它 `Stat` 时失败并中止，整份 `multistatus` 被截断
-（客户端拿到非法 XML，整个挂载点不可解析）。因此 `listGenres` **跳过**这类分类并记
-一条 `warn`——父目录列举始终可解析，代价是该分类下的剧在挂载点里不可见（直到上游
-把标签改干净）。要不要改成「目录名也过 `sanitizeName`」（无损，但改命名口径）需 PL 裁定。
+含路径分隔符的分类名（上游脏 `tags[0]`，如 `剧情/古装`）**按目录名规则转义**
+（`sanitizeName`：`剧情/古装` → `剧情_古装`，PL 2026-10-30 裁决）。不转义时它无法成为
+一个路径段：强行拼进根目录会产出跨段节点，`x/net/webdav` 的 `walkFS` 给它 `Stat` 时
+失败并中止，整份 `multistatus` 被截断（客户端拿到非法 XML，整个挂载点不可解析）；
+而「跳过 + warn」会让这批剧在挂载点里静默不可达（QA 实测转义后可列可播）。
+
+- 转义后同名的两个分类（`剧情/古装` 与 `剧情_古装`）并进同一个目录，记一条 debug。
+- 目录名 → genre 取值集合因此不再总是「目录名本身」：`genresForDir` 先做点查
+  （`GenreExists`），点查全落空时（转义形态）才退回一次 `ListGenres` 筛
+  「转义后等于目录名」的分类 —— 这条路径只对脏分类与不存在的目录付代价。
 
 剧目录名 → 剧目：先按 `WHERE title = ? AND year = ?`（`idx_drama_title`）点查，带冲突
 后缀的形态按 `WHERE provider = ? AND provider_id = ?` 点查；命中后**仍比对「分类 + 分片 +
@@ -518,8 +472,9 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 - `id = uid + "-" + hex(HMAC-SHA256(stream_secret, uid))[:12]`（`stream.ID`），
   `uid` 取 `emby_item.uid`：单集 `e<episode.id>`、合并集 `m<merge_group.id>`。
   **单集与合并集没有区别**，对外统一是 HLS 播放列表（`docs/PLAYBACK-CONTRACT.md`）。
-- 签名算法在 `internal/stream`（rank 40），vfs（rank 30）不 import 它：装配根注入
-  `vfs.IDFunc`。`/video` 端点本身属 S8（MKACG-612）。
+- 签名算法在 `internal/stream`（rank 20）：vfs（rank 30）可以 import 它，但仍在装配根
+  注入 `vfs.IDFunc`（`cmd` 传 `stream.ID`），让 vfs 只依赖「一个纯函数」这条缝。
+- 播放面（`/video/{id}.m3u8` + `/video/{id}/{seq}.ts`）见本节前面的「播放面」章。
 - `strm_prefix` 与 `stream_secret` 每次渲染现读，改值即时生效（硬约束 5）。
 
 ### NFO 形态
@@ -532,12 +487,12 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 | 集 `.nfo` | `episodedetails` | `title` / `season` / `episode` / `runtime` | 字段全部取自 `emby_item`：`episode` 是**对外集号**，`runtime` 单位是**分钟**（`runtime_sec / 60` 向下取整）；写秒会被 Emby 放大 60 倍 |
 | `tvshow.nfo` | `tvshow` | `title` / `year` / `plot` | `plot` 来自 `drama.plot` |
 
-`aired` 不写：`play_url_at` 是采集时间，不是播出日期。
+`aired` 不写：库里的时间只有采集时间，没有播出日期。
 
 ### 长度
 
 渲染结果的长度只有 `len(Render 的 []byte)` 一个真值，本包不提供独立的 `Size()` 或长度字段。
-`internal/webdav` 的 `PROPFIND getcontentlength` 与 `internal/stream` 的 `Content-Length`
+`internal/webdav` 的 `PROPFIND getcontentlength` 与播放面的 `Content-Length`
 都取这个值（硬约束 3）。
 
 ## WebDAV（internal/webdav）
@@ -603,9 +558,9 @@ Basic，凭据取 `settings.webdav_user` / `webdav_pass`，**每请求现读**�
 
 ### 已知边界
 
-- 修改时间恒为零值（`entry.ModTime`）：库里没有可靠的 mtime，`sync_at` / `play_url_at`
-  是采集时间。零值让 ETag 稳定在「内容长度」上，`http.ServeContent` 也不写 `Last-Modified`。
-- 不做封面 `poster.jpg`（属 artifact 缓存，单独任务）；`/video` 出流端点属 S8。
+- 修改时间恒为零值（`entry.ModTime`）：库里没有可靠的 mtime，`sync_at` 是采集时间。
+  零值让 ETag 稳定在「内容长度」上，`http.ServeContent` 也不写 `Last-Modified`。
+- 不做封面 `poster.jpg`（属 artifact 缓存，单独任务）。
 
 ### 测试（两层，都不需要外部 rclone）
 
@@ -665,7 +620,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | `/api/dramas` | GET | 剧目列表：drama 行 + `episodes` / `playable_episodes` / `emby_items` / `merge_groups` 计数 |
 | `/api/dramas` | POST | 新增剧目：`{"series_id":"<上游剧 id 或 /player/ 链接>"}`，同步入库后返回 201 + 整份列表 |
 | `/api/dramas/{id}` | DELETE | 删剧目（级联删集与合并组），204；不存在 404 |
-| `/api/dramas/{id}/episodes` | GET | 该剧全部集（`ep_no` 升序）；`has_play_url` 只报真假，不回传直链 |
+| `/api/dramas/{id}/episodes` | GET | 该剧全部集（`ep_no` 升序）；只回库里的字段（直链不落库，没有 `has_play_url`） |
 | `/api/dramas/{id}/merge-groups` | GET | 该剧合并组与成员（`ord` 即时间轴顺序） |
 | `/api/dramas/{id}/merge-groups` | POST | 建组：`{"label":"…","episode_ids":[…]}`，数组顺序即 `ord`，201 + 整份列表 |
 | `/api/merge-groups/{id}` | DELETE | 删组（同一事务内重建派生表），204 |

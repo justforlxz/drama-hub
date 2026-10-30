@@ -1,9 +1,6 @@
 package web
 
 import (
-	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -20,19 +17,5 @@ func TestTestdataRelativePathWorks(t *testing.T) {
 	}
 	if string(got) != "marker\n" {
 		t.Errorf("marker 内容 = %q, 期望 %q", string(got), "marker\n")
-	}
-}
-
-// TestServer_UnimplementedSubtree 锁定占位语义：管理 API 整棵子树（含更深子路径）
-// 一律 501。healthz 属装配面已迁到 cmd，本包不重复覆盖。
-func TestServer_UnimplementedSubtree(t *testing.T) {
-	srv := NewServer(slog.New(slog.DiscardHandler))
-
-	for _, path := range []string{"/api/", "/api/x", "/api/x/y"} {
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
-		if rec.Code != http.StatusNotImplemented {
-			t.Errorf("GET %s 状态码 = %d, 期望 %d", path, rec.Code, http.StatusNotImplemented)
-		}
 	}
 }

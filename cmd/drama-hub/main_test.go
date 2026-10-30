@@ -14,8 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/provider"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
+	"github.com/justforlxz/drama-hub/internal/web"
 )
 
 // newTestHandler 与 main 用同一条装配路径：httptest 起真实 handler，不 mock 自己的
@@ -27,7 +29,15 @@ func newTestHandler(t *testing.T) http.Handler {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return newHandler(slog.New(slog.DiscardHandler), store.NewStore(db.DB), store.NewSettings(db.DB))
+	return newHandler(slog.New(slog.DiscardHandler), store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer())
+}
+
+// testSyncer 是管理 API 的数据源依赖。cmd 的测试不触发同步，只为满足装配参数；
+// BaseURL 指向本机 0 端口，即使误触发同步也只会立刻连接失败，不会打到真站。
+func testSyncer() web.SeriesSyncer {
+	src := provider.NewSource(nil, slog.New(slog.DiscardHandler))
+	src.BaseURL = "http://127.0.0.1:1"
+	return src
 }
 
 func serve(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
@@ -56,31 +66,46 @@ func TestHandler_Healthz(t *testing.T) {
 }
 
 // TestHandler_UnimplementedMounts 覆盖仍是占位的挂载点语义：
-// 任意方法、任意子路径都是 501（AC2/AC3/AC4/AC7）。
-// /dav/ 已在 M4 接上真实 WebDAV，其契约归 internal/webdav（含「无认证 → 401」）。
+// `/s/` 子树里未实现的路径任意方法都是 501。
+// /dav/ 已在 M4 接上真实 WebDAV（契约归 internal/webdav），`/` 在 R1 接上管理面
+// （契约归 internal/web，见 TestHandler_ManagementSurface）。
 func TestHandler_UnimplementedMounts(t *testing.T) {
-	cases := []struct{ method, path string }{
-		{http.MethodGet, "/s/x"},
-		{http.MethodGet, "/api/"},
-		{http.MethodGet, "/api/x"},
-		{http.MethodPost, "/api/x/y"},
-	}
 	h := newTestHandler(t)
-	for _, c := range cases {
-		rec := serve(t, h, c.method, c.path)
-		if rec.Code != http.StatusNotImplemented {
-			t.Errorf("%s %s 状态码 = %d, 期望 %d", c.method, c.path, rec.Code, http.StatusNotImplemented)
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		if rec := serve(t, h, method, "/s/x"); rec.Code != http.StatusNotImplemented {
+			t.Errorf("%s /s/x 状态码 = %d, 期望 %d", method, rec.Code, http.StatusNotImplemented)
 		}
 	}
 }
 
-// TestHandler_UnknownPathNotFound 锁定「未装配路径 → 404」（AC5/AC6）。
-// 一旦有人加了 "/" catch-all，这条会立刻变红。
-func TestHandler_UnknownPathNotFound(t *testing.T) {
-	for _, path := range []string{"/nope", "/"} {
-		rec := serve(t, newTestHandler(t), http.MethodGet, path)
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("GET %s 状态码 = %d, 期望 %d", path, rec.Code, http.StatusNotFound)
+// TestHandler_ManagementSurface 覆盖 R1 的装配面：管理面的三页与 `/api/` 都挂在
+// 装配根的 `/` 上（不是 404、不是 501），未登记路径仍由 web 的 mux 兜底 404。
+func TestHandler_ManagementSurface(t *testing.T) {
+	h := newTestHandler(t)
+	for _, path := range []string{"/", "/merges", "/status"} {
+		rec := serve(t, h, http.MethodGet, path)
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET %s 状态码 = %d, 期望 200（管理面没挂上）", path, rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+			t.Errorf("GET %s Content-Type = %q", path, ct)
+		}
+	}
+	// 管理 API 走真实端点：空库的剧目列表是 200 + 空数组（501 说明还是占位）。
+	rec := serve(t, h, http.MethodGet, "/api/dramas")
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET /api/dramas 状态码 = %d, 期望 200（501 说明管理 API 还是占位）", rec.Code)
+	}
+	var list struct {
+		Dramas []any `json:"dramas"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Errorf("GET /api/dramas 不是合法 JSON: %v", err)
+	}
+	// 未登记路径仍是 404。
+	for _, path := range []string{"/nope", "/api/nope"} {
+		if rec := serve(t, h, http.MethodGet, path); rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s 状态码 = %d, 期望 404", path, rec.Code)
 		}
 	}
 }
@@ -108,7 +133,7 @@ func TestHandler_LogsRequests(t *testing.T) {
 			}
 			defer func() { _ = db.Close() }()
 			h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
-				store.NewStore(db.DB), store.NewSettings(db.DB))
+				store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer())
 
 			rec := serve(t, h, http.MethodGet, c.path)
 			if rec.Code != c.wantCode {
@@ -180,7 +205,7 @@ func TestHandler_StreamEpisode(t *testing.T) {
 	}
 	uid := "e" + strconv.FormatInt(epID, 10)
 	token := stream.Sign([]byte(secret), uid)
-	h := newHandler(logger, st, settings)
+	h := newHandler(logger, st, settings, testSyncer())
 
 	rec := serve(t, h, http.MethodGet, "/s/"+token+"/e/"+uid)
 	if rec.Code != http.StatusOK {
@@ -240,7 +265,7 @@ func TestHandler_SegmentRoute(t *testing.T) {
 		t.Fatalf("Set stream_secret: %v", err)
 	}
 	buf := &bytes.Buffer{}
-	h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), st, settings)
+	h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), st, settings, testSyncer())
 
 	// 正确签名 + 库中不存在的集：走到 handler 后是 404，而不是 501 兜底。
 	uid := "e999"
@@ -324,7 +349,7 @@ func TestHandler_WebDAV(t *testing.T) {
 	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
 		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
-	h := newHandler(slog.New(slog.DiscardHandler), st, settings)
+	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer())
 
 	// 无认证 → 401（不是 501：说明 /dav/ 已接上真实 handler）。
 	if rec := serve(t, h, "PROPFIND", "/dav/"); rec.Code != http.StatusUnauthorized {
@@ -402,7 +427,7 @@ func TestHandler_MergedPlaylist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateMergeGroup: %v", err)
 	}
-	h := newHandler(slog.New(slog.DiscardHandler), st, settings)
+	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer())
 
 	uid := "m" + strconv.FormatInt(gid, 10)
 	token := stream.Sign([]byte(secret), uid)

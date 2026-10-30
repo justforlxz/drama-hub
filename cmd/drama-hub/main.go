@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/httpx"
+	"github.com/justforlxz/drama-hub/internal/provider"
 	"github.com/justforlxz/drama-hub/internal/segment"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
@@ -53,7 +54,7 @@ func main() {
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           newHandler(logger, store.NewStore(db.DB), store.NewSettings(db.DB)),
+		Handler:           newHandler(logger, store.NewStore(db.DB), store.NewSettings(db.DB), provider.NewSource(nil, logger)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -86,15 +87,19 @@ func main() {
 // newHandler 装配顶层路由。cmd 是唯一的装配根：路由表在这里一眼可见，
 // 领域包只提供自己的 handler，不关心挂载点。
 //
-// /healthz、/dav/（M4 只读 WebDAV）、/s/（M5 出流 + M6 分片 + M7 合并集）、/api/
-// 都已接上真实实现（/api/ 仍为占位 501，属 R1）。`/s/` 子树按 pattern 具体度分工：
-// 分片端点、playlist 端点比 `/s/` 更具体，其余落到 stream.Server 的 `/s/` 兜底
-// （单集出流或 501）。领域包之间互不 import（同 rank），跨包的签名/分派在装配根接上。
-// 不注册 "/" catch-all —— 未装配路径由 ServeMux 自然兜底 404，这是「未知路径 →
-// 404」的前提。
-// 请求日志中间件只在装配根挂一次：/healthz、/dav/、/s/、/api/（含 web 内部）
-// 与未知路径都经它，每请求恰一条访问日志（token 段掩码，见 internal/httpx）。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings) http.Handler {
+// /healthz、/dav/（M4 只读 WebDAV）、/s/（M5 出流 + M6 分片 + M7 合并集）与 `/`
+// （R1 管理面：三页界面 + `/api/` 管理 API）都已接上真实实现。`/s/` 子树按 pattern
+// 具体度分工：分片端点、playlist 端点比 `/s/` 更具体，其余落到 stream.Server 的
+// `/s/` 兜底（单集出流或 501）。领域包之间互不 import（同 rank），跨包的签名/分派
+// 在装配根接上。
+//
+// 管理面挂在 `/` 上：`internal/web` 自己按完整路径分派三页界面与 `/api/` 子树，
+// 未登记路径由它返回 404（「未知路径 → 404」的语义不变，只是兜底者从顶层 mux
+// 换成了 web 的 mux）。/dav/ 与 /s/ 的 pattern 比 `/` 更具体，不受影响。
+//
+// 请求日志中间件只在装配根挂一次：/healthz、/dav/、/s/、/ 与未知路径都经它，
+// 每请求恰一条访问日志（token 段掩码，见 internal/httpx）。
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer) http.Handler {
 	cutter := segment.NewCutter(st, settings, logger, stream.Verify)
 	streamSrv := stream.NewServer(st, settings, logger)
 
@@ -123,7 +128,7 @@ func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings) 
 	mux.Handle(segment.Route, cutter)
 	// `/s/` 兜底：未单独注册的 `/s/` 子路径仍是 501（「已规划未实现」的既有语义）。
 	mux.Handle("/s/", streamSrv)
-	mux.Handle("/api/", web.NewServer(logger))
+	mux.Handle("/", web.NewServer(st, settings, syncer, logger))
 	return httpx.RequestLogger(logger, mux)
 }
 

@@ -29,8 +29,15 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 | `/s/{token}/e/{uid}/master.m3u8` | GET | 200/404 | 合并集 playlist 的标准别名 |
 | `/s/{token}/seg/{uid}/{seq}.ts` | GET | 200/404/502/503 | 分片：现转封装 MPEG-TS（单集按片内序、合并集按跨集时间轴），索引未就绪 503 |
 | `/s/` 其余子路径 | 任意 | 501 | 已规划未实现 |
-| `/api/` 及全部子路径 | 任意 | 501 | 管理 API，后续接入 |
-| 其它路径（含 `/`） | 任意 | 404 | 未装配；管理界面属后续阶段 |
+| `/`、`/merges`、`/status` | GET | 200 | 管理界面三页：剧目 / 合并编排 / 同步与缓存看板 |
+| `/static/app.css`、`/static/app.js` | GET | 200 | 内嵌样式与脚本（随二进制，无构建步骤） |
+| `/api/dramas` | GET / POST | 200 / 201 | 剧目列表（含计数）/ 按上游剧 id 同步入库 |
+| `/api/dramas/{id}` | DELETE | 204 | 删剧目（级联删集、合并组、对外集号） |
+| `/api/dramas/{id}/episodes` | GET | 200 | 该剧全部集，供合并编排挑选 |
+| `/api/dramas/{id}/merge-groups` | GET / POST | 200 / 201 | 合并组列表 / 建组（`episode_ids` 顺序即时间轴顺序） |
+| `/api/merge-groups/{id}` | DELETE | 204 | 删组并重建对外集号 |
+| `/api/status` | GET | 200 | 同步计数、运行配置现状、缓存代理建议参数 |
+| 其它未登记路径 | 任意 | 404 | 由 web 的 mux 兜底 |
 
 出流 token 是 HMAC 常量签名（ADR-0003）：`token = base64url( HMAC-SHA256(secret,
 "stream:"+uid) )`，secret 取 `settings.stream_secret`。错误签名 → 401；uid 非法或
@@ -46,8 +53,28 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 合并集（`uid = m<group_id>`）是虚拟 HLS 分片聚合：strm 指向合并集时返回自造
 playlist（`#EXT-X-VERSION:4` + `#EXT-X-DISCONTINUITY` 在集边界），分片 URL 指回
 `/s/{token}/seg/{uid}/{seq}.ts`，seq 是跨集连续时间轴；切片按 `seq → (集号, 集内秒)`
-解析，`-output_ts_offset` 保证跨集时间戳连续。合并编排（N 集并 1）通过管理 API
-重建 `emby_item` 派生表（属 R1）。
+解析，`-output_ts_offset` 保证跨集时间戳连续。合并编排（N 集并 1）在管理界面
+`/merges` 里做，重建 `emby_item` 派生表。
+
+## 管理界面
+
+三页，纯 Go 模板 + 原生 JS，随二进制嵌入（没有 `package.json`、没有构建步骤）：
+
+| 页面 | 能干的事 |
+|---|---|
+| `/` 剧目 | 粘贴上游剧 id 或 `https://hongguoduanju.com/player/<id>` 链接同步入库；删剧目（连带集、合并组、对外集号） |
+| `/merges` 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即时间轴顺序）→ 删组；已入组的集不可重复选 |
+| `/status` 同步与缓存 | 剧目/集/可播/对外集/合并组计数与最近同步时间、运行配置现状（密钥只显示是否已设置）、缓存代理建议参数 |
+
+页面里的每个操作都直接落到上面的 `/api/` 端点，渲染结果与 API 返回一致。缓存面只做
+展示：视频缓存由缓存代理淘汰（ADR-0004），看板给出 `--vfs-cache-max-size 200G
+--vfs-cache-max-age 720h` 这份建议值，不参与本服务运行逻辑。
+
+```bash
+open http://127.0.0.1:8080/            # 剧目
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"series_id":"7503745441910017049"}' http://127.0.0.1:8080/api/dramas
+```
 
 ```bash
 curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}
@@ -98,6 +125,6 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
 
 ## 状态
 
-实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、合并编排与派生表重建齐备，待真机验收（P5）。
+实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、合并编排与派生表重建齐备。R1（管理界面三页）已实现：剧目增删、合并编排、同步与缓存看板都接真实 API。真机验收（P2–P5）待跑。
 
 设计基线见 MKACG-580 附件 `DESIGN-drama-hub.md`。

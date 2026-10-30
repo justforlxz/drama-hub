@@ -1,0 +1,41 @@
+{{define "content"}}
+<section class="block">
+  <div class="block-head">
+    <h1>合并编排</h1>
+    <p class="hint">选剧 → 按想要的播放顺序点集 → 建组。合并只重建对外集号（emby_item），原始剧集数据不动。</p>
+  </div>
+  <label class="field inline">
+    <span>剧目</span>
+    <select id="drama-select"></select>
+  </label>
+  <p class="notice" id="notice" role="status" aria-live="polite"></p>
+</section>
+
+<section class="block">
+  <h2>已有合并组</h2>
+  <div class="scroll">
+    <table class="grid">
+      <caption class="sr-only">合并组</caption>
+      <thead>
+        <tr><th>标签</th><th>成员顺序</th><th></th></tr>
+      </thead>
+      <tbody id="groups"></tbody>
+    </table>
+  </div>
+  <p class="empty" id="groups-empty" hidden>这部剧还没有合并组。</p>
+</section>
+
+<section class="block">
+  <h2>新建合并组</h2>
+  <p class="hint" id="editor-hint">先选一部剧。已在合并组里的集不可再选（合并组之间不重叠）。</p>
+  <div class="episodes" id="episodes"></div>
+  <div class="row-form">
+    <label class="field">
+      <span>标签（留空自动填「第 A-B 集」）</span>
+      <input id="group-label" autocomplete="off" placeholder="第 1-2 集">
+    </label>
+    <button type="button" class="btn primary" id="create-group" disabled>建组</button>
+  </div>
+  <p class="hint" id="selection-hint"></p>
+</section>
+{{end}}

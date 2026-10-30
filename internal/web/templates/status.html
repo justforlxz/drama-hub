@@ -1,0 +1,33 @@
+{{define "content"}}
+<section class="block">
+  <div class="block-head">
+    <h1>同步与缓存</h1>
+    <p class="hint">同步计数来自库内数据；视频缓存由缓存代理负责，本服务只给建议参数（ADR-0004），不实现淘汰。</p>
+  </div>
+  <p class="notice" id="notice" role="status" aria-live="polite"></p>
+  <dl class="stats" id="totals"></dl>
+</section>
+
+<section class="block">
+  <h2>运行配置</h2>
+  <div class="scroll">
+    <table class="grid">
+      <caption class="sr-only">运行配置</caption>
+      <thead><tr><th>项</th><th>值</th><th>说明</th></tr></thead>
+      <tbody id="config"></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="block">
+  <h2>缓存代理</h2>
+  <div class="scroll">
+    <table class="grid">
+      <caption class="sr-only">缓存代理</caption>
+      <thead><tr><th>项</th><th>值</th><th>说明</th></tr></thead>
+      <tbody id="cache"></tbody>
+    </table>
+  </div>
+  <p class="hint" id="cache-note"></p>
+</section>
+{{end}}

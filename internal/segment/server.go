@@ -12,9 +12,9 @@ import (
 )
 
 // ServeHTTP 实现分片端点。装配根（cmd）在顶层 mux 上注册 Route（比 `/s/`
-// 更具体），命中 `GET /s/{token}/seg/{uid}/{seq}.ts`。M6 只认单集 uid
-// （`e<episode.id>`，与 stream 的 uid 规则一致）；合并集 uid 与跨集 seq 空间
-// 由 M7 扩展（Timeline 已提供 seq → (集号, 集内秒) 映射）。
+// 更具体），命中 `GET /s/{token}/seg/{uid}/{seq}.ts`。uid 分两个空间：单集
+// `e<episode.id>`（本集片内序）与合并集 `m<merge_group.id>`（跨集连续 seq 空间，
+// 由 NewTimeline 回答 seq → (集号, 集内秒)）。
 func (c *Cutter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
 	uid := r.PathValue("uid")
@@ -33,6 +33,11 @@ func (c *Cutter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !c.verify([]byte(secret), uid, token) {
 		httpx.WriteError(w, httpx.ErrUnauthorized)
+		return
+	}
+
+	if IsMergedUID(uid) {
+		c.serveMergedSlice(w, r, uid, seq)
 		return
 	}
 
@@ -63,29 +68,65 @@ func (c *Cutter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(segs) == 0 {
 		// 索引未完成（ADR-0001）：503 + Retry-After，不出半截流。
-		w.Header().Set("Retry-After", "5")
-		httpx.WriteError(w, fmt.Errorf("剧集 %s 的分片索引未就绪: %w", uid, httpx.ErrUnavailable))
+		writeSliceError(w, fmt.Errorf("剧集 %s 的分片索引未就绪: %w", uid, httpx.ErrUnavailable))
 		return
 	}
 
-	// M6 的单集 seq 空间：按该集自己的分段索引解析；跨集 seq 空间由 M7 的
-	// 合并 uid + NewTimeline 提供，端点只认本集片内序。
+	// 单集的 seq 空间即本集片内序。
 	if seq >= len(segs) || seq < 0 {
 		httpx.WriteError(w, fmt.Errorf("剧集 %s 无分片 %d: %w", uid, seq, httpx.ErrNotFound))
 		return
 	}
 	seg := segs[seq]
+	c.serveCut(w, r, cutRequest{uid: uid, seq: seq, playURL: ep.PlayURL, start: seg.StartSec, dur: seg.Dur})
+}
 
+// serveMergedSlice 服务合并集分片：合并组 → 跨集时间轴 → seq 命中的 (集, 集内秒)。
+func (c *Cutter) serveMergedSlice(w http.ResponseWriter, r *http.Request, uid string, seq int) {
+	groupID, ok := parseMergedUID(uid)
+	if !ok {
+		httpx.WriteError(w, fmt.Errorf("uid %q 不是合并集句柄: %w", uid, httpx.ErrNotFound))
+		return
+	}
+	ep, start, dur, offset, ok, err := c.mergedCut(r.Context(), groupID, seq)
+	if err != nil {
+		writeSliceError(w, err)
+		return
+	}
+	if !ok {
+		httpx.WriteError(w, fmt.Errorf("合并集 %s 无分片 %d: %w", uid, seq, httpx.ErrNotFound))
+		return
+	}
+	if ep.PlayURL == "" {
+		httpx.WriteError(w, fmt.Errorf("剧集 %d 没有播放地址: %w", ep.ID, httpx.ErrUpstream))
+		return
+	}
+	c.serveCut(w, r, cutRequest{uid: uid, seq: seq, playURL: ep.PlayURL, start: start, dur: dur, offset: offset})
+}
+
+// cutRequest 是一次切片请求的全部参数（单集与合并集共用）。
+type cutRequest struct {
+	uid     string
+	seq     int
+	playURL string
+	start   float64 // 集内起点（秒）
+	dur     float64 // 片长（秒）
+	offset  float64 // 合并时间轴上的绝对起点（秒）；单集为 0
+}
+
+// serveCut 是单集与合并集共用的切片写出路径：过并发闸 → ffmpeg 现切 → 200 MPEG-TS。
+//
+// ffmpeg 失败 → 502，失败结果不落库、不缓存（本服务不落盘任何切片）。
+func (c *Cutter) serveCut(w http.ResponseWriter, r *http.Request, req cutRequest) {
 	if err := c.acquire(r.Context()); err != nil {
 		return // 客户端已断开：不写响应，只让请求结束
 	}
-	body, cutErr := cut(r.Context(), ep.PlayURL, seg.StartSec, seg.Dur)
+	body, cutErr := cut(r.Context(), req.playURL, req.start, req.dur, req.offset)
 	c.release()
 	if cutErr != nil {
-		// ffmpeg 失败 → 502；不缓存失败结果（本服务不落盘任何切片，失败即丢弃）。
 		c.logger.WarnContext(r.Context(), "segment slice failed",
-			"uid", uid, "seq", seq, "start_sec", seg.StartSec, "err", cutErr)
-		httpx.WriteError(w, fmt.Errorf("切片剧集 %s 分片 %d: %w", uid, seq, httpx.ErrUpstream))
+			"uid", req.uid, "seq", req.seq, "start_sec", req.start, "err", cutErr)
+		httpx.WriteError(w, fmt.Errorf("切片 %s 分片 %d: %w", req.uid, req.seq, httpx.ErrUpstream))
 		return
 	}
 

@@ -245,20 +245,28 @@ func probe(ctx context.Context, src string) (sourceInfo, error) {
 // cut 执行 ffmpeg：`-ss` 前置（输入寻址，切点已是关键帧所以不漂移）→ `-c copy`
 // → MPEG-TS 写到 stdout。返回完整字节；失败返回 httpx.ErrUpstream。
 //
+// offset 是该片在合并时间轴上的绝对起点（单集传 0）：非零时用 -output_ts_offset
+// 把该片的 PTS/DTS 平移到绝对位置，跨集的连续时间轴因此没有时间戳回退——否则
+// 每集从 0 重新计时，播放器会在集边界丢帧（实测 ffmpeg 会报 non-monotonically
+// increasing dts，虽不致命但会掉帧）。
+//
 // 字节全部收进内存再返回，调用方才能「先定状态码再写响应」：ffmpeg 中途失败时
 // 客户端看到的是干净的 502，不是半截流。单片 10s 约 2–5 MB（DESIGN §2）。
-func cut(ctx context.Context, src string, start, dur float64) ([]byte, error) {
+func cut(ctx context.Context, src string, start, dur, offset float64) ([]byte, error) {
 	dctx, cancel := context.WithTimeout(ctx, timeoutCut)
 	defer cancel()
-	cmd := exec.CommandContext(dctx, "ffmpeg",
+	args := []string{
 		"-v", "error",
 		"-ss", formatSeconds(start),
 		"-i", src,
 		"-t", formatSeconds(dur),
 		"-c", "copy",
-		"-f", "mpegts",
-		"pipe:1",
-	)
+	}
+	if offset > 0 {
+		args = append(args, "-output_ts_offset", formatSeconds(offset))
+	}
+	args = append(args, "-f", "mpegts", "pipe:1")
+	cmd := exec.CommandContext(dctx, "ffmpeg", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("ffmpeg 切片 %s: %w（%s）", safeHost(src), httpx.ErrUpstream, stderrTail(err, out))

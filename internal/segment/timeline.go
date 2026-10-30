@@ -23,6 +23,10 @@ type Slice struct {
 	EpNo      int
 	StartSec  float64
 	Dur       float64
+	// OffsetSec 是该分片在合并时间轴上的绝对起点（前一集总时长起累计）。
+	// 切片时传给 ffmpeg 的 -output_ts_offset，保证跨集 DTS 连续、播放器不
+	// 因时间戳回退而丢帧（EXT-X-DISCONTINUITY 之外的第二道保险）。
+	OffsetSec float64
 }
 
 // Timeline 是把若干集的分片按给定顺序拼成的合并时间轴。seq 从 0 起连续，
@@ -38,6 +42,7 @@ type Timeline struct {
 // 决定跳过整集还是 503（M7 编排粒度）。
 func NewTimeline(eps []EpisodeSegments) *Timeline {
 	t := &Timeline{}
+	var offset float64
 	for _, ep := range eps {
 		for _, seg := range ep.Segments {
 			t.slices = append(t.slices, Slice{
@@ -46,7 +51,9 @@ func NewTimeline(eps []EpisodeSegments) *Timeline {
 				EpNo:      ep.EpNo,
 				StartSec:  seg.StartSec,
 				Dur:       seg.Dur,
+				OffsetSec: offset,
 			})
+			offset += seg.Dur
 		}
 	}
 	return t

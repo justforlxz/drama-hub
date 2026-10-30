@@ -320,6 +320,10 @@ func TestHandler_WebDAV(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertEpisode: %v", err)
 	}
+	// vfs 树只认 emby_item 派生表（硬约束 6），等价于生产里同步完成后的重建。
+	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
+	}
 	h := newHandler(slog.New(slog.DiscardHandler), st, settings)
 
 	// 无认证 → 401（不是 501：说明 /dav/ 已接上真实 handler）。
@@ -348,12 +352,98 @@ func TestHandler_WebDAV(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET %s 状态码 = %d, 期望 200", path, rec.Code)
 	}
-	uid := strconv.FormatInt(epID, 10)
+	uid := "e" + strconv.FormatInt(epID, 10)
 	want := "/s/" + stream.Sign([]byte(secret), uid) + "/e/" + uid + "\n"
 	if rec.Body.String() != want {
 		t.Errorf("strm 内容 = %q, 期望 %q", rec.Body.String(), want)
 	}
 	if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(rec.Body.Len()) {
 		t.Errorf("Content-Length = %q, body 长度 = %d", cl, rec.Body.Len())
+	}
+}
+
+// TestHandler_MergedPlaylist 覆盖 M7 的装配面：合并集 uid 走自造 m3u8（不是单集
+// MP4 透传、也不是 501），playlist 里带 DISCONTINUITY，且分片 URL 指回分片端点。
+func TestHandler_MergedPlaylist(t *testing.T) {
+	ctx := context.Background()
+	const secret = "0123456789abcdef0123456789abcdef"
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "m7.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	if err := settings.Set(ctx, store.KeyStreamSecret, secret); err != nil {
+		t.Fatalf("Set stream_secret: %v", err)
+	}
+	dramaID, err := st.UpsertDrama(ctx, store.Drama{Provider: "web", ProviderID: "m7", Title: "合并剧", Year: 2026})
+	if err != nil {
+		t.Fatalf("UpsertDrama: %v", err)
+	}
+	var ids []int64
+	for i := 1; i <= 2; i++ {
+		id, err := st.UpsertEpisode(ctx, store.Episode{DramaID: dramaID, EpNo: i, Source: "web", Vid: "v"})
+		if err != nil {
+			t.Fatalf("UpsertEpisode: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	// 装配根不预置索引（那是索引任务的事），这里直接写两集各 2 片，让时间轴可用。
+	for _, id := range ids {
+		if err := st.ReplaceSegments(ctx, id, []store.Segment{
+			{EpisodeID: id, StartSec: 0, Dur: 4, Keyframe: true, Mode: "copy"},
+			{EpisodeID: id, StartSec: 4, Dur: 2, Keyframe: true, Mode: "copy"},
+		}); err != nil {
+			t.Fatalf("ReplaceSegments: %v", err)
+		}
+	}
+	gid, err := st.CreateMergeGroup(ctx, dramaID, "第1-2集", ids)
+	if err != nil {
+		t.Fatalf("CreateMergeGroup: %v", err)
+	}
+	h := newHandler(slog.New(slog.DiscardHandler), st, settings)
+
+	uid := "m" + strconv.FormatInt(gid, 10)
+	token := stream.Sign([]byte(secret), uid)
+
+	// 合并集 uid 在 `/s/{token}/e/{uid}` 上返回 playlist，不是 501、不是 MP4。
+	rec := serve(t, h, http.MethodGet, "/s/"+token+"/e/"+uid)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("合并集出流状态码 = %d, 期望 200（501 说明装配没接上）", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/vnd.apple.mpegurl" {
+		t.Errorf("Content-Type = %q, 期望 application/vnd.apple.mpegurl", ct)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "#EXT-X-DISCONTINUITY") {
+		t.Errorf("合并集 playlist 缺集边界 DISCONTINUITY：\n%s", body)
+	}
+	if !strings.Contains(body, "/s/"+token+"/seg/"+uid+"/0.ts") {
+		t.Errorf("playlist 分片 URL 未指回分片端点：\n%s", body)
+	}
+	if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(rec.Body.Len()) {
+		t.Errorf("Content-Length = %q, body = %d 字节", cl, rec.Body.Len())
+	}
+
+	// /master.m3u8 别名同样返回 playlist；单集 uid 走别名是 404。
+	rec = serve(t, h, http.MethodGet, "/s/"+token+"/e/"+uid+"/master.m3u8")
+	if rec.Code != http.StatusOK {
+		t.Errorf("master.m3u8 别名状态码 = %d, 期望 200", rec.Code)
+	}
+	singleUID := "e" + strconv.FormatInt(ids[0], 10)
+	singleTok := stream.Sign([]byte(secret), singleUID)
+	if rec = serve(t, h, http.MethodGet, "/s/"+singleTok+"/e/"+singleUID+"/master.m3u8"); rec.Code != http.StatusNotFound {
+		t.Errorf("单集 uid 请求 master.m3u8 状态码 = %d, 期望 404", rec.Code)
+	}
+
+	// 单集 uid 仍走 MP4 透传（不回归成 playlist）：play_url 为空 → 上游失败类别 502。
+	if rec = serve(t, h, http.MethodGet, "/s/"+singleTok+"/e/"+singleUID); rec.Code != http.StatusBadGateway {
+		t.Errorf("单集 uid 状态码 = %d, 期望 502（play_url 为空，说明仍走单集出流）", rec.Code)
+	}
+
+	// 坏签名的合并集请求 → 401（装配根注入的 stream.Verify 生效）。
+	if rec = serve(t, h, http.MethodGet, "/s/bogus/e/"+uid); rec.Code != http.StatusUnauthorized {
+		t.Errorf("坏签名合并集状态码 = %d, 期望 401", rec.Code)
 	}
 }

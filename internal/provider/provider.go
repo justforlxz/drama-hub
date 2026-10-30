@@ -96,6 +96,11 @@ func (s *Source) SyncSeries(ctx context.Context, st *store.Store, sid string) er
 				return fmt.Errorf("写入第 %d 集: %w", i+1, err)
 			}
 		}
+		// 同步完成是 emby_item 派生表的调用点之一（DEV-STANDARDS「数据库」）：剧与集
+		// 落库后立刻重建对外剧集视图，否则 vfs 树看不到任何集（硬约束 6 只认派生表）。
+		if _, err := tx.RebuildEmbyItems(ctx, dramaID); err != nil {
+			return fmt.Errorf("重建对外剧集 %s: %w", sid, err)
+		}
 		return nil
 	})
 }

@@ -86,21 +86,43 @@ func main() {
 // newHandler 装配顶层路由。cmd 是唯一的装配根：路由表在这里一眼可见，
 // 领域包只提供自己的 handler，不关心挂载点。
 //
-// /healthz、/dav/（M4 只读 WebDAV）、/s/（M5 出流 + M6 分片）都已接上真实实现；
-// /api/ 仍为占位 501（属 R1）。/s/ 子树里 stream.Server 占 `/s/` 前缀，segment.Cutter
-// 用比它更具体的 pattern 挂在同一子树（Go 的 ServeMux 取最具体者），两者互不 import
-// （同 rank）；合并集（M7）仍由 stream.Server 兜底 501。不注册 "/" catch-all ——
-// 未装配路径由 ServeMux 自然兜底 404，这是「未知路径 → 404」的前提。
-//
+// /healthz、/dav/（M4 只读 WebDAV）、/s/（M5 出流 + M6 分片 + M7 合并集）、/api/
+// 都已接上真实实现（/api/ 仍为占位 501，属 R1）。`/s/` 子树按 pattern 具体度分工：
+// 分片端点、playlist 端点比 `/s/` 更具体，其余落到 stream.Server 的 `/s/` 兜底
+// （单集出流或 501）。领域包之间互不 import（同 rank），跨包的签名/分派在装配根接上。
+// 不注册 "/" catch-all —— 未装配路径由 ServeMux 自然兜底 404，这是「未知路径 →
+// 404」的前提。
 // 请求日志中间件只在装配根挂一次：/healthz、/dav/、/s/、/api/（含 web 内部）
 // 与未知路径都经它，每请求恰一条访问日志（token 段掩码，见 internal/httpx）。
 func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings) http.Handler {
+	cutter := segment.NewCutter(st, settings, logger, stream.Verify)
+	streamSrv := stream.NewServer(st, settings, logger)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.Handle(webdav.MountPath, webdav.NewHandler(vfs.NewTree(st, settings, signToken), settings, logger))
-	mux.Handle("/s/", stream.NewServer(st, settings, logger))
+	// 出流首个 URL（DESIGN §5.2）：uid 是合并集句柄时返回自造 m3u8，否则走单集 MP4
+	// 透传。Go 的 pattern 不能在路径段内按前缀分派，所以在这里按 uid 分派（cmd 可
+	// import 全部 internal 包，两个领域包仍互不 import）。
+	mux.HandleFunc("GET /s/{token}/e/{uid}", func(w http.ResponseWriter, r *http.Request) {
+		if segment.IsMergedUID(r.PathValue("uid")) {
+			cutter.ServePlaylist(w, r)
+			return
+		}
+		streamSrv.ServeHTTP(w, r)
+	})
+	// 合并集 playlist 的标准别名（部分客户端会自行追加 /master.m3u8）。
+	mux.HandleFunc(segment.PlaylistRoute, func(w http.ResponseWriter, r *http.Request) {
+		if !segment.IsMergedUID(r.PathValue("uid")) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		cutter.ServePlaylist(w, r)
+	})
 	// 分片端点：签名校验用 stream.Verify 注入（segment 不能 import 同 rank 的 stream）。
-	mux.Handle(segment.Route, segment.NewCutter(st, settings, logger, stream.Verify))
+	mux.Handle(segment.Route, cutter)
+	// `/s/` 兜底：未单独注册的 `/s/` 子路径仍是 501（「已规划未实现」的既有语义）。
+	mux.Handle("/s/", streamSrv)
 	mux.Handle("/api/", web.NewServer(logger))
 	return httpx.RequestLogger(logger, mux)
 }

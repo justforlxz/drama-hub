@@ -70,6 +70,10 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 ## 配置
 
+> **2.0 新增 8 个 key**（`refresh_interval_sec`、`refresh_batch`、`refresh_timeout_sec`、
+> `cache_dir`、`cache_max_mb`、`cache_lru_days` 与 `plugin.<源>.*` 前缀），取值范围见
+> `docs/SCHEDULER-MODEL.md`「配置」与 `docs/CACHE-MODEL.md`「淘汰」。本表待实现时合并。
+
 运行时配置只有一张表 `settings(key TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT)`。
 
 启动引导只读环境变量三项：`DRAMA_HUB_DB`、`DRAMA_HUB_ADDR`、`DRAMA_HUB_LOG_LEVEL`。其余全部走 settings。
@@ -90,6 +94,11 @@ ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（�
 新增参数必须同 PR 更新上表，并在 `settings` 里给默认值 + 范围校验。写非法值返回 400，不静默纠正。
 
 ## 出流（stream）
+
+> **2.0 定稿已改这一章的口径，本节待实现时重写。** 以 `docs/PLAYBACK-CONTRACT.md`
+> 与 `docs/CACHE-MODEL.md` 为准（ADR-0007）：`/dav/` → `/webdav/`，出流统一为
+> `/video/{id}.m3u8` + `/video/{id}/{seq}.ts`，`/s/*` 退役，分片缓存归本服务。
+
 
 模块 `internal/stream` 与 `internal/segment`（合并集部分），装配在 `/s/` 前缀下：
 
@@ -195,6 +204,11 @@ secret 取 `settings.stream_secret`，**每请求读一次不缓存**（硬约�
 不为此引入全量缓冲（缓冲整集字节是错误设计）。
 
 ## 分片（segment）
+
+> **2.0 定稿已改这一章的口径，本节待实现时重写。** 以 `docs/PLAYBACK-CONTRACT.md`
+> 与 `docs/CACHE-MODEL.md` 为准（ADR-0007）：`/dav/` → `/webdav/`，出流统一为
+> `/video/{id}.m3u8` + `/video/{id}/{seq}.ts`，`/s/*` 退役，分片缓存归本服务。
+
 
 模块 `internal/segment`，装配在 `/s/` 子树下：`segment.Cutter` 用比 `/s/` 更具体的
 pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `<seq>.ts`
@@ -376,6 +390,11 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 `ListEmbyItems`）只属于 `List`，避免 Emby/rclone 逐个文件 GET 时把整库集表读一遍。
 
 ## WebDAV（internal/webdav）
+
+> **2.0 定稿已改这一章的口径，本节待实现时重写。** 以 `docs/PLAYBACK-CONTRACT.md`
+> 与 `docs/CACHE-MODEL.md` 为准（ADR-0007）：`/dav/` → `/webdav/`，出流统一为
+> `/video/{id}.m3u8` + `/video/{id}/{seq}.ts`，`/s/*` 退役，分片缓存归本服务。
+
 
 挂载点 `/dav/`（`webdav.MountPath`），只读。协议实现委托 `golang.org/x/net/webdav`，
 本包只提供两件事：`x/net/webdav.FileSystem` 适配（`fs.go`）与 Basic 认证（`handler.go`）。

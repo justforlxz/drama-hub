@@ -144,8 +144,9 @@ ffprobe -v error -show_entries format=duration  # duration=10.066667
 | SQLite 文件 | ≈ 6–9 GB | 每行含索引约 155–190 B |
 | WebDAV 每类目录子项 | 最大类 ≈ 21.6 万 | 800 样本里「爱情」占 35.5% |
 
-`/全部/` 目录就是 60 万个子目录。`x/net/webdav` 的 `walkFS` 对一次 `PROPFIND`
+`/全部/` 一级目录已按 lxz 2026-10-30 口径删除（`docs/DIRECTORY-CONTRACT.md` v2），
+但单个分类目录仍有约 21.6 万个子目录。`x/net/webdav` 的 `walkFS` 对一次 `PROPFIND`
 调用 `Readdir(0)` 把**全部**子项读进内存再逐个 `Stat`
-（`x/net/webdav@v0.62.0/webdav/file.go:787`），所以 60 万子项的目录不是「慢」而是
+（`x/net/webdav@v0.62.0/webdav/file.go:787`），所以 20 万级子项的目录不是「慢」而是
 「不可列举」。这是 `docs/DIRECTORY-CONTRACT.md` 里 **D2** 要 PL 拍板的唯一一件事，
 不阻塞 stage 2 / 3 / 5（S2/S3/S4/S5 的数据面与调度面与目录形状无关）。

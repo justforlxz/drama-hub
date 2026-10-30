@@ -21,6 +21,10 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 未实现的端点返回 **501 Not Implemented**（已规划未实现），不是 404；未装配的
 路径返回 404。
 
+> **2.0 变更中**：`/dav/` 改挂 `/webdav/`；出流统一为 `/video/{id}.m3u8` +
+> `/video/{id}/{seq}.ts`，`/s/*` 退役；`.strm` 里写的是 `/video/{id}.m3u8`。
+> 下表仍是 1.0 的形态，以 `docs/PLAYBACK-CONTRACT.md` 为准。
+
 | 端点 | 方法 | 状态 | 说明 |
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
@@ -125,10 +129,13 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
 - **2.0（框架 + 播放源插件化）设计定稿件**：
   - `docs/PLUGIN-CONTRACT.md` — 插件接口、错误语义、注册与配置
   - `docs/SCHEDULER-MODEL.md` — 刷新调度、并发、超时、失败隔离、手动触发
-  - `docs/DATA-MODEL.md` — 字段来源、`0002`/`0003` 迁移草案、增删改语义
-  - `docs/DIRECTORY-CONTRACT.md` — `/全部/` 与 `/<类型>/` 目录树、同名冲突、Emby 影响
+  - `docs/DATA-MODEL.md` — 字段来源、`0002`–`0004` 迁移草案、增删改语义
+  - `docs/DIRECTORY-CONTRACT.md` — `/<类型>/` 目录树、同名冲突、Emby 影响
+  - `docs/PLAYBACK-CONTRACT.md` — `/webdav` 与 `/video/{id}.m3u8`、`.strm` 形态
+  - `docs/CACHE-MODEL.md` — 海报与分片本地缓存、淘汰、并发
   - `docs/L1-CORPUS-SCOPE.md` — 「获取全部的剧集」口径与红果实测数字
   - `docs/adr/0006-framework-plugin-boundary.md` — 框架 / 插件边界决策
+  - `docs/adr/0007-own-hls-and-local-cache.md` — 播放统一走自造 HLS、缓存收回本服务
 
 ## 状态
 

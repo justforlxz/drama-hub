@@ -93,8 +93,52 @@ ALTER TABLE episode DROP COLUMN play_url_at;
   成功」无法从库里得知 —— 因此**直接删掉 `PlayableEpisodes` 字段与它在
   `internal/web/api_dramas.go` 的 `Playable` 输出**，管理面不再展示「可播集数」。
   理由：这个数字在当前实现里恒为 0（同步从不写 `play_url`），删列只是让它别再骗人。
-- `internal/segment`、`internal/stream`：它们已经不读 `play_url`（走 `FetchDirectURL`），
-  只需把取直链改为调 `plugin.Resolve`。
+- **`internal/segment` 与 `internal/stream` 直接读 `ep.PlayURL`**（`segment/server.go:59`、
+  `segment/server.go:100`、`segment/cutter.go:94`、`stream/server.go:110`），删列必然编译不过。
+  而它们读到的值在真实库上**恒为空**：同步从不写 `play_url`（`UpsertEpisode` 的调用方
+  一律传空），`provider.FetchDirectURL` 只有测试在调、没有任何生产接线。
+  因此 **1.0 的播放端点在真实库上恒返回 502「没有播放地址」**——播放链路是断的。
+  这也正是 ADR-0007 要把直链解析搬进 `/video` 的原因：解析必须在请求时发生在服务内，
+  而不是期望库里存着一个 URL。
+  改法：四处改为调用 `plugin.Resolve(ctx, ref, epNo)`，去掉对 `ep.PlayURL` 的依赖。
+
+### 0004：本地分片缓存的索引
+
+```sql
+-- 0004_segment_cache.sql
+
+-- 本地分片缓存（ADR-0007 把视频分片缓存从 rclone 收回本服务）。
+-- 复用 artifact 作为缓存索引：kind 增加 'segment'。
+-- SQLite 不支持修改 CHECK 约束，所以重建表并搬数据（artifact 无外键引用，安全）。
+CREATE TABLE artifact_new (
+    kind         TEXT    NOT NULL CHECK (kind IN ('cover','index','segment')),
+    key          TEXT    NOT NULL,
+    path         TEXT    NOT NULL,
+    bytes        INTEGER NOT NULL,
+    sha256       TEXT    NOT NULL DEFAULT '',
+    last_used_at TEXT    NOT NULL,
+    PRIMARY KEY (kind, key)
+);
+
+INSERT INTO artifact_new (kind, key, path, bytes, sha256, last_used_at)
+     SELECT kind, key, path, bytes, sha256, last_used_at FROM artifact;
+
+DROP TABLE artifact;
+ALTER TABLE artifact_new RENAME TO artifact;
+
+-- 淘汰：按 kind 取 last_used_at 最旧的一批（LRU 与过期都走这条索引）。
+CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
+```
+
+| 对象 | 用途 |
+|---|---|
+| `artifact(kind='segment')` | 分片缓存索引：`key = sha256(uid\x1fseq\x1fcodec_sig)`，`path` 是本地文件，`bytes` 供淘汰算总量，`last_used_at` 供 LRU 与过期 |
+| `artifact(kind='cover')` | 海报（已有；本次把「刷新时下载」接上） |
+| `artifact(kind='index')` | 关键帧索引（已有；改为按需建立） |
+| `idx_artifact_kind_last_used` | `WHERE kind=? ORDER BY last_used_at` 的淘汰查询；也覆盖按 `kind` 的计数/求和 |
+
+**缓存里也不存直链**：`key` 是内容哈希，`path` 是本地路径，两者都不含上游 URL。
+换成 `stream_secret` 或上游换链都不会在缓存索引里留下痕迹。
 
 ## 字段来源逐个定稿
 
@@ -145,9 +189,11 @@ ALTER TABLE episode DROP COLUMN play_url_at;
 
 ### 播放入口（直链不落库）
 
-- 库中**没有任何一列**保存直链（0003 删两列后）。
-- 请求路径：`stream/segment` → 框架 → `plugin.Resolve(ref, epNo)` → `Stream.URL` → 字节中继。
-- 失败语义：`ErrNoStream` / `ErrNotFound` → **502，不写库、不缓存坏值**。
+- 库中**没有任何一列**保存直链（0003 删两列后），缓存索引里也没有（见 0004）。
+- 请求路径：`/video/{id}.m3u8` → 读 `segment` 表出 playlist；`/video/{id}/{seq}.ts`
+  → 查本地分片缓存 → 未命中则 `plugin.Resolve` 取直链、ffmpeg 切片、落缓存、回字节。
+  详见 `docs/PLAYBACK-CONTRACT.md` 与 `docs/CACHE-MODEL.md`。
+- 失败语义：`ErrNoStream` / `ErrNotFound` → **502，不写库、不写缓存**。
 - 红果实况：只有第 1 集有直链且是 10 秒预览，第 2..N 集 `ErrNoStream`，
   第 4 集起 `ErrNotFound`。这是源侧事实，不是本服务缺陷。
 
@@ -179,13 +225,13 @@ ALTER TABLE episode DROP COLUMN play_url_at;
 
 ## 0002 的 dry-run 验证（已跑过）
 
-验证方式：把本文上面两个 `sql` 代码块**原样抽出来**（不是手抄），放进仓库副本的
+验证方式：把本文上面三个 `sql` 代码块**原样抽出来**（不是手抄），放进仓库副本的
 `internal/store/migrations/`，用**仓库自己的迁移 runner**（`store.Open` → `migrate`）跑：
 
 ```sh
-# 从本文抽出两个 SQL 块 → 0002 / 0003
-python3 -c 'import re,io;s=io.open("docs/DATA-MODEL.md",encoding="utf-8").read();b=re.findall(r"```sql\n(.*?)```",s,re.S);io.open("/tmp/d/0002_add_genre_and_source_state.sql","w").write(b[0]);io.open("/tmp/d/0003_drop_play_url.sql","w").write(b[1])'
-cp /tmp/d/000{2,3}_*.sql <repo-copy>/internal/store/migrations/
+# 从本文抽出三个 SQL 块 → 0002 / 0003 / 0004（顺序即它们在文中出现的顺序）
+python3 -c 'import re,io,pathlib;s=io.open("docs/DATA-MODEL.md",encoding="utf-8").read();n=["0002_add_genre_and_source_state.sql","0003_drop_play_url.sql","0004_segment_cache.sql"];[pathlib.Path("/tmp/d",a).write_text(b,encoding="utf-8") for a,b in zip(n,re.findall(r"```sql\n(.*?)```",s,re.S))]'
+cp /tmp/d/0002_*.sql /tmp/d/0003_*.sql /tmp/d/0004_*.sql <repo-copy>/internal/store/migrations/
 cd <repo-copy> && go test ./internal/store/ -run TestS1 -v
 ```
 
@@ -195,15 +241,18 @@ cd <repo-copy> && go test ./internal/store/ -run TestS1 -v
 结果：
 
 ```
-首次 applied=3                       # 空库 → 最新（0001+0002+0003）
+首次 applied=4                       # 空库 → 最新（0001+0002+0003+0004）
 二次 applied=0                       # 重复执行幂等
-user_version=3                       # 两次打开后都停在 3
+user_version=4                       # 两次打开后都停在 4
 play_url 已移除: no such column: play_url
-索引 idx_drama_genre_title / idx_drama_title 均存在
+索引 idx_drama_genre_title / idx_drama_title / idx_artifact_kind_last_used 均存在
 默认值 genre="" tags="[]"
+artifact 允许 kind='segment'；CHECK 拒绝未知 kind
+重建前插入的 cover/index 两行在重建后仍在（逐字段相同，总行数 2）
 迁移 0001 0001_init.sql    (3806 bytes)
 迁移 0002 ...              (1590 bytes)
 迁移 0003 ...              (275 bytes)
+迁移 0004 ...              (996 bytes)
 ```
 
 三条要写清楚的幂等边界：
@@ -213,7 +262,7 @@ play_url 已移除: no such column: play_url
 2. **裸重复执行 SQL 不幂等**，且这是 SQLite 的语义决定的：`ADD COLUMN` /
    `DROP COLUMN` 重复执行必然报错。不许为此写成「先查 `pragma_table_info` 再决定」
    的动态 SQL —— 那会让迁移文件变成不可 review 的脚本。
-3. **迁移文件名必须从 0001 连续递增**（`migrate.go` 强制），所以 0002、0003 之间
+3. **迁移文件名必须从 0001 连续递增**（`migrate.go` 强制），所以 0002–0004 之间
    不能留空号；如果 S5 决定把删列提前，编号整体前移，内容不变。
 
 ## 对现有代码的影响清单（给 S5 的输入，不是本文的实现）

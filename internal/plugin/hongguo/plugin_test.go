@@ -33,7 +33,7 @@ type route struct {
 	body   string
 }
 
-// setRoutes 按路径逐条应答；未登记的路径返回 404（模拟上游的真实兜底）。
+// setRoutes 按 RequestURI（含 query）逐条应答；未登记的返回 404（模拟上游的真实兜底）。
 func (f *fakeSite) setRoutes(routes map[string]route) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -57,11 +57,14 @@ func newFakeSite(t *testing.T, status int, body string) (*fakeSite, *httptest.Se
 	f := &fakeSite{}
 	f.setReply(status, body)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 记录 RequestURI 而不是 Path：目录发现要按 ?page=N 区分 /category 的每一页，
+		// 路径相同而页码不同，只记 Path 就断言不出「按页推进」。
+		uri := r.URL.RequestURI()
 		f.mu.Lock()
-		f.paths = append(f.paths, r.URL.Path)
+		f.paths = append(f.paths, uri)
 		respond := f.respond
 		f.mu.Unlock()
-		st, b := respond(r.URL.Path)
+		st, b := respond(uri)
 		w.WriteHeader(st)
 		_, _ = io.WriteString(w, b)
 	}))
@@ -219,27 +222,6 @@ func TestHealth(t *testing.T) {
 	}
 }
 
-// Enumerate 在 S5（MKACG-607）落地前返回明确的未实现错误，不返回空 Page：
-// 空 Page 的语义是「源里一个作品都没有」，会把没实现伪装成源侧事实。
-func TestEnumeratePending(t *testing.T) {
-	_, srv := newFakeSite(t, http.StatusOK, "")
-	p := newTestPlugin(t, srv)
-
-	page, err := p.Enumerate(context.Background(), nil)
-	if err == nil {
-		t.Fatal("Enumerate 应当报告未实现，而不是返回空页")
-	}
-	if len(page.Refs) != 0 || page.Next != nil {
-		t.Fatalf("page = %+v, 期望零值", page)
-	}
-	for _, sentinel := range []error{plugin.ErrUpstream, plugin.ErrRejected, plugin.ErrSchema,
-		plugin.ErrNotFound, plugin.ErrNoStream} {
-		if errors.Is(err, sentinel) {
-			t.Fatalf("未实现错误不该冒充哨兵 %v（框架会当成源故障）", sentinel)
-		}
-	}
-}
-
 // 契约错误语义表的「触发条件」逐行落到哨兵上：一行一个子测试。
 //
 // 这张表是 S2 的验收对象（docs/PLUGIN-CONTRACT.md「错误语义」）：
@@ -277,6 +259,14 @@ func TestSentinelMapping(t *testing.T) {
 			sentinel: plugin.ErrRejected,
 			name:     "403 风控",
 			routes:   map[string]route{detailPath: {http.StatusForbidden, "forbidden"}},
+			call:     workCall,
+		},
+		{
+			// 444 是上游丢连接（限流），不是「这集不可播」也不是「这个作品不存在」：
+			// 实测全量灌库约 1 万次 /player 后源侧开始全量回 444（判据见 statusDropped 注释）。
+			sentinel: plugin.ErrRejected,
+			name:     "444 限流丢连接",
+			routes:   map[string]route{detailPath: {statusDropped, ""}},
 			call:     workCall,
 		},
 		{

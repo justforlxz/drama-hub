@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+来源：https://hongguoduanju.com/sitemap/hongguoduanju/index.xml（2026-10-30 匿名抓取，3,967 字节）
+裁剪：29 个 <sitemap> 只留前 2 个（index1.xml / index2.xml），XML 声明、命名空间、<lastmod> 原样保留。
+改造：loc 的主机名仍是真实域名——测试里把 DefaultBaseURL 换成假站点地址后再喂给插件，
+      这样「索引给绝对 URL、插件照 loc 取文件」这条真实行为在离线（无外网）测试下也能测。
+覆盖：Enumerate 的子 sitemap 顺序、游标「第几份」的编码与续跑。
+-->
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><sitemap><loc>https://hongguoduanju.com/sitemap/hongguoduanju/index1.xml</loc><lastmod>2026-10-30T03:17:35+08:00</lastmod></sitemap><sitemap><loc>https://hongguoduanju.com/sitemap/hongguoduanju/index2.xml</loc><lastmod>2026-10-30T03:17:35+08:00</lastmod></sitemap></sitemapindex>

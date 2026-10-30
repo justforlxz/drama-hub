@@ -320,22 +320,28 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 |---|---|---|
 | `Work(ctx, ref)` | `GET {BaseURL}/player/{id}` | 1（剧目元数据 + 全部集） |
 | `Resolve(ctx, ref, epNo)` | `GET /player/{id}` → `GET /player/{id}/{vid}` | 2 |
-| `Enumerate(ctx, cur)` | 目录索引（sitemap 与 `/category` 并集） | S5（MKACG-607）落地 |
+| `Enumerate(ctx, cur)` | 目录索引：`index.xml` + 29 份子 sitemap + `seo-important.xml` + `/category` 34 页 | 64（每份子 sitemap 前重取一次 4 KB 索引）= 30s 级 |
 
 `Resolve` 是 2 个请求：契约入参只有集号，集号 → 源侧集标识（`vid`）只能从详情页取，
 而插件不许保存状态；要压到 1 个必须改接口（把源侧集标识传进来）。`docs/PLUGIN-CONTRACT.md`
 能力矩阵写的「红果：1 个请求 / 集」与 `Resolve` 签名不自洽，实现按签名走。
-`Enumerate` 在 S5 之前返回「未实现」错误，**不返回空 Page**（空 Page 的意思是
-「源里一个作品都没有」，会把没实现伪装成源侧事实；框架按未知错误记录，状态页可见）。
+`Enumerate` 一页 = 一份上游文档（子 sitemap 整份返回，43,556 个 loc 一次读完），
+三段串行：子 sitemap（29）→ `seo-important.xml` → `/category` 第 1..34 页。并集才是全集：
+只用 sitemap 漏最新 53 部，只用 `/category` 只剩 800 部（`docs/L1-CORPUS-SCOPE.md`）。
+游标 `v1:<段>:<位置>` 只记「哪一段、第几份/第几页」，可从任意游标续跑；认不出的游标按
+`ErrSchema` 打回（静默从头开始会把「游标坏了」伪装成「枚举走完了」）。
 
 - `BaseURL` 默认 `https://hongguoduanju.com`，配置键 `plugin.web.base_url`（空 = 用它）。
   它是唯一为测试开的缝（`--network=none` 下指向 `httptest.Server`）。`*http.Client`
   由装配根按 `plugin.web.request_timeout_sec` 构造（默认 30s）。
-- 响应体经 `io.LimitReader` 读，上限 4 MiB；超限按 `ErrSchema`（页面异常放大，不是可重试的传输错误）。
+- 响应体经 `io.LimitReader` 读，两档上限：页面（列表页 / 集页 / `/category`）4 MiB，sitemap 8 MiB
+  （实测子 sitemap 每份 5,242,7xx 字节）；超限按 `ErrSchema`（页面异常放大，不是可重试的传输错误）。
 - 解析：`_ROUTER_DATA` 后的 JSON 用标准库 `json.Decoder` 从 `{` 起解（不手写括号扫描）；JSON-LD 用 `regexp` 取出 `<script type="application/ld+json">` 块后按 `@type` 过滤。
 - 校验（任一不满足即 `ErrSchema`）：`isSuccess` 不为 `false`；页面的 `series_id` 与 `seriesDetail.series_id` 都等于请求 id（被锁集会被上游 302 到别的集/别的剧页面）；`vid_list` 非空、元素全为数字、无重复。JSON-LD 块另做绑定校验：`url` 的 pathname 是 `/player/{id}` 或 `/player/{id}/{vid}`，且 `contentUrl` 的 pathname 含 `/{vid}`。
 - `vid_list` 下标即集号（`ep_no = i+1`）；`episode.vid` = `vid_list[i]`。
-- 哨兵映射（插件 HTTP 层，框架只用 `errors.Is` 判定）：429 / 403 → `ErrRejected`；
+- 哨兵映射（插件 HTTP 层，框架只用 `errors.Is` 判定）：429 / 403 / 444 → `ErrRejected`
+  （444 = 上游丢连接；实测累计约 1 万次 `/player` 后源侧全量回 444，属限流，见
+  `docs/L1-CORPUS-SCOPE.md`「取证 F」）；
   404 → `ErrNotFound`（集页 404 由 `Resolve` 翻成 `ErrNoStream`，见契约错误语义表）；
   其余非 2xx / 传输失败 / 读体失败 / 空响应 → `ErrUpstream`；结构不符 → `ErrSchema`；
   `VideoObject` 在但 `contentUrl` 缺 → `ErrNoStream`。`ctx` 被取消 / 超时直接返回 ctx 错误，

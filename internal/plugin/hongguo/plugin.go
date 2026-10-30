@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -35,9 +36,22 @@ const (
 	// plugin.web.request_timeout_sec = 30（docs/PLUGIN-CONTRACT.md「配置」），
 	// 装配根按配置构造 client；这里是它的同一份默认值。
 	defaultTimeout = 30 * time.Second
-	// maxBodyBytes 是单次响应体读取上限：实测列表页约 213 KB，4 MiB 足够且能挡住
-	// 上游异常放大 / 无限流。超限按 ErrSchema（页面异常放大不是可重试故障）。
+	// maxBodyBytes 是单次响应体读取上限：实测列表页 / 集页约 213 KB，`/category`
+	// 一页约 281 KB，4 MiB 足够且能挡住上游异常放大 / 无限流。超限按 ErrSchema
+	// （页面异常放大不是可重试故障）。
 	maxBodyBytes = 4 << 20
+	// maxSitemapBytes 是 sitemap 的读取上限。子 sitemap 不是「一页」：实测 29 份
+	// 每份都是 5,242,7xx 字节（整份 43,556 个 loc），比页面大一个数量级。
+	// 给它单独一个上限，而不是把页面闸放宽到 8 MiB —— 页面闸是对「上游异常放大」
+	// 的判据，不该为了 sitemap 放弃。
+	maxSitemapBytes = 8 << 20
+	// statusDropped 是上游把连接直接丢掉时 nginx 返回的 444（无响应体、约 50 ms
+	// 就回）。实测 2026-10-30 全量灌库跑到约 1 万次 /player 请求后，源侧开始对
+	// /player 全量回 444（sitemap 与 /category 仍是 200），4 个 worker 在 17 分钟里
+	// 打出了 98,190 次 444 —— 这是限流/风控，不是「这个作品不存在」，按
+	// ErrRejected 处理让框架立刻中止本轮（docs/PLUGIN-CONTRACT.md 错误语义表
+	// 「429、403、风控页」那一行），而不是继续以 90 req/s 打上游。
+	statusDropped = 444
 )
 
 // Config 是构造期注入的不可变配置。
@@ -78,21 +92,6 @@ func New(cfg Config) *Plugin {
 
 // Name 实现 plugin.Plugin。
 func (p *Plugin) Name() string { return Name }
-
-// errEnumeratePending 表示目录发现尚未实现。
-//
-// 刻意不返回空 Page：空 Page 的语义是「源里一个作品都没有」，会把「没实现」伪装成
-// 源侧事实。分页枚举（sitemap 与 /category 并集）归 S5 / MKACG-607；在它落地之前，
-// 框架按「未知错误」处理（当作 ErrUpstream 并记 unknown_error），状态页看得见。
-var errEnumeratePending = errors.New("hongguo: 目录发现尚未实现（S5 / MKACG-607）")
-
-// Enumerate 实现 plugin.Plugin，但目录发现属 S5（MKACG-607）：本阶段只落契约与注册。
-func (p *Plugin) Enumerate(ctx context.Context, _ *plugin.Cursor) (plugin.Page, error) {
-	if err := ctx.Err(); err != nil {
-		return plugin.Page{}, err
-	}
-	return plugin.Page{}, errEnumeratePending
-}
 
 // Work 实现 plugin.Plugin：一个 GET /player/{id} 同时给出剧目元数据与全部集。
 //
@@ -186,57 +185,93 @@ func (p *Plugin) Health(ctx context.Context) error {
 	return err
 }
 
-// get 发一次 GET 并读回响应体，把结果映射成契约哨兵：
+// get 发一次 GET（相对 BaseURL 的路径）并读回响应体：页面级上限 maxBodyBytes。
 //
-//	429 / 403        → ErrRejected（可重试，需退避）
+// 错误映射与日志见 fetch。目录发现的 sitemap 走 getSitemap（上限更大），
+// 因为它一份就是 5 MiB 的 XML，不是「一页」。
+func (p *Plugin) get(ctx context.Context, path string) ([]byte, error) {
+	return p.fetch(ctx, path, p.absolute(path), maxBodyBytes)
+}
+
+// getSitemap 读一份 sitemap（索引或子 sitemap）：上限 maxSitemapBytes。
+//
+// loc 用上游索引给的地址（可以是绝对 URL，跨 origin 也照读——loc 是源侧对文件
+// 位置的声明）；相对地址按 BaseURL 补齐，测试用假站点时不必编造域名。
+func (p *Plugin) getSitemap(ctx context.Context, loc string) ([]byte, error) {
+	raw := p.absolute(loc)
+	return p.fetch(ctx, pathOf(raw), raw, maxSitemapBytes)
+}
+
+// absolute 把上游给的地址规整成可请求的绝对 URL：已是绝对地址就原样返回，
+// 否则拼在 BaseURL 之后。
+func (p *Plugin) absolute(loc string) string {
+	if strings.HasPrefix(loc, "http://") || strings.HasPrefix(loc, "https://") {
+		return loc
+	}
+	return strings.TrimRight(p.baseURL, "/") + "/" + strings.TrimLeft(loc, "/")
+}
+
+// pathOf 取出 URL 的路径部分（无 query），只用于日志与错误文本：
+// 错误里不得出现完整直链，而 sitemap 的 loc 是带主机名的绝对地址。
+func pathOf(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Path != "" {
+		return u.Path
+	}
+	return raw
+}
+
+// fetch 发一次 GET 并读回响应体，把结果映射成契约哨兵：
+//
+//	429 / 403 / 444  → ErrRejected（可重试，需退避）
 //	404              → ErrNotFound
 //	其余非 2xx、传输错误、读体失败、空响应 → ErrUpstream
-//	响应体超 maxBodyBytes                  → ErrSchema
+//	响应体超 limit                        → ErrSchema
 //
 // ctx 被取消 / 超时（用户点了取消）直接返回 ctx 的错误，不冒充源故障。
 // slog 一条出站记录（源 / 对象 / 状态 / 字节数），不记直链内容。
-func (p *Plugin) get(ctx context.Context, path string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(p.baseURL, "/")+path, nil)
+func (p *Plugin) fetch(ctx context.Context, logPath, rawURL string, limit int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 构造请求 %s: %v", plugin.ErrUpstream, path, err)
+		return nil, fmt.Errorf("%w: 构造请求 %s: %v", plugin.ErrUpstream, logPath, err)
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		p.logger.WarnContext(ctx, "上游请求失败", "plugin", Name, "path", path, "upstream_status", 0, "bytes", 0)
-		return nil, fmt.Errorf("%w: GET %s: %v", plugin.ErrUpstream, path, err)
+		p.logger.WarnContext(ctx, "上游请求失败", "plugin", Name, "path", logPath, "upstream_status", 0, "bytes", 0)
+		return nil, fmt.Errorf("%w: GET %s: %v", plugin.ErrUpstream, logPath, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	level := slog.LevelInfo
 	if readErr != nil || resp.StatusCode != http.StatusOK {
 		level = slog.LevelWarn
 	}
 	p.logger.Log(ctx, level, "上游请求",
-		"plugin", Name, "path", path, "upstream_status", resp.StatusCode, "bytes", len(body))
+		"plugin", Name, "path", logPath, "upstream_status", resp.StatusCode, "bytes", len(body))
 
 	if readErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("%w: 读取 %s 响应体: %v", plugin.ErrUpstream, path, readErr)
+		return nil, fmt.Errorf("%w: 读取 %s 响应体: %v", plugin.ErrUpstream, logPath, readErr)
 	}
 	switch {
-	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden:
-		return nil, fmt.Errorf("%w: GET %s 返回 %d", plugin.ErrRejected, path, resp.StatusCode)
+	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden ||
+		resp.StatusCode == statusDropped:
+		return nil, fmt.Errorf("%w: GET %s 返回 %d", plugin.ErrRejected, logPath, resp.StatusCode)
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("%w: GET %s 返回 404", plugin.ErrNotFound, path)
+		return nil, fmt.Errorf("%w: GET %s 返回 404", plugin.ErrNotFound, logPath)
 	case resp.StatusCode != http.StatusOK:
-		return nil, fmt.Errorf("%w: GET %s 返回 %d", plugin.ErrUpstream, path, resp.StatusCode)
+		return nil, fmt.Errorf("%w: GET %s 返回 %d", plugin.ErrUpstream, logPath, resp.StatusCode)
 	}
 	if len(body) == 0 {
-		return nil, fmt.Errorf("%w: GET %s 返回空响应体", plugin.ErrUpstream, path)
+		return nil, fmt.Errorf("%w: GET %s 返回空响应体", plugin.ErrUpstream, logPath)
 	}
-	if len(body) > maxBodyBytes {
-		return nil, fmt.Errorf("%w: GET %s 响应体超过 %d 字节", plugin.ErrSchema, path, maxBodyBytes)
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("%w: GET %s 响应体超过 %d 字节", plugin.ErrSchema, logPath, limit)
 	}
 	return body, nil
 }

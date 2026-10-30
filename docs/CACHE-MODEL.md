@@ -105,12 +105,14 @@ playlist 是 `segment` 表的**纯函数**（`segment.BuildPlaylist`）：一次
 GET /video/{id}/{seq}.ts
   → 解析 id（HMAC 校验）
   → 查 artifact(kind='segment', key=sha256(键))    1 次主键查询
-  → 命中：打开文件，http.ServeContent（Range 由它处理），异步更新 last_used_at
+  → 命中：打开文件，http.ServeContent（Range 由它处理），touch last_used_at
   → 未命中：single-flight 生成 → 落缓存 → 回字节
   → 生成失败：502，不写缓存
 ```
 
-`last_used_at` 的更新**异步且可丢**：丢一次只会让这条更早被淘汰，不影响正确性。
+`last_used_at` 的更新**可丢**：写失败只让这条更早被淘汰，不影响正确性，因此命中
+路径不因 touch 失败而失败。S7 的实现是同步一次 `UPDATE`（命中路径一次主键写，量级
+可忽略），换来的好处是命中即生效、不用等后台任务。
 
 ## 与 WebDAV 的关系
 

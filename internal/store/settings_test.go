@@ -243,7 +243,7 @@ func TestUnknownKey(t *testing.T) {
 	s := NewSettings(db)
 	ctx := context.Background()
 
-	const bogus SettingKey = "cache_max_mb"
+	const bogus SettingKey = "cache_max_gb"
 
 	if err := s.Set(ctx, bogus, "1"); !errors.Is(err, ErrUnknownSetting) {
 		t.Errorf("Set(未知 key) 错误 = %v, 期望 ErrUnknownSetting", err)
@@ -543,6 +543,50 @@ func TestRefreshBatchBounds(t *testing.T) {
 	for _, raw := range []string{"-1", "10001"} {
 		if err := s.Set(ctx, KeyRefreshBatch, raw); !errors.Is(err, ErrInvalidSetting) {
 			t.Errorf("Set(refresh_batch, %s) = %v, 期望 ErrInvalidSetting", raw, err)
+		}
+	}
+}
+
+// 缓存淘汰两项的默认值与范围（docs/CACHE-MODEL.md「淘汰」）：
+// cache_max_mb 0–1048576（0 = 不按大小淘汰），cache_lru_days 1–365。
+func TestCacheSettingDefaultsAndBounds(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	for key, want := range map[SettingKey]int{
+		KeyCacheMaxMB:   8192,
+		KeyCacheLRUDays: 30,
+	} {
+		got, err := s.Int(ctx, key)
+		if err != nil {
+			t.Fatalf("Int(%s): %v", key, err)
+		}
+		if got != want {
+			t.Errorf("Int(%s) = %d, 期望默认 %d", key, got, want)
+		}
+	}
+
+	for _, raw := range []string{"0", "1048576"} {
+		if err := s.Set(ctx, KeyCacheMaxMB, raw); err != nil {
+			t.Errorf("Set(cache_max_mb, %s) = %v, 期望通过（闭区间端点）", raw, err)
+		}
+	}
+	for _, raw := range []string{"1", "365"} {
+		if err := s.Set(ctx, KeyCacheLRUDays, raw); err != nil {
+			t.Errorf("Set(cache_lru_days, %s) = %v, 期望通过（闭区间端点）", raw, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		key SettingKey
+		raw string
+	}{
+		{KeyCacheMaxMB, "-1"}, {KeyCacheMaxMB, "1048577"},
+		{KeyCacheLRUDays, "0"}, {KeyCacheLRUDays, "366"},
+	} {
+		if err := s.Set(ctx, tc.key, tc.raw); !errors.Is(err, ErrInvalidSetting) {
+			t.Errorf("Set(%s, %s) = %v, 期望 ErrInvalidSetting", tc.key, tc.raw, err)
 		}
 	}
 }

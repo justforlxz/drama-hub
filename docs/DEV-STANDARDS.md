@@ -70,18 +70,19 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 ## 配置
 
-> **2.0 还有 2 个全局 key 未实现**（`cache_max_mb`、`cache_lru_days`），归 S7
-> （MKACG-611），范围见 `docs/CACHE-MODEL.md`「淘汰」。刷新调度的三项
-> （`refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec`）与
-> `plugin.<源>.refresh_interval_sec` 已随 S4（MKACG-606）落地，范围见
-> `docs/SCHEDULER-MODEL.md`「配置」。`cache_dir` 已随 S3（MKACG-608）落地
-> （海报本地化的落盘根目录）。
+> 2.0 的全局 key 已全部落地：`cache_dir` 随 S3（MKACG-608），`cache_max_mb` /
+> `cache_lru_days` 随 S7（MKACG-611，范围见 `docs/CACHE-MODEL.md`「淘汰」），刷新
+> 调度的三项（`refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec`）与
+> `plugin.<源>.refresh_interval_sec` 随 S4（MKACG-606，范围见
+> `docs/SCHEDULER-MODEL.md`「配置」）。
 >
-> **生效方式分两类**：`plugin.<源>.enabled` 与 `refresh_interval_sec`（全局与源级覆盖）
-> 热读——调度器每次醒来重读 settings，改完最多 60 秒按新值算，不需要重启、也不需要
-> 任何通知机制；`plugin.<源>.base_url` 与 `plugin.<源>.request_timeout_sec` 是构造期
-> 注入的不可变配置（`*http.Client` 的 Timeout 在这里定型，见
-> `docs/PLUGIN-CONTRACT.md` 硬性要求 2），改后需重启。
+> **生效方式分两类**：`plugin.<源>.enabled`、`refresh_interval_sec`（全局与源级覆盖）
+> 与三个缓存项（`cache_dir` / `cache_max_mb` / `cache_lru_days`）热读——调度器每次醒来
+> 重读 settings（改完最多 60 秒按新值算），缓存每次读写现读 `cache_dir`、每轮淘汰现读
+> 上限与天数（淘汰循环每 5 分钟一轮），都不需要重启、也不需要任何通知机制；
+> `plugin.<源>.base_url` 与 `plugin.<源>.request_timeout_sec` 是构造期注入的不可变配置
+> （`*http.Client` 的 Timeout 在这里定型，见 `docs/PLUGIN-CONTRACT.md` 硬性要求 2），
+> 改后需重启。
 
 运行时配置只有一张表 `settings(key TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT)`。
 
@@ -95,7 +96,9 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 | `seg_prefetch` | `2` | 0–10 | 预取分片数 |
 | `pin_days` | `7` | 0–90 | 最近 N 天播放过的合并集整集预取 |
 | `webdav_user` / `webdav_pass` | 必填 | — | WebDAV Basic 认证 |
-| `cache_dir` | `./data/cache` | 非空路径 | 本地缓存根目录：海报落 `<cache_dir>/cover/<hash 前 2 位>/<hash>.<ext>`（`docs/CACHE-MODEL.md`） |
+| `cache_dir` | `./data/cache` | 非空路径 | 本地缓存根目录：海报 `cover/`、分片 `seg/`、索引 `index/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`） |
+| `cache_max_mb` | `8192` | 0–1048576 | 分片缓存上限（MB）；`0` = 不按大小淘汰 |
+| `cache_lru_days` | `30` | 1–365 | 超过 N 天未命中的缓存条目（三种 kind 都算）删除 |
 | `plugin.<源>.enabled` | `true` | — | 该源是否参与刷新调度（缺失按 `true`，内置源默认启用） |
 | `plugin.<源>.base_url` | `""` | URL 或空 | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
 | `plugin.<源>.request_timeout_sec` | `30` | 5–300 | 单次出站请求超时 |
@@ -111,8 +114,9 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 写接口，所以非法值目前只能由代码侧（`Settings.Set`）拒绝，没有 HTTP 400 的入口；
 写接口属后续阶段。
 
-`cache_max_mb` / `cache_lru_days` 尚未实现：淘汰归 S7（MKACG-611），在它落地前
-本服务不做任何缓存淘汰（ADR-0007 已把缓存收回本服务，淘汰随 S7 一起实现）。
+缓存淘汰由本服务自己执行（ADR-0007）：`internal/cache` 的淘汰循环每 5 分钟一轮，
+先按 `cache_lru_days` 删过期，再按 `cache_max_mb` 删最久未用的分片（`docs/CACHE-MODEL.md`
+「淘汰」）。淘汰间隔是固定值，不做成可调项。
 ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（见 `internal/segment` 的闸注释）。
 
 新增参数必须同 PR 更新上表，并在 `settings` 里给默认值 + 范围校验。写非法值返回 400，不静默纠正。

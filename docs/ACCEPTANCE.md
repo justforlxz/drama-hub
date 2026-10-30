@@ -9,10 +9,19 @@
 
 ## P2（虚拟 WebDAV + NFO）
 
-- [ ] `rclone lsf --max-depth 3 dramahub:/` 输出三级目录：剧 → Season 01 → strm/nfo
+- [ ] 挂载点是 `/webdav`（`rclone config create dramahub webdav url http://127.0.0.1:8080/webdav vendor other`）
+- [ ] `rclone lsf --max-depth 5 dramahub:/` 输出五级：分类 → 分片 → 剧 → Season 01 → strm/nfo
+- [ ] 顶层只有分类目录（没有 `全部/`），分类数等于库里的 `SELECT DISTINCT genre`
+- [ ] `rclone lsf --max-depth 2 dramahub:/<分类>` 只给出分片目录：`00`–`7f` 全部 128 个
+      （空分片是空目录，列它不产生查询）
 - [ ] `rclone size dramahub:/` 不报错（读不到长度会在这里暴露）
-- [ ] `rclone cat dramahub:/短剧/<剧>/Season 01/<集>.strm` 输出一行 URL 且前缀是配置的 `strm_prefix`
+- [ ] `rclone cat "dramahub:/<分类>/<分片>/<剧名> (<年份>)/Season 01/<集>.strm"` 输出一行
+      `{strm_prefix}/video/{id}.m3u8`
 - [ ] Emby 扫描后：剧名、年份、封面、集号连续（无跳号）、nfo 标题是「第 N 集」或「第 A-B 集」
+- [ ] Emby 库配法（两种都支持，先试第一种）：
+      1. 一个「剧集」库，媒体文件夹 = DAV 根（`/mnt/dramahub`），Emby 逐层往下扫；
+      2. 若 Emby 在 DAV 根上把分类当成剧，退一步把具体分类目录（`/webdav/爱情` 等，
+         真实词表 68 个）逐个加成媒体文件夹。
 
 ## P3（单集出流）
 

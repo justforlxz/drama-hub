@@ -11,9 +11,6 @@ import (
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
-// dramaDirA 是 fixture 里剧 A 的目录名（独立于被测代码拼出）。
-const dramaDirA = "短剧/" + titleA + " (2024)"
-
 // singleItem 独立构造单集派生行（与 store 的 uid 规则一致：`e<episode.id>`）。
 func singleItem(ep store.Episode) store.EmbyItem {
 	return store.EmbyItem{
@@ -24,20 +21,23 @@ func singleItem(ep store.Episode) store.EmbyItem {
 
 // strmPath / nfoPath 是 fixture 里剧 A 某集的两条渲染路径（独立于被测代码拼出）。
 func (f fixture) strmPath(ep store.Episode) string {
-	return dramaDirA + "/Season 01/" + embyBase(store.Drama{Title: titleA}, singleItem(ep)) + ".strm"
+	return f.dirA + "/" + seasonDir + "/" + embyBase(store.Drama{Title: titleA}, singleItem(ep)) + ".strm"
 }
 
 func (f fixture) nfoPath(ep store.Episode) string {
-	return dramaDirA + "/Season 01/" + embyBase(store.Drama{Title: titleA}, singleItem(ep)) + ".nfo"
+	return f.dirA + "/" + seasonDir + "/" + embyBase(store.Drama{Title: titleA}, singleItem(ep)) + ".nfo"
 }
 
-// AC3：strm 内容 = {prefix}/s/{token}/e/{uid}\n，单行、尾换行；两个前缀用例。
+// uidFor 是外部集在 strm 里的 uid 段：e<episode.id>。
+func uidFor(ep store.Episode) string { return "e" + strconv.FormatInt(ep.ID, 10) }
+
+// AC3：strm 内容 = {prefix}/video/{id}.m3u8\n，单行、尾换行；两个前缀用例。
 func TestRenderStrm(t *testing.T) {
 	tests := []struct {
 		name   string
 		prefix string
 	}{
-		{name: "带前缀", prefix: "https://proxy.example/dav"},
+		{name: "带前缀", prefix: "https://proxy.example:8080"},
 		{name: "空前缀", prefix: ""},
 	}
 	for _, tt := range tests {
@@ -51,8 +51,8 @@ func TestRenderStrm(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Render(%s): %v", path, err)
 				}
-				uid := "e" + strconv.FormatInt(ep.ID, 10)
-				want := tt.prefix + "/s/" + stubToken(testSecret, uid) + "/e/" + uid + "\n"
+				uid := uidFor(ep)
+				want := tt.prefix + "/video/" + stubID(testSecret, uid) + ".m3u8\n"
 				if string(body) != want {
 					t.Errorf("strm 内容 = %q, 期望 %q", body, want)
 				}
@@ -115,7 +115,7 @@ func TestRenderEpisodeNFO(t *testing.T) {
 // AC5：剧 NFO 解析后 title/year/plot 正确（含 XML 转义的 & 与 <>）。
 func TestRenderShowNFO(t *testing.T) {
 	f := seed(t, "")
-	body, err := f.tree.Render(context.Background(), dramaDirA+"/tvshow.nfo")
+	body, err := f.tree.Render(context.Background(), f.dirA+"/tvshow.nfo")
 	if err != nil {
 		t.Fatalf("Render tvshow.nfo: %v", err)
 	}
@@ -140,19 +140,15 @@ func TestRenderShowNFO(t *testing.T) {
 
 // AC6：List 列出的每个文件都能渲染，且返回字节数 = 独立构造的期望字节数（>0）。
 //
-// strm 用前缀 + uid 独立拼出期望；nfo 用「解析后重新序列化」独立重建整段字节，
+// strm 用前缀 + id 独立拼出期望；nfo 用「解析后重新序列化」独立重建整段字节，
 // 长度与内容都必须逐字节相等 —— 没有任何「先返回 0 再补」的中间态。
 func TestRenderLengthEqualsBytes(t *testing.T) {
-	const prefix = "https://proxy.example/dav"
+	const prefix = "https://proxy.example:8080"
 	f := seed(t, prefix)
 	ctx := context.Background()
 
-	nodes, err := f.tree.List(ctx)
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
 	files := 0
-	for _, n := range nodes {
+	for _, n := range f.walk(t) {
 		if n.IsDir {
 			continue
 		}
@@ -170,7 +166,7 @@ func TestRenderLengthEqualsBytes(t *testing.T) {
 		switch {
 		case len(n.Path) > len(".strm") && n.Path[len(n.Path)-len(".strm"):] == ".strm":
 			uid := uidForPath(t, n.Path, f)
-			want = []byte(prefix + "/s/" + stubToken(testSecret, uid) + "/e/" + uid + "\n")
+			want = []byte(prefix + "/video/" + stubID(testSecret, uid) + ".m3u8\n")
 		default:
 			want = rebuildNFO(t, body)
 		}
@@ -190,7 +186,7 @@ func uidForPath(t *testing.T, path string, f fixture) string {
 	t.Helper()
 	for _, ep := range []store.Episode{f.epA1, f.epA2} {
 		if path == f.strmPath(ep) {
-			return "e" + strconv.FormatInt(ep.ID, 10)
+			return uidFor(ep)
 		}
 	}
 	t.Fatalf("路径 %s 不在 fixture 里", path)
@@ -263,8 +259,8 @@ func TestRenderStrmReadsSettingsLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("改后 Render: %v", err)
 	}
-	uid := "e" + strconv.FormatInt(f.epA1.ID, 10)
-	if want := "https://changed.example/s/" + stubToken(testSecret, uid) + "/e/" + uid + "\n"; string(body) != want {
+	uid := uidFor(f.epA1)
+	if want := "https://changed.example/video/" + stubID(testSecret, uid) + ".m3u8\n"; string(body) != want {
 		t.Errorf("改前缀后 strm = %q, 期望 %q", body, want)
 	}
 }
@@ -278,5 +274,52 @@ func TestRenderStrmMissingSecret(t *testing.T) {
 	}
 	if body != nil {
 		t.Errorf("缺密钥时返回了 %d 字节", len(body))
+	}
+}
+
+// AC：标题被 sanitize 过的剧（目录名与 title 原文不同）仍能按目录名定位并渲染
+// ——点查 idx_drama_title 不中时退到分片内比对，不是 404。
+func TestRenderSanitizedDramaDir(t *testing.T) {
+	f := seed(t, "")
+	body, err := f.tree.Render(context.Background(), f.dirB+"/tvshow.nfo")
+	if err != nil {
+		t.Fatalf("Render(剧 B tvshow.nfo): %v", err)
+	}
+	var got showNFO
+	if err := xml.Unmarshal(body, &got); err != nil {
+		t.Fatalf("解析剧 NFO: %v\n%s", err, body)
+	}
+	if got.Title != titleB {
+		t.Errorf("title = %q, 期望 %q（sanitize 只作用于目录名，不改 NFO）", got.Title, titleB)
+	}
+}
+
+// AC：同名冲突的两部剧各自按带后缀的目录名定位，渲染出各自的 tvshow.nfo。
+func TestRenderConflictSuffixDirs(t *testing.T) {
+	f := seed(t, "")
+	ctx := context.Background()
+	shard := shardOf("dup-0")
+	ids := providerIDsWithShard(shard, "web", 2)
+	dirs := make([]string, 0, 2)
+	for i, id := range ids {
+		f.addDrama(t, store.Drama{
+			Provider: "web", ProviderID: id, Title: "同名剧", Year: 2026,
+			Genre: genreA, Plot: "第" + strconv.Itoa(i) + "部",
+		})
+		dirs = append(dirs, dramaDirPath(genreA, id, "同名剧 (2026) [web-"+id+"]"))
+	}
+
+	for i, dir := range dirs {
+		body, err := f.tree.Render(ctx, dir+"/tvshow.nfo")
+		if err != nil {
+			t.Fatalf("Render(%s/tvshow.nfo): %v", dir, err)
+		}
+		var got showNFO
+		if err := xml.Unmarshal(body, &got); err != nil {
+			t.Fatalf("解析剧 NFO: %v\n%s", err, body)
+		}
+		if want := "第" + strconv.Itoa(i) + "部"; got.Plot != want {
+			t.Errorf("%s 渲染到别的剧：plot = %q, 期望 %q", dir, got.Plot, want)
+		}
 	}
 }

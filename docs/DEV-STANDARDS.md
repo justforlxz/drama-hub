@@ -421,42 +421,101 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 ## 虚拟文件树与渲染（internal/vfs）
 
 树与文件内容全部按请求渲染，不落盘（AGENTS.md 硬约束 1）。`vfs.Tree` 只有两个入口：
-`List(ctx)` 枚举全部目录与文件节点，`Render(ctx, path)` 返回文件的完整字节。
+`List(ctx, dir)` 列某个目录的直接子项、`Render(ctx, path)` 返回文件的完整字节。
+形状、命名与冲突规则的真值是 `docs/DIRECTORY-CONTRACT.md`，本节写实现口径。
 
 ### 目录与命名（纯函数，`tree.go`）
 
 ```
-短剧/
-└── <剧名> (<年份>)/
-    ├── tvshow.nfo
-    └── Season 01/
-        ├── <剧名> - S01E01 - <标签>.strm
-        └── <剧名> - S01E01 - <标签>.nfo
+短剧/                                  ← vfs 根（DAV 挂载点根映射到它，DAV 路径里没有这一段）
+└── <分类>/                            ← drama.genre；缺失落兜底名「其他」
+    └── <分片>/                        ← fnv32a(provider_id) % 128 的两位十六进制（00–7f）
+        └── <剧名> (<年份>)/
+            ├── tvshow.nfo
+            └── Season 01/
+                ├── <剧名> - S01E01 - <标签>.strm
+                └── <剧名> - S01E01 - <标签>.nfo
 ```
 
+- 顶层只有分类目录，没有 `全部/`：一部剧只出现在它自己那一个分类下。
+- 分片是纯函数（用 `provider_id` 而非标题，剧改名、重扫都不换分片），只为把每个目录的
+  子项数摊到 PROPFIND 能列出来的量级。`N = store.ShardCount`（128）是代码常量，
+  不是 schema：改 N 只是重算 `drama.shard` 这一列的数据（`TestShardRecountKeepsSchema`）。
+- 兜底名「其他」同时覆盖 `genre` 为空与上游真的叫「其他」两种取值，它们并进同一目录。
+- 同名冲突（同一个分片目录内基准名重复）：所有冲突成员改用
+  `<基准名> [<provider>-<provider_id>]`，后缀是 `provider_id` 原文、不截断；不冲突的
+  成员保持基准名。
 - 剧目录 `<剧名> (<年份>)`：年份来自 `drama.year`；`year=0` 显式写成 `(<0>)`，不省略。
-- 季目录恒为 `Season 01`（`emby_item.season` 恒为 1，1.0 单季）。
+- 季目录恒为 `Season 01`（`emby_item.season` 恒为 1）。
 - 集号 `S%02dE%02d`：**对外集号取 `emby_item.ep_no`**（硬约束 6），不是 `episode.ep_no`。
 - `<标签>` = `embyLabel`：单集取源集标题、空则 `第<对外集号>集`；**合并集取
   `第 A-B 集`**（A/B 是组内最小/最大源集号，A==B 时退化为 `第 A 集`）。
 - 目录名与文件名里的 `/ \ : * ? " < > |` 一律替换为 `_`（Windows + WebDAV 非法字符集）。
-- 路径以 `/` 分隔、相对 vfs 根、无前导 `/`；WebDAV 的绝对路径由 `internal/webdav` 映射。
+- 路径以 `/` 分隔、相对 vfs 根、无前导 `/`；`""` 与 `短剧` 都表示根。
 
 **数据源是 `emby_item` 派生表**（`store.ListEmbyItems`），不是 `episode`：一个合并组
 在树里只产出 1 条文件对，Emby 因此显示为 1 集、对外集号连续（硬约束 6）。合并调整
 只重建派生表，`drama` / `episode` 原始数据不动。
+
+### 列举成本（一个目录一次查询）
+
+`List(ctx, dir)` 只返回**一层**直接子项，每次常数条 SQL，与全库规模无关：
+
+| `dir` | 子项 | 查询 |
+|---|---|---|
+| `""`（根） | 分类目录 | 1 次 `SELECT DISTINCT genre`（覆盖索引全扫，唯一 O(行数) 的一条） |
+| `<分类>` | 分片目录 `00`–`7f` | 1–2 次 genre 存在性点查（`GenreExists`），分片集合是代码常量、不查库 |
+| `<分类>/<分片>` | 剧目录 | 1–2 次 genre 存在性点查 + 1 次 `WHERE genre IN (…) AND shard = ? ORDER BY title` |
+| `<剧目录>` | `tvshow.nfo` + `Season 01` | 1 次剧目点查（目录名被 sanitize 时再加 1–2 次 genre 存在性点查） |
+| `<剧目录>/Season 01` | 集文件对 | 同上 + 1 次 `ListEmbyItems` |
+
+两类查询都走索引（`idx_drama_genre_shard_title` / `idx_drama_title`），由
+`internal/store` 的 `TestDirectoryQueryPlans` 用 `EXPLAIN QUERY PLAN` 钉住。
+**不存在「枚举整棵树」的路径**：旧实现每次请求 1 次 `ListDramas` + 每剧 1 次
+`ListEmbyItems`，在 L1 规模（60 万部 × 46.8 集）下不可能完成。
+
+两个实现选择（契约允许、此处留档）：
+
+- **分片目录恒回 `00`–`7f` 全部 128 个**（契约原文「分类目录 1 次 `DISTINCT shard`
+  （或直接回 `00`–`7f`）」取了后者）。`DISTINCT shard` 要扫该分类的全部索引行
+  （183k 行约 20–40ms，随分类规模线性增长），而分片集合本来就是
+  `store.ShardCount`；空分片列出来是空目录，列它不发生查询。
+- **分类目录名解析只用存在性点查**（`GenreExists`，`SELECT EXISTS(SELECT 1 … WHERE genre = ?)`，
+  O(log n)）：目录名 → genre 取值集合是纯映射（`其他` → `{"", "其他"}`，其余就是目录名
+  本身），不需要把行集取回来。不要换成 `SELECT DISTINCT genre` 再过滤（整条覆盖索引
+  全扫，60 万行约 74ms），也不要换成 `DISTINCT genre WHERE genre IN (…)`（仍要扫该分类
+  的全部索引行，183k 行约 44ms）。根目录是唯一必须拿到全部分类的地方，所以只有它付
+  这一次全扫。
+- 这条口径由 `internal/vfs` 的 `TestListDoesNotScanAllGenres` 用**数 store 方法调用**
+  的方式钉住（不是数 SQL 文本）：根目录 1 次 `ListGenres`，其余层 0 次。SQL 文本测试
+  抓不住「点查写了但没接线」——上一轮 Review 就是这么抓到的。
+
+含路径分隔符的分类名（上游脏 `tags[0]`，如 `剧情/古装`）按契约「分类名不做转义」
+处理，不被转义，但它无法成为一个路径段：强行拼进根目录会产出跨段节点，
+`x/net/webdav` 的 `walkFS` 给它 `Stat` 时失败并中止，整份 `multistatus` 被截断
+（客户端拿到非法 XML，整个挂载点不可解析）。因此 `listGenres` **跳过**这类分类并记
+一条 `warn`——父目录列举始终可解析，代价是该分类下的剧在挂载点里不可见（直到上游
+把标签改干净）。要不要改成「目录名也过 `sanitizeName`」（无损，但改命名口径）需 PL 裁定。
+
+剧目录名 → 剧目：先按 `WHERE title = ? AND year = ?`（`idx_drama_title`）点查，带冲突
+后缀的形态按 `WHERE provider = ? AND provider_id = ?` 点查；命中后**仍比对「分类 + 分片 +
+目录名」**，不一致即 `ErrNotFound`（防止其他分片/分类的同名剧被渲染到本路径下）。
+标题含 `/ : * ?` 等字符时目录名是 sanitize 过的、点查必然不中，此时退到「本分片内比对」
+（`WHERE genre IN (…) AND shard = ?`，索引区间查询，不是全表扫）。
+
 ### strm 形态
 
 一行 URL + 尾 `\n`，前缀取 `settings.strm_prefix`：
 
 ```
-{strm_prefix}/s/{token}/e/{uid}
+{strm_prefix}/video/{id}.m3u8
 ```
 
-- `uid` 取 `emby_item.uid`：单集 `e<episode.id>`、合并集 `m<merge_group.id>`（M7，
-  与 stream / segment 的 uid 规则一致；派生表是唯一真值，硬约束 6）。
-- `token` 由装配根注入的 `vfs.TokenFunc(secret, uid string) string` 计算，签名算法是
-  `internal/stream` 的 ADR-0003 HMAC —— vfs（rank 30）不 import stream（rank 40）。
+- `id = uid + "-" + hex(HMAC-SHA256(stream_secret, uid))[:12]`（`stream.ID`），
+  `uid` 取 `emby_item.uid`：单集 `e<episode.id>`、合并集 `m<merge_group.id>`。
+  **单集与合并集没有区别**，对外统一是 HLS 播放列表（`docs/PLAYBACK-CONTRACT.md`）。
+- 签名算法在 `internal/stream`（rank 40），vfs（rank 30）不 import 它：装配根注入
+  `vfs.IDFunc`。`/video` 端点本身属 S8（MKACG-612）。
 - `strm_prefix` 与 `stream_secret` 每次渲染现读，改值即时生效（硬约束 5）。
 
 ### NFO 形态
@@ -477,29 +536,50 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 `internal/webdav` 的 `PROPFIND getcontentlength` 与 `internal/stream` 的 `Content-Length`
 都取这个值（硬约束 3）。
 
-### 查询成本
-`Render` 是**常数次查询**、与全库规模无关：按目录名 `ListDramas` 匹配单部剧（1 次），
-集级文件再取该剧的 `ListEmbyItems`（1 次，内部一次 `IN` 查询取单集源集、每组一次成员
-查询）；`.strm` 另加两次现读设置。全树遍历（1 次 `ListDramas` + 每剧 1 次
-`ListEmbyItems`）只属于 `List`，避免 Emby/rclone 逐个文件 GET 时把整库集表读一遍。
-
 ## WebDAV（internal/webdav）
 
-> **2.0 定稿已改这一章的口径，本节待实现时重写。** 以 `docs/PLAYBACK-CONTRACT.md`
-> 与 `docs/CACHE-MODEL.md` 为准（ADR-0007）：`/dav/` → `/webdav/`，出流统一为
-> `/video/{id}.m3u8` + `/video/{id}/{seq}.ts`，`/s/*` 退役，分片缓存归本服务。
-
-
-挂载点 `/dav/`（`webdav.MountPath`），只读。协议实现委托 `golang.org/x/net/webdav`，
+挂载点 `/webdav/`（`webdav.MountPath`），只读。协议实现委托 `golang.org/x/net/webdav`，
 本包只提供两件事：`x/net/webdav.FileSystem` 适配（`fs.go`）与 Basic 认证（`handler.go`）。
+路径与目录形状见 `docs/DIRECTORY-CONTRACT.md`。
 
 ### 路径映射
 
-**DAV 根 = vfs 根目录**：`/` → `短剧`，`/剧名 (2024)/…` → `短剧/剧名 (2024)/…`。
-根目录名从 `vfs.List` 现取（唯一不带 `/` 的目录节点），不在本包复制字面量。
+**DAV 根 = vfs 根目录**（`vfs.Root`）：`/` → `短剧`，`/爱情/0a/剧名 (2024)/…` →
+`短剧/爱情/0a/剧名 (2024)/…`。DAV 路径里没有 `短剧` 这一段，根目录名来自 `vfs.Root`，
+不在本包复制字面量。
 
-因此 `rclone lsf --max-depth 3 dramahub:/` 的第一级就是剧目录（`docs/ACCEPTANCE.md` P2）：
-Emby 库路径 `rclone mount dramahub:/ /mnt/dramahub` → `/mnt/dramahub`。
+因此 `rclone lsf --max-depth 5 dramahub:/` 的层级是 分类 → 分片 → 剧 → Season 01 →
+strm/nfo（`docs/ACCEPTANCE.md` P2）：Emby 库路径 `rclone mount dramahub:/ /mnt/dramahub`
+→ `/mnt/dramahub`（一个「剧集」库，库根 `=` DAV 根）。
+
+### 定位一个节点 = 列一次父目录
+
+`Stat` / `OpenFile` 不枚举整棵树：把 DAV 路径拆成「父目录 + 末段」，调一次
+`vfs.List(ctx, 父目录)`，再按末段匹配（快照里的 `listing.byName` 是「末段 → 节点」
+索引，一层列举不会退化成 O(子项数²) 次比较）。因此一次 `Stat` 的成本是**一层列举**，
+与库规模无关。
+
+目录不存在时 `vfs.ErrNotFound` 被翻译成 `*fs.PathError{Err: fs.ErrNotExist}`：
+**必须是 `*fs.PathError`**，因为协议层用 `os.IsNotExist` 分流，普通
+`fmt.Errorf("%w")` 包装它认不出来，`PROPFIND` 会落到
+`405 Method Not Allowed` 而不是 404。
+
+### 目录打开是惰性的
+
+`OpenFile` 打开一个目录时**不列子项**，`Readdir` 第一次调用才查。原因在协议层：
+`x/net/webdav` 处理 `Depth: 1` 时会对**每个子项**再 `OpenFile` 一次（`prop.go`
+的 `propnames`），惰性化之前「列举一层」因此变成「列举 N 层 + 渲染孙级文件」——
+608k 部库实测 `/剧情` 13.30s、`/剧情/05` 858ms；惰性化之后同样的请求是
+`List=2 / Render=0`。当前 `PROPFIND` 的查询次数由
+`TestPropfindDepth1_QueryCountIndependentOfSize` 在 200 部与 12,000 部两种规模上
+钉住（次数必须相同，且不渲染任何孙级文件）。
+
+### 请求内快照
+
+`x/net/webdav` 处理一个 `PROPFIND` 会对同一份数据反复调用 `Stat` / `OpenFile`（父目录一次、
+每个子项再各一次）。逐次查库会让一次目录列举变成 O(目录项数) 次查询，因此一次请求内把
+**已列过的目录**（键是目录，不是整棵树）与渲染结果挂在请求 ctx 上（`snapshot`），每请求
+每层各算一次。**不跨请求**：没有 TTL、没有失效逻辑，数据改了下一个请求即见（硬约束 5 同理）。
 
 ### 长度
 
@@ -517,35 +597,34 @@ Basic，凭据取 `settings.webdav_user` / `webdav_pass`，**每请求现读**�
 `Mkdir` / `RemoveAll` / `Rename` 与任何带写意图的 `OpenFile` 一律失败
 （`PUT`/`DELETE`/`MKCOL` → `405`）。锁定用 `x/net/webdav.MemLS`（协议层要求，不落盘）。
 
-### 请求内快照
-
-`x/net/webdav` 处理一个 `PROPFIND` 会对同一份数据反复调用 `Stat` / `OpenFile`（父目录一次、
-每个子项再各一次）。逐次 `List` 会让一次目录列举变成 O(目录项数) 次全树查询，因此一次
-请求内把 `List` 结果与渲染结果挂在请求 ctx 上（`snapshot`），每请求各算一次。**不跨请求**：
-没有 TTL、没有失效逻辑，数据改了下一个请求即见（硬约束 5 同理）。
-
 ### 已知边界
 
 - 修改时间恒为零值（`entry.ModTime`）：库里没有可靠的 mtime，`sync_at` / `play_url_at`
   是采集时间。零值让 ETag 稳定在「内容长度」上，`http.ServeContent` 也不写 `Last-Modified`。
-- 不做封面 `poster.jpg`（属 artifact 缓存，单独任务）；不做合并集（M7）。
+- 不做封面 `poster.jpg`（属 artifact 缓存，单独任务）；`/video` 出流端点属 S8。
 
 ### 测试（两层，都不需要外部 rclone）
 
-**单元**（`fs_unit_test.go`）：`fakeTree` 提供节点与渲染字节，**不碰 SQLite、不起
-HTTP**。覆盖路径映射（DAV 根 = vfs 根目录）、长度只来自 `len(渲染字节)`、
-`fs.ErrNotExist` 包装、`Readdir` 直接子项、只读语义、请求内快照（同请求只 `List`
-一次、同路径只渲染一次、不跨请求复用）、渲染/列举错误透传。这几条守住适配逻辑本身。
+**单元**（`fs_unit_test.go`）：`fakeTree` 按目录给出子项与渲染字节，**不碰 SQLite、不起
+HTTP**。覆盖：DAV 根 = vfs 根、长度只来自 `len(渲染字节)`、`os.IsNotExist` 认得的
+`*fs.PathError` 包装、目录打开惰性（`OpenFile` 不查子项、`Readdir` 才查）、`Readdir`
+直接子项且只查该目录、只读语义、请求内快照（同目录只 `List` 一次、同路径只渲染一次、
+不跨请求复用）、列举/渲染错误透传。
 
 **集成**（`webdav_test.go`）：真 SQLite + 真 handler（`httptest`），验证协议契约。
-客户端游览（等同 `rclone lsf --max-depth 3`、Emby 扫库的请求序列）由进程内的递归
+客户端游览（等同 `rclone lsf --max-depth 5`、Emby 扫库的请求序列）由进程内的递归
 PROPFIND 客户端完成，不依赖外部二进制、不起守护进程、不落盘：
 
-- `TestWalkTree_CompleteDepth3`：max-depth 3 枚举出完整树（剧 → Season 01 → strm/nfo），
-  并对每个文件项断言 `getcontentlength == GET 实际 body 长度`。
+- `TestPropfindDepth1_Layers`：`Depth: 1` 逐层只有该层节点（根只有分类、分类只有分片、
+  分片只有剧目录、剧目录是 `tvshow.nfo` + `Season 01`），且 DAV 路径里没有 `短剧` / `全部`。
+- `TestWalkTree_Complete`：max-depth 5 枚举出完整树（分类 → 分片 → 剧 → Season 01 →
+  strm/nfo），并对每个文件项断言 `getcontentlength == GET 实际 body 长度`。
 - `TestWalkTree_DepthBounded`：遍历在预算内结束、深度不超过 max-depth。
+- `TestPropfindNotFoundIs404`：不存在的路径在**线缆上**必须是 404（不是 405）。
+- `TestPropfindDepth1_QueryCountIndependentOfSize`：200 部与 12,000 部两种规模的
+  `Depth:1` 查询次数必须相同（每层一次），且不渲染任何孙级文件。
 
-消费方接口：`webdav.Tree`（`List` + `Render`）定义在 `fs.go`（接口在消费方，
+消费方接口：`webdav.Tree`（`List(ctx, dir)` + `Render`）定义在 `fs.go`（接口在消费方，
 DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 `fakeTree`。
 
 **超时是硬要求**（`webdav_test.go` 顶部常量）：`requestTimeout = 5s`（单请求，
@@ -560,7 +639,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 挂载点 `/`（装配根注册）。三页界面与管理 API 是同一个 handler：完整路径原样传入
 本包（ServeMux 不剥前缀），未登记路径由本包 mux 返回 404 —— 「未知路径 → 404」
-的语义不变，只是兜底者从顶层 mux 换成 web 的 mux。`/dav/`、`/s/` 的 pattern 比
+的语义不变，只是兜底者从顶层 mux 换成 web 的 mux。`/webdav/`、`/s/` 的 pattern 比
 `/` 更具体，不受影响。
 
 ### 页面

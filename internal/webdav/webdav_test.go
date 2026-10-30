@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -37,16 +40,26 @@ type fixture struct {
 	pass     string
 	prefix   string
 	titleA   string
+	genre    string // 剧 A 的分类目录名
+	shard    string // 剧 A 的分片目录名（两位十六进制）
 	epIDs    []int64
 	settings *store.Settings
 }
 
-// stubToken 是 TokenFunc 替身：webdav（rank 40）不能 import stream（rank 40），
+// stubID 是 IDFunc 替身：webdav（rank 40）不能 import stream（rank 40），
 // 装配根（cmd）才是接签名的地方。把 secret 编进结果证明参数确实来自注入缝。
-func stubToken(secret, uid string) string { return "tok(" + secret + ":" + uid + ")" }
+func stubID(secret, uid string) string { return "id(" + secret + ":" + uid + ")" }
 
-// tokenFor 是可预期的 token 值（与 stubToken 同规则，独立写出）。
-func tokenFor(secret, uid string) string { return "tok(" + secret + ":" + uid + ")" }
+// idFor 是可预期的 id 值（与 stubID 同规则，独立写出）。
+func idFor(secret, uid string) string { return "id(" + secret + ":" + uid + ")" }
+
+// shardOf 独立实现目录分片号 fnv32a(provider_id) % 128（不复用生产代码）：
+// 测试用它把「这个剧目录应该在哪个分片下」算出来，而不是从被测树里抄。
+func shardOf(providerID string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(providerID))
+	return fmt.Sprintf("%02x", h.Sum32()%128)
+}
 
 // newFixture 起一个用真 handler 的 httptest.Server（不 mock 自己的 handler）。
 func newFixture(t *testing.T) fixture {
@@ -81,6 +94,7 @@ func newFixture(t *testing.T) fixture {
 
 	dramaID, err := st.UpsertDrama(ctx, store.Drama{
 		Provider: "web", ProviderID: "a1", Title: title, Year: 2024, Plot: "简介",
+		Genre: "爱情",
 	})
 	if err != nil {
 		t.Fatalf("UpsertDrama: %v", err)
@@ -104,13 +118,14 @@ func newFixture(t *testing.T) fixture {
 
 	// 与 cmd 的装配方式一致：handler 挂在 MountPath 上，路径前缀由它自己剥。
 	mux := http.NewServeMux()
-	mux.Handle(MountPath, NewHandler(vfs.NewTree(st, settings, stubToken), settings, newDiscardLogger()))
+	mux.Handle(MountPath, NewHandler(vfs.NewTree(st, settings, stubID, newDiscardLogger()), settings, newDiscardLogger()))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
 	return fixture{
 		srv: srv, client: &http.Client{Timeout: requestTimeout}, user: user, pass: pass,
-		prefix: prefix, titleA: title, epIDs: epIDs, settings: settings,
+		prefix: prefix, titleA: title, genre: "爱情", shard: shardOf("a1"),
+		epIDs: epIDs, settings: settings,
 	}
 }
 
@@ -123,8 +138,16 @@ func (f fixture) setPassword(t *testing.T, pass string) error {
 	return f.settings.Set(context.Background(), store.KeyWebDAVPass, pass)
 }
 
+// dramaPath 是 fixture 里剧 A 的剧目录在 DAV 上的路径：/<分类>/<分片>/<剧目录>。
+func (f fixture) dramaPath() string {
+	return "/" + f.genre + "/" + f.shard + "/" + f.titleA + " (2024)"
+}
+
 // seasonPath 是 fixture 里剧 A 的季目录在 DAV 上的路径。
-func (f fixture) seasonPath() string { return "/" + f.titleA + " (2024)/Season 01" }
+func (f fixture) seasonPath() string { return f.dramaPath() + "/Season 01" }
+
+// shardPath 是剧 A 所在分片目录在 DAV 上的路径。
+func (f fixture) shardPath() string { return "/" + f.genre + "/" + f.shard }
 
 // request 发一个带 Basic 认证的 DAV 请求；path 相对挂载点（"/" 即挂载点根）。
 func (f fixture) request(t *testing.T, method, path string, body io.Reader, hdr map[string]string) *http.Response {
@@ -217,38 +240,101 @@ func entries(t *testing.T, ms multistatus) map[string]davEntry {
 	return out
 }
 
-// AC1：PROPFIND Depth: 1 返回 207；DAV 根下直接是剧目录，剧目录下是 tvshow.nfo + Season 01。
-func TestPropfindDepth1_Tree(t *testing.T) {
+// shardHrefs 返回某个分类目录下全部分片目录的 href（00–7f）。
+func shardHrefs(genre string) []string {
+	out := make([]string, 0, 128)
+	for shard := 0; shard < 128; shard++ {
+		out = append(out, "/webdav/"+genre+"/"+fmt.Sprintf("%02x", shard)+"/")
+	}
+	return out
+}
+
+// AC：<LAYER> Depth: 1 返回 207，逐层只有该层的节点——根只有分类、分类只有分片、
+// 分片只有剧目录、剧目录是 tvshow.nfo + Season 01（没有 全部/、没有额外的 短剧/ 一层）。
+func TestPropfindDepth1_Layers(t *testing.T) {
 	f := newFixture(t)
+	const davPrefix = "/webdav"
 
-	code, ms := f.propfind(t, "/")
-	if code != http.StatusMultiStatus {
-		t.Fatalf("PROPFIND / 状态码 = %d, 期望 207", code)
+	tests := []struct {
+		name     string
+		path     string
+		wantDirs []string // 期望的目录 href（带尾斜杠）
+		wantFile []string // 期望的文件 href（不带尾斜杠）
+	}{
+		{
+			name:     "根只有分类",
+			path:     "/",
+			wantDirs: []string{davPrefix + "/" + f.genre + "/"},
+		},
+		{
+			name:     "分类只有分片",
+			path:     "/" + f.genre,
+			wantDirs: shardHrefs(f.genre), // 00–7f 的全部（docs/DIRECTORY-CONTRACT.md 允许）
+		},
+		{
+			name:     "分片只有剧目录",
+			path:     f.shardPath(),
+			wantDirs: []string{davPrefix + f.dramaPath() + "/"},
+		},
+		{
+			name:     "剧目录是 tvshow.nfo + Season 01",
+			path:     f.dramaPath(),
+			wantDirs: []string{davPrefix + f.dramaPath() + "/Season 01/"},
+			wantFile: []string{davPrefix + f.dramaPath() + "/tvshow.nfo"},
+		},
 	}
-	got := entries(t, ms)
-	// DAV 根就是库根：`rclone lsf --max-depth 3 dramahub:/` 第一级必须是剧目录
-	// （docs/ACCEPTANCE.md P2），不能多套一层 `短剧/`。
-	dramaHref := "/dav/" + f.titleA + " (2024)/"
-	if e, ok := got[dramaHref]; !ok {
-		t.Fatalf("根列举缺剧目录 %s，实际：%v", dramaHref, keys(got))
-	} else if !e.isDir {
-		t.Errorf("%s 应带 resourcetype collection（目录）", e.path)
-	}
-	// vfs 的根目录名（`短剧`）不得成为 DAV 路径的一段：DAV 根即库根。
-	if _, ok := got["/dav/短剧/"]; ok {
-		t.Errorf("根下不该再套一层 短剧：%v", keys(got))
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, ms := f.propfind(t, tt.path)
+			if code != http.StatusMultiStatus {
+				t.Fatalf("Depth:1 %s 状态码 = %d, 期望 207", tt.path, code)
+			}
+			got := entries(t, ms)
+			// 把这一层的 href 打出来：这是 PROPFIND 的真实输出（真 handler + httptest），
+			// 逐层「只有该层节点」的证据就在这段日志里（-test.v 可见）。
+			hrefs := make([]string, 0, len(got))
+			for href := range got {
+				hrefs = append(hrefs, href)
+			}
+			sort.Strings(hrefs)
+			t.Logf("PROPFIND Depth:1 %-28s → %v", tt.path, hrefs)
 
-	code, ms = f.propfind(t, "/"+f.titleA+" (2024)")
-	if code != http.StatusMultiStatus {
-		t.Fatalf("PROPFIND 剧目录 状态码 = %d, 期望 207", code)
-	}
-	got = entries(t, ms)
-	seasonHref := dramaHref + "Season 01/"
-	if e, ok := got[seasonHref]; !ok {
-		t.Fatalf("剧目录列举缺 %s，实际：%v", seasonHref, keys(got))
-	} else if !e.isDir {
-		t.Errorf("%s 应是目录", seasonHref)
+			// Depth:1 的响应首项是目录自身（目录 href 带尾斜杠）。
+			delete(got, davPrefix+strings.TrimSuffix(tt.path, "/")+"/")
+
+			for _, href := range tt.wantDirs {
+				e, ok := got[href]
+				if !ok {
+					t.Fatalf("%s 缺目录 %s，实际：%v", tt.path, href, keys(got))
+				}
+				if !e.isDir {
+					t.Errorf("%s 应带 resourcetype collection（目录）", href)
+				}
+				delete(got, href)
+			}
+			for _, href := range tt.wantFile {
+				e, ok := got[href]
+				if !ok {
+					t.Fatalf("%s 缺文件 %s，实际：%v", tt.path, href, keys(got))
+				}
+				if e.isDir {
+					t.Errorf("%s 不该是目录", href)
+				}
+				delete(got, href)
+			}
+			if len(got) != 0 {
+				t.Errorf("%s 多出节点：%v", tt.path, keys(got))
+			}
+			// vfs 的根目录名（`短剧`）不得成为 DAV 路径的一段：DAV 根即库根。
+			for href := range entries(t, ms) {
+				if strings.Contains(href, "/webdav/短剧") {
+					t.Errorf("DAV 路径里出现了 vfs 根目录名 短剧：%s", href)
+				}
+				if strings.Contains(href, "全部") {
+					t.Errorf("树里出现 全部/ 节点：%s", href)
+				}
+			}
+		})
 	}
 }
 
@@ -276,7 +362,7 @@ func TestPropfindDepth1_ContentLengthMatchesBody(t *testing.T) {
 		if e.size <= 0 {
 			t.Errorf("%s 的 getcontentlength = %d, 期望 > 0", path, e.size)
 		}
-		body := f.getBody(t, strings.TrimPrefix(path, "/dav"), true)
+		body := f.getBody(t, strings.TrimPrefix(path, "/webdav"), true)
 		if int64(len(body)) != e.size {
 			t.Errorf("%s: getcontentlength = %d, GET body 长度 = %d", path, e.size, len(body))
 		}
@@ -302,7 +388,7 @@ func TestGet_Files(t *testing.T) {
 			name: "strm/首集", ep: f.epIDs[0], ext: ".strm",
 			wantBytes: func(f fixture) []byte {
 				uid := "e" + strconv.FormatInt(f.epIDs[0], 10)
-				return []byte(f.prefix + "/s/" + tokenFor("0123456789abcdef0123456789abcdef", uid) + "/e/" + uid + "\n")
+				return []byte(f.prefix + "/video/" + idFor("0123456789abcdef0123456789abcdef", uid) + ".m3u8\n")
 			},
 		},
 		{
@@ -312,7 +398,7 @@ func TestGet_Files(t *testing.T) {
 			name: "strm/第二集", ep: f.epIDs[1], ext: ".strm",
 			wantBytes: func(f fixture) []byte {
 				uid := "e" + strconv.FormatInt(f.epIDs[1], 10)
-				return []byte(f.prefix + "/s/" + tokenFor("0123456789abcdef0123456789abcdef", uid) + "/e/" + uid + "\n")
+				return []byte(f.prefix + "/video/" + idFor("0123456789abcdef0123456789abcdef", uid) + ".m3u8\n")
 			},
 		},
 		{
@@ -503,6 +589,25 @@ func TestNotFound(t *testing.T) {
 	}
 }
 
+// AC（阻断 3 的回归）：不存在的目录，PROPFIND 必须回 404，不是 405。
+//
+// x/net/webdav 的 handlePropfind 用 os.IsNotExist 分流，而它只认 *fs.PathError；
+// 早先的 fmt.Errorf 包装让它落到 405 Method Not Allowed（客户端看起来像「协议不支持」）。
+func TestPropfindNotFoundIs404(t *testing.T) {
+	f := newFixture(t)
+	for _, path := range []string{
+		"/无此分类",
+		"/" + f.genre + "/fe", // 分片号越界（N=128，最大 7f）
+		"/" + f.genre + "/" + f.shard + "/无此剧 (2024)",
+		"/" + f.genre + "/" + f.shard + "/" + f.titleA + " (2024)/Season 02",
+	} {
+		resp := f.request(t, "PROPFIND", path, nil, map[string]string{"Depth": "1"})
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("PROPFIND %s 状态码 = %d, 期望 404", path, resp.StatusCode)
+		}
+	}
+}
+
 // keys 取 map 的键集合（用于失败信息）。
 func keys[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
@@ -551,7 +656,7 @@ func (f fixture) walkTree(t *testing.T, maxDepth int) []walkNode {
 		// href 里的目录带尾斜杠、文件不带；统一成「无尾斜杠」再比较，self 项
 		// （目录自身，href == 本次请求路径）不入结果。
 		for href, e := range entries(t, ms) {
-			rel := strings.TrimSuffix(strings.TrimPrefix(href, "/dav"), "/")
+			rel := strings.TrimSuffix(strings.TrimPrefix(href, "/webdav"), "/")
 			if strings.TrimSuffix(cur.path, "/") == rel && cur.path != "/" {
 				continue
 			}
@@ -597,14 +702,14 @@ func (f fixture) propfindCtx(t *testing.T, ctx context.Context, path string) (in
 	return resp.StatusCode, ms
 }
 
-// AC-4：整棵目录树可被递归列举到（max-depth 3 覆盖 剧/Season/文件 三层），
+// AC：整棵目录树可被递归列举到（max-depth 5 覆盖 分类/分片/剧/Season/文件 五层），
 // 且每个文件项都带 getcontentlength = GET 实际 body 长度。
 //
 // 这条替代了原先「手工跑 rclone lsf --max-depth 3」的验收方式：同一协议语义，
 // 进程内、无外部二进制、受 requestTimeout/walkTimeout 约束。
-func TestWalkTree_CompleteDepth3(t *testing.T) {
+func TestWalkTree_Complete(t *testing.T) {
 	f := newFixture(t)
-	nodes := f.walkTree(t, 3)
+	nodes := f.walkTree(t, 5)
 
 	got := make(map[string]walkNode, len(nodes))
 	for _, n := range nodes {
@@ -615,13 +720,18 @@ func TestWalkTree_CompleteDepth3(t *testing.T) {
 	}
 
 	want := map[string]bool{ // path -> isDir
-		"/" + f.titleA + " (2024)":                                 true,
-		"/" + f.titleA + " (2024)/tvshow.nfo":                      false,
-		"/" + f.titleA + " (2024)/Season 01":                       true,
+		"/" + f.genre:                 true,
+		f.dramaPath():                 true,
+		f.dramaPath() + "/tvshow.nfo": false,
+		f.dramaPath() + "/Season 01":  true,
 		f.seasonPath() + "/" + f.episodeBase(f.epIDs[0]) + ".strm": false,
 		f.seasonPath() + "/" + f.episodeBase(f.epIDs[0]) + ".nfo":  false,
 		f.seasonPath() + "/" + f.episodeBase(f.epIDs[1]) + ".strm": false,
 		f.seasonPath() + "/" + f.episodeBase(f.epIDs[1]) + ".nfo":  false,
+	}
+	// 分片目录恒为 00–7f 的全部（空分片列出来是空目录），一并计入期望集合。
+	for shard := 0; shard < 128; shard++ {
+		want["/"+f.genre+"/"+fmt.Sprintf("%02x", shard)] = true
 	}
 	for path, isDir := range want {
 		n, ok := got[path]
@@ -649,18 +759,170 @@ func TestWalkTree_CompleteDepth3(t *testing.T) {
 	}
 }
 
-// AC-4 的反面：遍历必须有限且在预算内结束——maxDepth 3 时不漏层、也不无限下钻。
+// AC 的反面：遍历必须有限且在预算内结束——maxDepth 5 时不漏层、也不无限下钻。
 // 这条守住「测试自己不会挂死」，避免再出现手工命令超时不退出的情况。
 func TestWalkTree_DepthBounded(t *testing.T) {
 	f := newFixture(t)
 	start := time.Now()
-	nodes := f.walkTree(t, 3)
+	nodes := f.walkTree(t, 5)
 	if elapsed := time.Since(start); elapsed > walkTimeout {
 		t.Fatalf("遍历耗时 %v 超过预算 %v", elapsed, walkTimeout)
 	}
 	for _, n := range nodes {
-		if depth := strings.Count(n.path, "/"); depth > 3 {
-			t.Errorf("max-depth 3 却出现深度 %d 的路径 %s", depth, n.path)
+		if depth := strings.Count(n.path, "/"); depth > 5 {
+			t.Errorf("max-depth 5 却出现深度 %d 的路径 %s", depth, n.path)
 		}
+	}
+}
+
+// countingTree 是 vfs.Tree 的计数装饰器：记录 List / Render 调用次数与查过的目录。
+//
+// 「一次 Depth:1 的查询次数与目录规模无关」是一条可断言的事实（不是时间），
+// 所以性能契约用它钉住，而不是钉墙钟。
+type countingTree struct {
+	inner   *vfs.Tree
+	lists   int
+	renders int
+	dirs    map[string]int
+}
+
+func newCountingTree(inner *vfs.Tree) *countingTree {
+	return &countingTree{inner: inner, dirs: map[string]int{}}
+}
+
+func (c *countingTree) List(ctx context.Context, dir string) ([]vfs.Node, error) {
+	c.lists++
+	c.dirs[dir]++
+	return c.inner.List(ctx, dir)
+}
+
+func (c *countingTree) Render(ctx context.Context, p string) ([]byte, error) {
+	c.renders++
+	return c.inner.Render(ctx, p)
+}
+
+// reset 清空计数（一次请求前调用）。
+func (c *countingTree) reset() {
+	c.lists, c.renders, c.dirs = 0, 0, map[string]int{}
+}
+
+// bulkFixture 是「n 部剧、同一分类」的服务端：真 SQLite + 计数树 + 真 handler。
+type bulkFixture struct {
+	fixture
+	tree *countingTree
+}
+
+// newBulkFixture 造 n 部剧（同一分类，分片由 fnv 自动摊开）并起 httptest.Server。
+func newBulkFixture(t *testing.T, n int) bulkFixture {
+	t.Helper()
+	ctx := context.Background()
+	const (
+		user   = "davuser"
+		pass   = "davpass"
+		genre  = "剧情"
+		secret = "0123456789abcdef0123456789abcdef"
+	)
+
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "bulk.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	for k, v := range map[store.SettingKey]string{
+		store.KeyWebDAVUser:   user,
+		store.KeyWebDAVPass:   pass,
+		store.KeyStreamSecret: secret,
+	} {
+		if err := settings.Set(ctx, k, v); err != nil {
+			t.Fatalf("Set %s: %v", k, err)
+		}
+	}
+
+	// 一个事务里灌库：这条测试要的是「列举规模」，不是写路径性能。
+	err = st.InTx(ctx, func(tx *store.Store) error {
+		for i := 0; i < n; i++ {
+			if _, err := tx.UpsertDrama(ctx, store.Drama{
+				Provider: "web", ProviderID: "bulk-" + strconv.Itoa(i),
+				Title: "剧" + strconv.Itoa(i), Year: 2024, Genre: genre,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("灌入 %d 部剧: %v", n, err)
+	}
+
+	tree := newCountingTree(vfs.NewTree(st, settings, stubID, newDiscardLogger()))
+	mux := http.NewServeMux()
+	mux.Handle(MountPath, NewHandler(tree, settings, newDiscardLogger()))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	return bulkFixture{
+		fixture: fixture{
+			srv: srv, client: &http.Client{Timeout: requestTimeout},
+			user: user, pass: pass, genre: genre,
+		},
+		tree: tree,
+	}
+}
+
+// AC（阻断 1、2 的回归）：Depth:1 的查询次数与目录规模无关，且不渲染孙级文件。
+//
+// 旧实现：OpenFile 目录即列子项，x/net 对每个子项都 OpenFile 一次 ⇒ 每层列举变成
+// 「子项数」次查询 + 把孙级文件全渲染一遍（608k 库实测 /剧情 13.30s）。
+// 现在：每层只查一次，一次列举的查询次数是常数。
+func TestPropfindDepth1_QueryCountIndependentOfSize(t *testing.T) {
+	type sample struct{ name, path string }
+	measure := func(t *testing.T, f bulkFixture, s sample) (lists, renders int) {
+		t.Helper()
+		f.tree.reset()
+		code, _ := f.propfind(t, s.path)
+		if code != http.StatusMultiStatus {
+			t.Fatalf("%s: Depth:1 %s 状态码 = %d, 期望 207", s.name, s.path, code)
+		}
+		return f.tree.lists, f.tree.renders
+	}
+
+	const small, large = 200, 12000
+	fs, fl := newBulkFixture(t, small), newBulkFixture(t, large)
+
+	// 找一个「有剧」的分片目录（两部 fixture 的 provider_id 前缀相同，分布一致）。
+	shard := shardOf("bulk-0")
+
+	for _, s := range []sample{
+		{name: "根", path: "/"},
+		{name: "分类", path: "/剧情"},
+		{name: "分片", path: "/剧情/" + shard},
+	} {
+		t.Run(s.name, func(t *testing.T) {
+			smallLists, smallRenders := measure(t, fs, s)
+			largeLists, largeRenders := measure(t, fl, s)
+
+			t.Logf("%s：%d 部剧 → List=%d Render=%d；%d 部剧 → List=%d Render=%d（查过的目录 %v）",
+				s.name, small, smallLists, smallRenders, large, largeLists, largeRenders, fl.tree.dirs)
+
+			if smallLists != largeLists {
+				t.Errorf("%s 的查询次数随库规模变化：%d 部 = %d 次，%d 部 = %d 次",
+					s.name, small, smallLists, large, largeLists)
+			}
+			// 常数上限：根 1 次 DISTINCT genre；分类/分片 = 父目录 + 自己。
+			if largeLists > 2 {
+				t.Errorf("%s 的 List 次数 = %d, 期望 ≤ 2（每层一次）", s.name, largeLists)
+			}
+			// 列举某一层只碰这一层：孙级文件一个都不渲染。
+			if largeRenders != 0 {
+				t.Errorf("%s 列举时渲染了 %d 个孙级文件, 期望 0", s.name, largeRenders)
+			}
+			// 只查「这一层 + 它的父目录」，一个孙级目录都不碰。
+			if len(fl.tree.dirs) > 2 {
+				t.Errorf("%s 查了 %d 个目录（%v），期望 ≤ 2 个", s.name, len(fl.tree.dirs), fl.tree.dirs)
+			}
+		})
 	}
 }

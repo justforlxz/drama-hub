@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +23,14 @@ import (
 	"github.com/justforlxz/drama-hub/internal/sync"
 	"github.com/justforlxz/drama-hub/internal/web"
 )
+
+// shardOf 独立实现目录分片号 fnv32a(provider_id) % 128（不复用生产代码）：
+// 用它算「这部剧的目录应该挂在哪个分片下」。
+func shardOf(providerID string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(providerID))
+	return fmt.Sprintf("%02x", h.Sum32()%128)
+}
 
 // newTestHandler 与 main 用同一条装配路径：httptest 起真实 handler，不 mock 自己的
 // handler。出流端点需要数据库（settings / episode 表），因此开一个临时库装配。
@@ -80,7 +90,7 @@ func TestHandler_Healthz(t *testing.T) {
 
 // TestHandler_UnimplementedMounts 覆盖仍是占位的挂载点语义：
 // `/s/` 子树里未实现的路径任意方法都是 501。
-// /dav/ 已在 M4 接上真实 WebDAV（契约归 internal/webdav），`/` 在 R1 接上管理面
+// /webdav/ 已在 M4 接上真实 WebDAV（契约归 internal/webdav），`/` 在 R1 接上管理面
 // （契约归 internal/web，见 TestHandler_ManagementSurface）。
 func TestHandler_UnimplementedMounts(t *testing.T) {
 	h := newTestHandler(t)
@@ -124,7 +134,7 @@ func TestHandler_ManagementSurface(t *testing.T) {
 }
 
 // TestHandler_LogsRequests（F5 AC7）证明装配根每请求恰一条访问日志：对
-// /healthz、/dav/（无认证 → 401）、/nope 各发一次，每次 1 条含 method/path/status/duration_ms
+// /healthz、/webdav/（无认证 → 401）、/nope 各发一次，每次 1 条含 method/path/status/duration_ms
 // 四字段的 JSON 日志，路径与状态和响应一致。logger 级别设为 Debug，避免级别
 // 过滤影响条数。
 func TestHandler_LogsRequests(t *testing.T) {
@@ -134,7 +144,7 @@ func TestHandler_LogsRequests(t *testing.T) {
 		wantCode int
 	}{
 		{"/healthz", "/healthz", http.StatusOK},
-		{"/dav/", "/dav/", http.StatusUnauthorized},
+		{"/webdav/", "/webdav/", http.StatusUnauthorized},
 		{"/nope", "/nope", http.StatusNotFound},
 	}
 	for _, c := range cases {
@@ -324,9 +334,9 @@ func TestHandler_SegmentRoute(t *testing.T) {
 	}
 }
 
-// TestHandler_WebDAV 覆盖 M4 的装配面：`/dav/` 已从占位 501 换成真实 WebDAV
-// （无认证 401；带认证 PROPFIND 207；strm 里的 token 由装配根的 signToken 生成，
-// 与 internal/stream 的签名一致——这条断言能挡住 TokenFunc 接错）。
+// TestHandler_WebDAV 覆盖装配面：`/webdav/` 已从占位 501 换成真实 WebDAV
+// （无认证 401；带认证 Depth:1 207；strm 里的 id 由装配根的 signID 生成、与
+// internal/stream 的 stream.ID 一致——这条断言能挡住 IDFunc 接错）。
 func TestHandler_WebDAV(t *testing.T) {
 	ctx := context.Background()
 	const (
@@ -350,7 +360,7 @@ func TestHandler_WebDAV(t *testing.T) {
 			t.Fatalf("Set %s: %v", k, err)
 		}
 	}
-	dramaID, err := st.UpsertDrama(ctx, store.Drama{Provider: "web", ProviderID: "p1", Title: "测试剧", Year: 2024})
+	dramaID, err := st.UpsertDrama(ctx, store.Drama{Provider: "web", ProviderID: "p1", Title: "测试剧", Year: 2024, Genre: "爱情"})
 	if err != nil {
 		t.Fatalf("UpsertDrama: %v", err)
 	}
@@ -364,24 +374,26 @@ func TestHandler_WebDAV(t *testing.T) {
 	}
 	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources())
 
-	// 无认证 → 401（不是 501：说明 /dav/ 已接上真实 handler）。
-	if rec := serve(t, h, "PROPFIND", "/dav/"); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("PROPFIND /dav/（无认证）状态码 = %d, 期望 401", rec.Code)
+	// 无认证 → 401（不是 501：说明 /webdav/ 已接上真实 handler）。
+	if rec := serve(t, h, "PROPFIND", "/webdav/"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("PROPFIND /webdav/（无认证）状态码 = %d, 期望 401", rec.Code)
 	}
 
 	// 带认证 PROPFIND → 207。
-	req := httptest.NewRequest("PROPFIND", "/dav/", nil)
+	req := httptest.NewRequest("PROPFIND", "/webdav/", nil)
 	req.SetBasicAuth(user, pass)
 	req.Header.Set("Depth", "1")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMultiStatus {
-		t.Fatalf("PROPFIND /dav/ 状态码 = %d, 期望 207", rec.Code)
+		t.Fatalf("PROPFIND /webdav/ 状态码 = %d, 期望 207", rec.Code)
 	}
 
-	// strm 里的 token/uid 与出流端点一致：Sign(secret, episode.id) + `/e/<id>`。
+	// strm 指向 `/video/{id}.m3u8`，id = uid + "-" + 签名的前 12 个十六进制字符；
+	// 这里用装配根的 signID（stream.ID）独立算一遍，挡住 IDFunc 接错。
 	// 文件名含空格与中文，请求目标必须是转义后的形式（真实客户端也这样发）。
-	path := "/dav/" + url.PathEscape("测试剧 (2024)") + "/Season%2001/" +
+	path := "/webdav/" + url.PathEscape("爱情") + "/" + shardOf("p1") + "/" +
+		url.PathEscape("测试剧 (2024)") + "/Season%2001/" +
 		url.PathEscape("测试剧 - S01E01 - 开局") + ".strm"
 	req = httptest.NewRequest(http.MethodGet, path, nil)
 	req.SetBasicAuth(user, pass)
@@ -391,7 +403,7 @@ func TestHandler_WebDAV(t *testing.T) {
 		t.Fatalf("GET %s 状态码 = %d, 期望 200", path, rec.Code)
 	}
 	uid := "e" + strconv.FormatInt(epID, 10)
-	want := "/s/" + stream.Sign([]byte(secret), uid) + "/e/" + uid + "\n"
+	want := "/video/" + stream.ID(secret, uid) + ".m3u8\n"
 	if rec.Body.String() != want {
 		t.Errorf("strm 内容 = %q, 期望 %q", rec.Body.String(), want)
 	}

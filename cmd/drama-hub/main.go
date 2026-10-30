@@ -120,7 +120,7 @@ func main() {
 // newHandler 装配顶层路由。cmd 是唯一的装配根：路由表在这里一眼可见，
 // 领域包只提供自己的 handler，不关心挂载点。
 //
-// /healthz、/dav/（M4 只读 WebDAV）、/s/（M5 出流 + M6 分片 + M7 合并集）与 `/`
+// /healthz、/webdav/（M4 只读 WebDAV）、/s/（M5 出流 + M6 分片 + M7 合并集）与 `/`
 // （R1 管理面：三页界面 + `/api/` 管理 API）都已接上真实实现。`/s/` 子树按 pattern
 // 具体度分工：分片端点、playlist 端点比 `/s/` 更具体，其余落到 stream.Server 的
 // `/s/` 兜底（单集出流或 501）。领域包之间互不 import（同 rank），跨包的签名/分派
@@ -128,9 +128,9 @@ func main() {
 //
 // 管理面挂在 `/` 上：`internal/web` 自己按完整路径分派三页界面与 `/api/` 子树，
 // 未登记路径由它返回 404（「未知路径 → 404」的语义不变，只是兜底者从顶层 mux
-// 换成了 web 的 mux）。/dav/ 与 /s/ 的 pattern 比 `/` 更具体，不受影响。
+// 换成了 web 的 mux）。/webdav/ 与 /s/ 的 pattern 比 `/` 更具体，不受影响。
 //
-// 请求日志中间件只在装配根挂一次：/healthz、/dav/、/s/、/ 与未知路径都经它，
+// 请求日志中间件只在装配根挂一次：/healthz、/webdav/、/s/、/ 与未知路径都经它，
 // 每请求恰一条访问日志（token 段掩码，见 internal/httpx）。
 func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source) http.Handler {
 	cutter := segment.NewCutter(st, settings, logger, stream.Verify)
@@ -138,7 +138,7 @@ func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, 
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.Handle(webdav.MountPath, webdav.NewHandler(vfs.NewTree(st, settings, signToken), settings, logger))
+	mux.Handle(webdav.MountPath, webdav.NewHandler(vfs.NewTree(st, settings, signID, logger), settings, logger))
 	// 出流首个 URL（DESIGN §5.2）：uid 是合并集句柄时返回自造 m3u8，否则走单集 MP4
 	// 透传。Go 的 pattern 不能在路径段内按前缀分派，所以在这里按 uid 分派（cmd 可
 	// import 全部 internal 包，两个领域包仍互不 import）。
@@ -253,9 +253,9 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
 }
 
-// signToken 把 stream.Sign 适配为 vfs.TokenFunc：vfs（rank 30）不 import stream
-// （rank 40），签名算法在装配根接上，见 docs/DEV-STANDARDS.md「虚拟文件树与渲染」。
-func signToken(secret, uid string) string { return stream.Sign([]byte(secret), uid) }
+// signID 把 stream.ID 适配为 vfs.IDFunc：vfs（rank 30）不 import stream（rank 40），
+// 对外播放 id 的算法在装配根接上，见 docs/DEV-STANDARDS.md「虚拟文件树与渲染」。
+func signID(secret, uid string) string { return stream.ID(secret, uid) }
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {

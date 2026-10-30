@@ -1,4 +1,4 @@
-package provider
+package hongguo
 
 import (
 	"encoding/json"
@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/justforlxz/drama-hub/internal/plugin"
 )
 
 // 真实页面 fixture 的身份（2026-10-29 抓取的《宴律，你的白月光回国了》）。
@@ -102,7 +104,7 @@ func TestParsePlayerPageSeriesFields(t *testing.T) {
 	}
 }
 
-// AC5/AC6：身份不符与结构变化都必须报 ErrParse，且不与 ErrUpstream 混淆。
+// AC5/AC6：身份不符与结构变化都必须报 plugin.ErrSchema，且不与 plugin.ErrUpstream 混淆。
 func TestParsePlayerPageRejects(t *testing.T) {
 	cases := []struct {
 		fixture string
@@ -118,10 +120,10 @@ func TestParsePlayerPageRejects(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.fixture, func(t *testing.T) {
 			_, err := parsePlayerPage(readFixture(t, tc.fixture), fixtureSID)
-			if !errors.Is(err, ErrParse) {
-				t.Fatalf("%s：err = %v, 期望 ErrParse", tc.why, err)
+			if !errors.Is(err, plugin.ErrSchema) {
+				t.Fatalf("%s：err = %v, 期望 plugin.ErrSchema", tc.why, err)
 			}
-			if errors.Is(err, ErrUpstream) || errors.Is(err, ErrNoDirectURL) {
+			if errors.Is(err, plugin.ErrUpstream) || errors.Is(err, plugin.ErrNoStream) {
 				t.Fatalf("%s：错误类别串了：%v", tc.why, err)
 			}
 		})
@@ -134,7 +136,7 @@ func TestParseDirectURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDirectURL: %v", err)
 	}
-	want := defaultBaseURL + "/video/public/" + fixtureVID + "/360p.mp4"
+	want := DefaultBaseURL + "/video/public/" + fixtureVID + "/360p.mp4"
 	if got != want {
 		t.Fatalf("直链 = %q, 期望 %q", got, want)
 	}
@@ -156,7 +158,7 @@ func TestParseDirectURLNormalize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDirectURL: %v", err)
 	}
-	want := defaultBaseURL + "/video/public/" + fixtureVID + "/360p.mp4?b=2&token=a"
+	want := DefaultBaseURL + "/video/public/" + fixtureVID + "/360p.mp4?b=2&token=a"
 	if got != want {
 		t.Fatalf("规整后 = %q, 期望 %q", got, want)
 	}
@@ -187,18 +189,18 @@ func TestNormalizeURL(t *testing.T) {
 	}
 }
 
-// AC10：VideoObject 在、contentUrl 缺失 → ErrNoDirectURL（与 ErrParse 可区分）。
+// AC10：VideoObject 在、contentUrl 缺失 → plugin.ErrNoStream（与 plugin.ErrSchema 可区分）。
 func TestParseDirectURLNoContent(t *testing.T) {
 	_, err := parseDirectURL(readFixture(t, "page-episode-no-content.html"), fixtureSID, fixtureVID)
-	if !errors.Is(err, ErrNoDirectURL) {
-		t.Fatalf("err = %v, 期望 ErrNoDirectURL", err)
+	if !errors.Is(err, plugin.ErrNoStream) {
+		t.Fatalf("err = %v, 期望 plugin.ErrNoStream", err)
 	}
-	if errors.Is(err, ErrParse) {
-		t.Fatalf("ErrNoDirectURL 不应同时是 ErrParse: %v", err)
+	if errors.Is(err, plugin.ErrSchema) {
+		t.Fatalf("plugin.ErrNoStream 不应同时是 plugin.ErrSchema: %v", err)
 	}
 }
 
-// AC3 的反面：没有本集 VideoObject、或块绑定到别的剧/别的集 → ErrParse。
+// AC3 的反面：没有本集 VideoObject、或块绑定到别的剧/别的集 → plugin.ErrSchema。
 func TestParseDirectURLRejects(t *testing.T) {
 	cases := []struct{ fixture, why string }{
 		{"page-episode-no-videobject.html", "页面只有非 VideoObject 块"},
@@ -209,11 +211,11 @@ func TestParseDirectURLRejects(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.fixture, func(t *testing.T) {
 			_, err := parseDirectURL(readFixture(t, tc.fixture), fixtureSID, fixtureVID)
-			if !errors.Is(err, ErrParse) {
-				t.Fatalf("%s：err = %v, 期望 ErrParse", tc.why, err)
+			if !errors.Is(err, plugin.ErrSchema) {
+				t.Fatalf("%s：err = %v, 期望 plugin.ErrSchema", tc.why, err)
 			}
-			if errors.Is(err, ErrNoDirectURL) {
-				t.Fatalf("%s：不应报 ErrNoDirectURL: %v", tc.why, err)
+			if errors.Is(err, plugin.ErrNoStream) {
+				t.Fatalf("%s：不应报 plugin.ErrNoStream: %v", tc.why, err)
 			}
 		})
 	}

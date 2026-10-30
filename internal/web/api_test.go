@@ -16,10 +16,10 @@ import (
 )
 
 // fakeSyncer 冒充数据源：把上游剧 id 变成库里的一部剧 + 两集，形状与
-// provider.Source.SyncSeries 一致（写剧 → 写集 → 重建派生表）。
+// sync.Syncer.SyncSeries 一致（写剧 → 写集 → 重建派生表）。
 //
-// 真实 provider 的解析/校验由 internal/provider 自己覆盖；这里只关心管理面
-// 「点了同步之后 API 回了什么」。
+// 真实插件的取数与解析由 internal/plugin/hongguo 与 internal/sync 自己覆盖；
+// 这里只关心管理面「点了同步之后 API 回了什么」。
 type fakeSyncer struct {
 	sid   string
 	calls int
@@ -61,7 +61,9 @@ func newTestServer(t *testing.T) (*Server, *store.Store, *fakeSyncer) {
 
 	st := store.NewStore(db.DB)
 	syncer := &fakeSyncer{}
-	return NewServer(st, store.NewSettings(db.DB), syncer, slog.New(slog.DiscardHandler)), st, syncer
+	// 状态页的播放源清单由装配根给（生产里来自注册表），测试固定一个源。
+	sources := []Source{{Name: "web", Label: "红果官网 SSR"}}
+	return NewServer(st, store.NewSettings(db.DB), syncer, sources, slog.New(slog.DiscardHandler)), st, syncer
 }
 
 // do 发一个真实请求，返回响应。
@@ -369,6 +371,13 @@ func TestAPI_Status(t *testing.T) {
 	if got.Config.WebDAVUserSet || got.Config.WebDAVPassSet {
 		t.Error("webdav 凭据未写入却报已设置")
 	}
+	if len(got.Sources) != 1 {
+		t.Fatalf("sources = %+v, 期望 1 个源", got.Sources)
+	}
+	if src := got.Sources[0]; src.Name != "web" || src.Label != "红果官网 SSR" ||
+		!src.Enabled || src.RequestTimeoutSec != 30 || src.Reason != "" {
+		t.Errorf("source = %+v, 期望 web 默认启用、超时 30 秒、无原因", src)
+	}
 	if got.Cache.Mode != "direct" {
 		t.Errorf("cache.mode = %q, 期望 direct（strm_prefix 为空）", got.Cache.Mode)
 	}
@@ -448,4 +457,25 @@ func mustEpisodeID(t *testing.T, st *store.Store, dramaID int64, no int) int64 {
 	}
 	t.Fatalf("剧 %d 没有第 %d 集", dramaID, no)
 	return 0
+}
+
+// 插件被停用时看板给出原因：停用不是故障，但必须看得见（AC：插件未启用/配置缺失
+// 照常启动，状态页可见原因）。
+func TestAPI_StatusSourceDisabled(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	key := store.PluginSettingKey("web", store.PluginItemEnabled)
+	if err := srv.settings.Set(context.Background(), key, "false"); err != nil {
+		t.Fatalf("Set %s: %v", key, err)
+	}
+
+	got := decode[statusView](t, do(t, srv, http.MethodGet, "/api/status", ""))
+	if len(got.Sources) != 1 {
+		t.Fatalf("sources = %+v, 期望 1 个源", got.Sources)
+	}
+	if got.Sources[0].Enabled {
+		t.Error("plugin.web.enabled=false 却报 enabled=true")
+	}
+	if !strings.Contains(got.Sources[0].Reason, string(key)+"=false") {
+		t.Errorf("reason = %q, 期望带上停用的配置键", got.Sources[0].Reason)
+	}
 }

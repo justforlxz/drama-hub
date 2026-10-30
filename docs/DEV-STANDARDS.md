@@ -59,7 +59,7 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 - 迁移文件 `internal/store/migrations/NNNN_<verb>_<subject>.sql`，只向前，不改历史文件。启动时自动执行到最新。
 - 所有 SQL 只在 `internal/store` 出现；其它包通过方法访问。SQL 字符串拼接一律用参数占位。
 - 连接参数固定：`journal_mode=WAL`、`busy_timeout=5000`、`foreign_keys=ON`。
-- 派生的 `emby_item` 表由 `store.RebuildEmbyItems(dramaID)` 幂等重建，调用点只有同步完成（`provider.SyncSeries`）与合并变更（`CreateMergeGroup` / `DeleteMergeGroup`）两处。重建是「整体替换」：先删该剧全部行再按源集号顺序插入，对外集号从 1 起连续；单集占 1 个集号、合并组也只占 1 个。
+- 派生的 `emby_item` 表由 `store.RebuildEmbyItems(dramaID)` 幂等重建，调用点只有同步完成（`internal/sync` 的 `Syncer.SyncSeries`）与合并变更（`CreateMergeGroup` / `DeleteMergeGroup`）两处。重建是「整体替换」：先删该剧全部行再按源集号顺序插入，对外集号从 1 起连续；单集占 1 个集号、合并组也只占 1 个。
 - 合并编排只在 `internal/store/merge.go`：`merge_group`（组）+ `merge_item`（组内成员，`ord` 即时间轴顺序）+ `emby_item`（派生）。`CreateMergeGroup` 校验成员至少 2 集、同剧、不重复、不与已有组重叠（违反返回 `ErrInvalid`，不落库）。
 - 时间统一存 UTC 的 RFC3339 文本；展示时区转换在 Web 层做。
 - store 用哨兵错误表达结果：查询/删除无行返回 `ErrNotFound`，唯一/主键约束冲突由 `wrapWriteErr` 统一映射为 `ErrConflict`（均可 `errors.Is` 判断），不向调用方泄漏裸 `*sqlite.Error`。
@@ -70,12 +70,11 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 ## 配置
 
-> **2.0 新增 6 个全局 key**（`refresh_interval_sec`、`refresh_batch`、`refresh_timeout_sec`、
-> `cache_dir`、`cache_max_mb`、`cache_lru_days`）**加一族 `plugin.<源>.*`**
-> （`enabled` / `base_url` / `request_timeout_sec` / `refresh_interval_sec`）。
-> 取值范围见 `docs/SCHEDULER-MODEL.md`「配置」与 `docs/CACHE-MODEL.md`「淘汰」。
-> 本表待实现时合并；ADR-0007 已确认缓存上限与 LRU 天数是本服务的配置
-> （`AGENTS.md` 硬约束 5 已同步改写）。
+> **2.0 还有 6 个全局 key 未实现**（`refresh_interval_sec`、`refresh_batch`、
+> `refresh_timeout_sec`、`cache_dir`、`cache_max_mb`、`cache_lru_days`），归 S4（MKACG-606）
+> 与 S7（MKACG-611），取值范围见 `docs/SCHEDULER-MODEL.md`「配置」与
+> `docs/CACHE-MODEL.md`「淘汰」。`plugin.<源>.refresh_interval_sec` 同样属 S4。
+> 已实现的 `plugin.<源>.*` 三项在下表。
 
 运行时配置只有一张表 `settings(key TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT)`。
 
@@ -89,6 +88,12 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 | `seg_prefetch` | `2` | 0–10 | 预取分片数 |
 | `pin_days` | `7` | 0–90 | 最近 N 天播放过的合并集整集预取 |
 | `webdav_user` / `webdav_pass` | 必填 | — | WebDAV Basic 认证 |
+| `plugin.<源>.enabled` | `true` | — | 该源是否参与刷新调度（缺失按 `true`，内置源默认启用） |
+| `plugin.<源>.base_url` | `""` | URL 或空 | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
+| `plugin.<源>.request_timeout_sec` | `30` | 5–300 | 单次出站请求超时 |
+
+`<源>` 是 `Plugin.Name()`（红果是 `web`），键的格式与校验在 `internal/store`
+（`PluginSettingKey` + `specFor` 的前缀模式），调用方不自己拼字符串。
 
 **不属于本服务运行配置**（由缓存代理负责，见 ADR-0004）：缓存上限、LRU 天数。
 它们只在 WebUI/文档生成 rclone 配置建议值时出现。**本服务不实现任何缓存淘汰**。
@@ -278,31 +283,65 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 中间件只允许挂一次：在 `web` / `stream` / `webdav` 内再挂一层会让同一请求产生两条日志。
 
 
-## 数据源（provider）
+## 插件与同步（internal/plugin、internal/sync）
 
-`internal/provider` 是官网 SSR 数据源（`provider` / `source` 一律写 `"web"`）。两个入口，各自的出站请求数固定：
+播放源是插件。契约（接口签名、5 条哨兵错误、配置键、注册方式）以
+`docs/PLUGIN-CONTRACT.md` 为唯一真值，本节只写实现口径。
 
-| 入口 | 上游 | 请求数 | 副作用 |
-|---|---|---|---|
-| `Source.SyncSeries(ctx, st, sid)` | `GET {BaseURL}/player/{sid}` | 1 | 一个事务写 1 部剧 + 全部集 |
-| `Source.FetchDirectURL(ctx, sid, vid)` | `GET {BaseURL}/player/{sid}/{vid}` | 1 | 不写库（读时解析） |
+| 包 | 职责 | 允许 import 的内部包 |
+|---|---|---|
+| `internal/plugin` | 契约：`Plugin` 接口、5 条哨兵、`Registry` | 无（只依赖标准库） |
+| `internal/plugin/hongguo` | 第一个实现：红果官网 SSR，`Name() == "web"` | `internal/plugin` |
+| `internal/sync` | 框架侧写库编排：`Syncer.SyncSeries` | `internal/plugin`、`internal/store` |
 
-- `BaseURL` 默认 `https://hongguoduanju.com`，是唯一为测试开的缝（`--network=none` 下指向 `httptest.Server`）。空 `*http.Client` → 默认 15s 超时客户端；出站一律带 `ctx` + `Client.Timeout`。
-- 响应体经 `io.LimitReader` 读，上限 4 MiB；超限按 `ErrParse`（页面异常放大，不是可重试的传输错误）。
+插件只做「上游字节 → 领域值」：不写库、不开事务、不保存状态（不存游标、不缓存直链）。
+写库、事务、`emby_item` 重建在 `internal/sync`；刷新调度与游标归 S4（MKACG-606）。
+
+### 红果插件的上游成本
+
+| 方法 | 上游 | 请求数 |
+|---|---|---|
+| `Work(ctx, ref)` | `GET {BaseURL}/player/{id}` | 1（剧目元数据 + 全部集） |
+| `Resolve(ctx, ref, epNo)` | `GET /player/{id}` → `GET /player/{id}/{vid}` | 2 |
+| `Enumerate(ctx, cur)` | 目录索引（sitemap 与 `/category` 并集） | S5（MKACG-607）落地 |
+
+`Resolve` 是 2 个请求：契约入参只有集号，集号 → 源侧集标识（`vid`）只能从详情页取，
+而插件不许保存状态；要压到 1 个必须改接口（把源侧集标识传进来）。`docs/PLUGIN-CONTRACT.md`
+能力矩阵写的「红果：1 个请求 / 集」与 `Resolve` 签名不自洽，实现按签名走。
+`Enumerate` 在 S5 之前返回「未实现」错误，**不返回空 Page**（空 Page 的意思是
+「源里一个作品都没有」，会把没实现伪装成源侧事实；框架按未知错误记录，状态页可见）。
+
+- `BaseURL` 默认 `https://hongguoduanju.com`，配置键 `plugin.web.base_url`（空 = 用它）。
+  它是唯一为测试开的缝（`--network=none` 下指向 `httptest.Server`）。`*http.Client`
+  由装配根按 `plugin.web.request_timeout_sec` 构造（默认 30s）。
+- 响应体经 `io.LimitReader` 读，上限 4 MiB；超限按 `ErrSchema`（页面异常放大，不是可重试的传输错误）。
 - 解析：`_ROUTER_DATA` 后的 JSON 用标准库 `json.Decoder` 从 `{` 起解（不手写括号扫描）；JSON-LD 用 `regexp` 取出 `<script type="application/ld+json">` 块后按 `@type` 过滤。
-- 校验（任一不满足即 `ErrParse`，**不写库**）：`isSuccess` 不为 `false`；页面的 `series_id` 与 `seriesDetail.series_id` 都等于请求 `sid`（被锁集会被上游 302 到别的集/别的剧页面）；`vid_list` 非空、元素全为数字、无重复。JSON-LD 块另做绑定校验：`url` 的 pathname 是 `/player/{sid}` 或 `/player/{sid}/{vid}`，且 `contentUrl` 的 pathname 含 `/{vid}`。
-- `vid_list` 下标即集号（`ep_no = i+1`）。
-- 哨兵：`ErrUpstream`（传输错误 / 非 200 / 空响应体）、`ErrParse`（结构变化 / 身份不符 / 超限）、`ErrNoDirectURL`（VideoObject 在但 `contentUrl` 缺失）。provider 不 import `internal/httpx`，状态码映射由边界包负责。
+- 校验（任一不满足即 `ErrSchema`）：`isSuccess` 不为 `false`；页面的 `series_id` 与 `seriesDetail.series_id` 都等于请求 id（被锁集会被上游 302 到别的集/别的剧页面）；`vid_list` 非空、元素全为数字、无重复。JSON-LD 块另做绑定校验：`url` 的 pathname 是 `/player/{id}` 或 `/player/{id}/{vid}`，且 `contentUrl` 的 pathname 含 `/{vid}`。
+- `vid_list` 下标即集号（`ep_no = i+1`）；`episode.vid` = `vid_list[i]`。
+- 哨兵映射（插件 HTTP 层，框架只用 `errors.Is` 判定）：429 / 403 → `ErrRejected`；
+  404 → `ErrNotFound`（集页 404 由 `Resolve` 翻成 `ErrNoStream`，见契约错误语义表）；
+  其余非 2xx / 传输失败 / 读体失败 / 空响应 → `ErrUpstream`；结构不符 → `ErrSchema`；
+  `VideoObject` 在但 `contentUrl` 缺 → `ErrNoStream`。`ctx` 被取消 / 超时直接返回 ctx 错误，
+  不冒充源故障。插件不 import `internal/httpx`，状态码映射由边界包负责。
+- 框架校验（`internal/sync`）：集表非空、`Episodes[i].No == i+1`、源侧集标识数量与集数一致，
+  违反即 `ErrSchema` 且**不写库**（这是插件实现 bug，不是上游问题）。
+- `episode.vid` 的来源不在契约的 `Episode` 里（只有集号 / 标题 / 时长）：框架用消费方定义的
+  可选接口 `sync.WorkWithEpisodeKeys` —— 插件实现就一次调用同时拿到详情与每集源侧标识，
+  不实现则 `episode.vid` 留空（不编造）。红果实现了它。
 
 ### `play_url` 留空的契约
 
 **同步不写 `episode.play_url` / `play_url_at`。** 实测（2026-10-29，9 部剧逐一 ffprobe）：列表页 `vid_list` 给全全部集，但单集页 SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **实际时长恒为 10.08 秒**（JSON-LD 却声明整集时长 1m48s–3m38s），第 2..N 集 `contentUrl` 为空字符串、`publicVideoSeo: null`。把预览链写进 `play_url` 等于「整库每集只播 10 秒」，比留空更有害。
 
-因此：同步只保证「剧与集齐全、`vid`/`ep_no` 正确」；`play_url` 为空表示**尚无可用播放源**。真直链按需走 `FetchDirectURL`，由消费者（出流）决定怎么用。整集字节来源属 M5 及之后的范围（见 MKACG-592 的 PL 决策项）。
+因此：同步只保证「剧与集齐全、`vid`/`ep_no` 正确」；`play_url` 为空表示**尚无可用播放源**。真直链按需走 `Plugin.Resolve`（S8 / MKACG-612 接到 `/video/{id}/{seq}.ts` 上）。整集字节来源属 M5 及之后的范围（见 MKACG-592 的 PL 决策项）。
 
 ### 测试
 
-假官网一律是 `httptest.Server`：`Source.BaseURL` 指向它，`sync_at` 用注入时钟（`Source.now`），不依赖真实外网与真实时间。fixture 放 `internal/provider/testdata/html/`，裁剪自真实页面并在文件头注明来源、裁剪日期与覆盖场景。
+假官网一律是 `httptest.Server`：`hongguo.Config.BaseURL` 指向它，不依赖真实外网。
+`sync_at` 的时钟由测试注入（`sync.New` 之后设 `Syncer.now`），不依赖真实时间。
+页面 fixture 放 `internal/plugin/hongguo/testdata/html/`，裁剪自真实页面并在文件头注明
+来源、裁剪日期与覆盖场景；`internal/sync` 的入库一致性测试读同一份 fixture
+（`../plugin/hongguo/testdata/html`），因为「迁移前后入库结果逐字段一致」必须用同一个页面。
 
 ## 代码组织
 
@@ -313,14 +352,16 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 | rank | 包 | 允许 import 的内部包 |
 |---|---|---|
 | 60 | `cmd/drama-hub` | 全部 internal |
-| 50 | `internal/web` | 45 / 40 / 30 / 20 / 10 |
+| 50 | `internal/web` | 40 / 30 / 20 / 10 |
 | 40 | `internal/webdav`、`internal/stream`、`internal/segment` | 30 / 20 / 10 |
-| 30 | `internal/provider`、`internal/vfs`、`internal/httpx` | 20 / 10 |
-| 20 | `internal/cache` | 10 |
-| 10 | `internal/store` | 无 |
+| 30 | `internal/sync`、`internal/vfs`、`internal/httpx` | 20 / 10 |
+| 20 | `internal/plugin/hongguo`、`internal/cache` | 10 |
+| 10 | `internal/plugin`、`internal/store` | 无 |
 
 `internal/httpx` 是 HTTP 边界的横切层：只依赖标准库、不 import 任何 internal 包；
-与它同 rank 30 的 `provider` / `vfs` 互不 import —— 上游/虚拟层不做 HTTP 状态分类。
+与它同 rank 30 的 `sync` / `vfs` 互不 import —— 插件与同步编排不做 HTTP 状态分类。
+`internal/plugin`（契约）只依赖标准库，与同为 rank 10 的 `store` 互不 import：
+插件不认识库，库也不认识插件，两者只在 `internal/sync` 与装配根相遇。
 
 - 一个文件一个关注点，超过 500 行先考虑拆分。
 - 接口定义在消费方，只声明用到的方法；不预建「为将来准备」的接口。
@@ -478,7 +519,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 |---|---|---|
 | `/` | 剧目 | 按上游剧 id 或 `/player/<id>` 链接同步入库；删剧目（级联删集、合并组、对外集号） |
 | `/merges` | 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即 `ord`）→ 删组 |
-| `/status` | 同步与缓存 | 同步计数与最近同步时间、运行配置现状（密钥只报「是否已设置」）、缓存代理建议参数 |
+| `/status` | 同步与缓存 | 同步计数与最近同步时间、各播放源状态（是否启用、生效的 `base_url` 与超时、停用原因）、运行配置现状（密钥只报「是否已设置」）、缓存代理建议参数 |
 
 模板 `templates/*.html` 与 `static/app.css`、`static/app.js` 用 `//go:embed` 进二进制：
 界面没有构建步骤、没有 `package.json`（ADR-0002）。页面 JS 只调下面这些 API，渲染结果
@@ -495,7 +536,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | `/api/dramas/{id}/merge-groups` | GET | 该剧合并组与成员（`ord` 即时间轴顺序） |
 | `/api/dramas/{id}/merge-groups` | POST | 建组：`{"label":"…","episode_ids":[…]}`，数组顺序即 `ord`，201 + 整份列表 |
 | `/api/merge-groups/{id}` | DELETE | 删组（同一事务内重建派生表），204 |
-| `/api/status` | GET | 同步计数 + 运行配置 + 缓存面 |
+| `/api/status` | GET | 同步计数 + 运行配置 + 各播放源状态 + 缓存面 |
 
 - **「增剧目」的唯一入口是数据源同步**：剧目与集的真值在上游，手工插空剧只会得到一条
   永远没有集的记录。`series_id` 只接受纯数字或 `/player/<id>` 链接 —— 归一后的值会拼进

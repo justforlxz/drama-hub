@@ -30,7 +30,8 @@
 
 ```
 cmd/drama-hub/          main，只做装配，不含业务逻辑
-internal/provider/      数据源适配（官网 SSR 主力、App 接口回退）
+internal/plugin/        播放源插件契约（接口 / 5 条哨兵 / 注册表）与实现 hongguo/
+internal/sync/          框架侧同步编排：插件取数 → 事务写库 → 重建派生表
 internal/store/         SQLite、迁移、派生表重建
 internal/vfs/           虚拟文件树 → strm/nfo/图片 渲染
 internal/webdav/        x/net/webdav 自定义 FileSystem

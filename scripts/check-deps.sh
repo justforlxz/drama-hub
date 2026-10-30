@@ -12,10 +12,12 @@ internal/web 50
 internal/webdav 40
 internal/stream 40
 internal/segment 40
-internal/provider 30
+internal/sync 30
 internal/vfs 30
 internal/httpx 30
+internal/plugin/hongguo 20
 internal/cache 20
+internal/plugin 10
 internal/store 10"
 
 mod=github.com/justforlxz/drama-hub
@@ -103,9 +105,9 @@ self_test() {
     trap 'rm -f "$OUT"' EXIT INT TERM HUP
     m=github.com/justforlxz/drama-hub
     check_line "$m/internal/web $m/internal/store"
-    check_line "$m/internal/provider $m/internal/cache"
+    check_line "$m/internal/plugin/hongguo $m/internal/plugin"
     check_line "$m/internal/store $m/internal/web"
-    check_line "$m/internal/vfs $m/internal/provider"
+    check_line "$m/internal/vfs $m/internal/sync"
     # 注册 httpx(rank 30) 后，这条边由「未登记」变「反向」（cache rank 20 → httpx 30），
     # 违规数仍为 3，自测语义不变。
     check_line "$m/internal/cache $m/internal/httpx"

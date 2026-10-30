@@ -1,0 +1,255 @@
+// Package hongguo 是播放源插件契约的第一个实现：红果短剧官网 SSR。
+//
+// 只做「上游字节 → 领域值」的翻译：不写库、不开事务、不 import store / vfs / web /
+// 调度器（ADR-0006）。名字、配置键与错误语义的真值见 docs/PLUGIN-CONTRACT.md。
+package hongguo
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/justforlxz/drama-hub/internal/plugin"
+)
+
+// Name 是插件在库里的稳定标识，直接进 drama.provider / episode.source。
+//
+// 取 "web" 而不是 "hongguo"：库里已有 provider='web' 的数据，改名要写数据迁移而
+// 2.0 不需要（理由与被否决的备选见 docs/DATA-MODEL.md「provider 标识」）。
+// 一经发布不得更改——改它等于改库里的历史数据。
+const Name = "web"
+
+// DefaultBaseURL 是官网站点根。配置 plugin.web.base_url 为空时用它。
+const DefaultBaseURL = "https://hongguoduanju.com"
+
+// sitemapIndexPath 是源侧目录索引，枚举（S5）与自检（Health）都以它为入口。
+const sitemapIndexPath = "/sitemap/hongguoduanju/index.xml"
+
+const (
+	// defaultTimeout 是 HTTPClient 为 nil 时的兜底出站超时。契约的配置默认值
+	// plugin.web.request_timeout_sec = 30（docs/PLUGIN-CONTRACT.md「配置」），
+	// 装配根按配置构造 client；这里是它的同一份默认值。
+	defaultTimeout = 30 * time.Second
+	// maxBodyBytes 是单次响应体读取上限：实测列表页约 213 KB，4 MiB 足够且能挡住
+	// 上游异常放大 / 无限流。超限按 ErrSchema（页面异常放大不是可重试故障）。
+	maxBodyBytes = 4 << 20
+)
+
+// Config 是构造期注入的不可变配置。
+//
+// 契约硬性要求 2：插件实例只允许保存构造期配置（名字、BaseURL、*http.Client、
+// *slog.Logger），不保存游标、上次结果或缓存的直链。
+type Config struct {
+	BaseURL    string       // 空 → DefaultBaseURL
+	HTTPClient *http.Client // nil → 30s 超时客户端
+	Logger     *slog.Logger // nil → slog.Default()
+}
+
+// 编译期断言：红果插件实现契约的全部方法（少一个就是构建失败，不是运行时才发现）。
+var _ plugin.Plugin = (*Plugin)(nil)
+
+// Plugin 是红果插件。零值不可用，用 New 构造。
+type Plugin struct {
+	baseURL string
+	client  *http.Client
+	logger  *slog.Logger
+}
+
+// New 构造插件：空 BaseURL 用 DefaultBaseURL，空 client 用 30s 超时客户端，
+// 空 logger 用默认 logger。
+func New(cfg Config) *Plugin {
+	p := &Plugin{baseURL: cfg.BaseURL, client: cfg.HTTPClient, logger: cfg.Logger}
+	if p.baseURL == "" {
+		p.baseURL = DefaultBaseURL
+	}
+	if p.client == nil {
+		p.client = &http.Client{Timeout: defaultTimeout}
+	}
+	if p.logger == nil {
+		p.logger = slog.Default()
+	}
+	return p
+}
+
+// Name 实现 plugin.Plugin。
+func (p *Plugin) Name() string { return Name }
+
+// errEnumeratePending 表示目录发现尚未实现。
+//
+// 刻意不返回空 Page：空 Page 的语义是「源里一个作品都没有」，会把「没实现」伪装成
+// 源侧事实。分页枚举（sitemap 与 /category 并集）归 S5 / MKACG-607；在它落地之前，
+// 框架按「未知错误」处理（当作 ErrUpstream 并记 unknown_error），状态页看得见。
+var errEnumeratePending = errors.New("hongguo: 目录发现尚未实现（S5 / MKACG-607）")
+
+// Enumerate 实现 plugin.Plugin，但目录发现属 S5（MKACG-607）：本阶段只落契约与注册。
+func (p *Plugin) Enumerate(ctx context.Context, _ *plugin.Cursor) (plugin.Page, error) {
+	if err := ctx.Err(); err != nil {
+		return plugin.Page{}, err
+	}
+	return plugin.Page{}, errEnumeratePending
+}
+
+// Work 实现 plugin.Plugin：一个 GET /player/{id} 同时给出剧目元数据与全部集。
+//
+// 实测 seriesDetail.vid_list 就是全部集标识（下标即集号），因此不逐集抓。
+// 集标题与时长源侧批量拿不到，留零值而不是编造（契约 Episode 注释）。
+func (p *Plugin) Work(ctx context.Context, ref plugin.WorkRef) (plugin.WorkDetail, error) {
+	detail, _, err := p.work(ctx, ref)
+	return detail, err
+}
+
+// WorkWithEpisodeKeys 是框架侧（internal/sync）的可选能力接口：一次调用同时返回
+// 详情与每集在源侧的集标识（红果的 vid），框架据此写 episode.vid。
+//
+// 契约的 Episode 只有集号 / 标题 / 时长，源侧集标识没有位置；为了让 2.0 迁移前的
+// 入库字段（episode.vid）不丢，框架另行约定这个可选方法。它不在 plugin.Plugin
+// 里，所以别的插件不实现也不影响契约。
+func (p *Plugin) WorkWithEpisodeKeys(ctx context.Context, ref plugin.WorkRef) (plugin.WorkDetail, []string, error) {
+	return p.work(ctx, ref)
+}
+
+// work 是 Work / WorkWithEpisodeKeys 的共同实现：取一页详情并解析出集表。
+func (p *Plugin) work(ctx context.Context, ref plugin.WorkRef) (plugin.WorkDetail, []string, error) {
+	if ref.ID == "" {
+		return plugin.WorkDetail{}, nil, fmt.Errorf("%w: WorkRef.ID 为空", plugin.ErrSchema)
+	}
+	body, err := p.get(ctx, "/player/"+ref.ID)
+	if err != nil {
+		return plugin.WorkDetail{}, nil, err
+	}
+	ser, err := parsePlayerPage(string(body), ref.ID)
+	if err != nil {
+		return plugin.WorkDetail{}, nil, err
+	}
+	episodes := make([]plugin.Episode, len(ser.vids))
+	for i := range ser.vids {
+		episodes[i] = plugin.Episode{No: i + 1}
+	}
+	detail := plugin.WorkDetail{
+		Work: plugin.Work{
+			Ref:         ref,
+			Title:       ser.name,
+			Year:        yearFromUnix(ser.firstVisibleTime),
+			Plot:        ser.intro,
+			CoverURL:    ser.cover,
+			Genres:      ser.tags,
+			EpisodeDecl: len(ser.vids),
+		},
+		Episodes: episodes,
+	}
+	return detail, ser.vids, nil
+}
+
+// Resolve 实现 plugin.Plugin：解析某一集的可播放直链。
+//
+// 出站成本是 2 个请求（详情页取集表 + 集页取直链），不是契约能力矩阵写的 1 个：
+// Resolve 的入参只有集号，集号 → 源侧集标识的映射只能从详情页拿，而插件不许保存
+// 状态（契约硬性要求 2）。要压到 1 个请求必须改接口（传入源侧集标识），属设计侧。
+//
+// epNo 超出集数 → ErrNotFound；集页 404 或 VideoObject 无 contentUrl → ErrNoStream
+// （契约错误语义表的两行：这一集不可播不是作品不存在）。
+func (p *Plugin) Resolve(ctx context.Context, ref plugin.WorkRef, epNo int) (plugin.Stream, error) {
+	_, vids, err := p.work(ctx, ref)
+	if err != nil {
+		return plugin.Stream{}, err
+	}
+	if epNo < 1 || epNo > len(vids) {
+		return plugin.Stream{}, fmt.Errorf("%w: %s 没有第 %d 集（共 %d 集）",
+			plugin.ErrNotFound, ref.ID, epNo, len(vids))
+	}
+	vid := vids[epNo-1]
+	body, err := p.get(ctx, "/player/"+ref.ID+"/"+vid)
+	if err != nil {
+		if errors.Is(err, plugin.ErrNotFound) {
+			return plugin.Stream{}, fmt.Errorf("%w: 集页 %s/%s 返回 404", plugin.ErrNoStream, ref.ID, vid)
+		}
+		return plugin.Stream{}, err
+	}
+	url, err := parseDirectURL(string(body), ref.ID, vid)
+	if err != nil {
+		return plugin.Stream{}, err
+	}
+	return plugin.Stream{URL: url}, nil
+}
+
+// Health 实现 plugin.Plugin：取一次源侧目录索引，证明「能连上、能拿到已知对象」。
+//
+// 只用 200 + 非空判据；内容解析与分页属 Enumerate（S5）。它不参与刷新逻辑，
+// 失败也不影响服务启动（契约 Health 注释）。
+func (p *Plugin) Health(ctx context.Context) error {
+	_, err := p.get(ctx, sitemapIndexPath)
+	return err
+}
+
+// get 发一次 GET 并读回响应体，把结果映射成契约哨兵：
+//
+//	429 / 403        → ErrRejected（可重试，需退避）
+//	404              → ErrNotFound
+//	其余非 2xx、传输错误、读体失败、空响应 → ErrUpstream
+//	响应体超 maxBodyBytes                  → ErrSchema
+//
+// ctx 被取消 / 超时（用户点了取消）直接返回 ctx 的错误，不冒充源故障。
+// slog 一条出站记录（源 / 对象 / 状态 / 字节数），不记直链内容。
+func (p *Plugin) get(ctx context.Context, path string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(p.baseURL, "/")+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: 构造请求 %s: %v", plugin.ErrUpstream, path, err)
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		p.logger.WarnContext(ctx, "上游请求失败", "plugin", Name, "path", path, "upstream_status", 0, "bytes", 0)
+		return nil, fmt.Errorf("%w: GET %s: %v", plugin.ErrUpstream, path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+	level := slog.LevelInfo
+	if readErr != nil || resp.StatusCode != http.StatusOK {
+		level = slog.LevelWarn
+	}
+	p.logger.Log(ctx, level, "上游请求",
+		"plugin", Name, "path", path, "upstream_status", resp.StatusCode, "bytes", len(body))
+
+	if readErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("%w: 读取 %s 响应体: %v", plugin.ErrUpstream, path, readErr)
+	}
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden:
+		return nil, fmt.Errorf("%w: GET %s 返回 %d", plugin.ErrRejected, path, resp.StatusCode)
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, fmt.Errorf("%w: GET %s 返回 404", plugin.ErrNotFound, path)
+	case resp.StatusCode != http.StatusOK:
+		return nil, fmt.Errorf("%w: GET %s 返回 %d", plugin.ErrUpstream, path, resp.StatusCode)
+	}
+	if len(body) == 0 {
+		return nil, fmt.Errorf("%w: GET %s 返回空响应体", plugin.ErrUpstream, path)
+	}
+	if len(body) > maxBodyBytes {
+		return nil, fmt.Errorf("%w: GET %s 响应体超过 %d 字节", plugin.ErrSchema, path, maxBodyBytes)
+	}
+	return body, nil
+}
+
+// yearFromUnix 把上游的 unix 秒（字符串）换成 UTC 年份，尽力而为：缺失或非法
+// 返回 0，不报错（该字段缺失不该让整次调用失败）。
+func yearFromUnix(raw string) int {
+	if raw == "" {
+		return 0
+	}
+	var sec int64
+	if _, err := fmt.Sscanf(raw, "%d", &sec); err != nil || sec <= 0 {
+		return 0
+	}
+	return time.Unix(sec, 0).UTC().Year()
+}

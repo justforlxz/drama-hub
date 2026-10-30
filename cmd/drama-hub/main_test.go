@@ -14,9 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/justforlxz/drama-hub/internal/provider"
+	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
+	"github.com/justforlxz/drama-hub/internal/sync"
 	"github.com/justforlxz/drama-hub/internal/web"
 )
 
@@ -29,15 +30,19 @@ func newTestHandler(t *testing.T) http.Handler {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return newHandler(slog.New(slog.DiscardHandler), store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer())
+	return newHandler(slog.New(slog.DiscardHandler), store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer(), testSources())
 }
 
 // testSyncer 是管理 API 的数据源依赖。cmd 的测试不触发同步，只为满足装配参数；
-// BaseURL 指向本机 0 端口，即使误触发同步也只会立刻连接失败，不会打到真站。
+// BaseURL 指向本机 1 端口，即使误触发同步也只会立刻连接失败，不会打到真站。
 func testSyncer() web.SeriesSyncer {
-	src := provider.NewSource(nil, slog.New(slog.DiscardHandler))
-	src.BaseURL = "http://127.0.0.1:1"
-	return src
+	logger := slog.New(slog.DiscardHandler)
+	return sync.New(hongguo.New(hongguo.Config{BaseURL: "http://127.0.0.1:1", Logger: logger}))
+}
+
+// testSources 是状态页的播放源清单，形状与生产一致（名字来自插件）。
+func testSources() []web.Source {
+	return []web.Source{{Name: hongguo.Name, Label: "红果官网 SSR"}}
 }
 
 func serve(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
@@ -133,7 +138,7 @@ func TestHandler_LogsRequests(t *testing.T) {
 			}
 			defer func() { _ = db.Close() }()
 			h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
-				store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer())
+				store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer(), testSources())
 
 			rec := serve(t, h, http.MethodGet, c.path)
 			if rec.Code != c.wantCode {
@@ -205,7 +210,7 @@ func TestHandler_StreamEpisode(t *testing.T) {
 	}
 	uid := "e" + strconv.FormatInt(epID, 10)
 	token := stream.Sign([]byte(secret), uid)
-	h := newHandler(logger, st, settings, testSyncer())
+	h := newHandler(logger, st, settings, testSyncer(), testSources())
 
 	rec := serve(t, h, http.MethodGet, "/s/"+token+"/e/"+uid)
 	if rec.Code != http.StatusOK {
@@ -265,7 +270,7 @@ func TestHandler_SegmentRoute(t *testing.T) {
 		t.Fatalf("Set stream_secret: %v", err)
 	}
 	buf := &bytes.Buffer{}
-	h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), st, settings, testSyncer())
+	h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), st, settings, testSyncer(), testSources())
 
 	// 正确签名 + 库中不存在的集：走到 handler 后是 404，而不是 501 兜底。
 	uid := "e999"
@@ -349,7 +354,7 @@ func TestHandler_WebDAV(t *testing.T) {
 	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
 		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
-	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer())
+	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer(), testSources())
 
 	// 无认证 → 401（不是 501：说明 /dav/ 已接上真实 handler）。
 	if rec := serve(t, h, "PROPFIND", "/dav/"); rec.Code != http.StatusUnauthorized {
@@ -427,7 +432,7 @@ func TestHandler_MergedPlaylist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateMergeGroup: %v", err)
 	}
-	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer())
+	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer(), testSources())
 
 	uid := "m" + strconv.FormatInt(gid, 10)
 	token := stream.Sign([]byte(secret), uid)
@@ -470,5 +475,129 @@ func TestHandler_MergedPlaylist(t *testing.T) {
 	// 坏签名的合并集请求 → 401（装配根注入的 stream.Verify 生效）。
 	if rec = serve(t, h, http.MethodGet, "/s/bogus/e/"+uid); rec.Code != http.StatusUnauthorized {
 		t.Errorf("坏签名合并集状态码 = %d, 期望 401", rec.Code)
+	}
+}
+
+// 装配根显式注册插件（不用 init()），并且 plugin.<源>.* 配置真的进到插件：
+// 把 base_url 指向假官网后，管理 API 的同步请求就打在这个假官网上。
+func TestPluginConfigReachesPlugin(t *testing.T) {
+	ctx := context.Background()
+	// handler 在自己的 goroutine 里跑，用 channel 收请求路径：既不用锁也不用 sleep。
+	paths := make(chan string, 4)
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(site.Close)
+
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "plugin.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	if err := settings.Set(ctx, store.PluginSettingKey(hongguo.Name, store.PluginItemBaseURL), site.URL); err != nil {
+		t.Fatalf("Set base_url: %v", err)
+	}
+	if err := settings.Set(ctx, store.PluginSettingKey(hongguo.Name, store.PluginItemRequestTimeout), "5"); err != nil {
+		t.Fatalf("Set request_timeout_sec: %v", err)
+	}
+
+	logger := slog.New(slog.DiscardHandler)
+	reg, err := newPlugins(ctx, settings, logger)
+	if err != nil {
+		t.Fatalf("newPlugins: %v", err)
+	}
+	p, ok := reg.Get(hongguo.Name)
+	if !ok {
+		t.Fatalf("注册表里没有 %q：装配根必须显式注册内置插件", hongguo.Name)
+	}
+	h := newHandler(logger, st, settings, sync.New(p), sourceList(reg))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/dramas", strings.NewReader(`{"series_id":"7503745441910017049"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("POST /api/dramas 状态码 = %d, 期望 502（上游 500）", rec.Code)
+	}
+	select {
+	case got := <-paths:
+		if got != "/player/7503745441910017049" {
+			t.Fatalf("上游请求路径 = %q, 期望 /player/<id>", got)
+		}
+	default:
+		t.Fatal("同步没有打到配置的 base_url")
+	}
+
+	// 状态页读的是同一组配置键，值的来源只有 settings。
+	statusRec := serve(t, h, http.MethodGet, "/api/status")
+	var status struct {
+		Sources []struct {
+			Name              string `json:"name"`
+			Enabled           bool   `json:"enabled"`
+			BaseURL           string `json:"base_url"`
+			RequestTimeoutSec int    `json:"request_timeout_sec"`
+			Reason            string `json:"reason"`
+		} `json:"sources"`
+	}
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("解析 /api/status: %v", err)
+	}
+	if len(status.Sources) != 1 {
+		t.Fatalf("sources = %+v, 期望 1 个源", status.Sources)
+	}
+	src := status.Sources[0]
+	if src.Name != hongguo.Name || !src.Enabled || src.BaseURL != site.URL || src.RequestTimeoutSec != 5 || src.Reason != "" {
+		t.Fatalf("状态页的源 = %+v, 期望 web 启用 + 配置的 base_url + 5 秒超时", src)
+	}
+}
+
+// 插件被停用（没有任何配置行时默认启用）时服务照常启动，状态页给出原因。
+func TestPluginDisabledStillStarts(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "disabled.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+
+	// 先验「配置缺失照常启动」：没有任何 plugin.* 行，注册仍然成功。
+	logger := slog.New(slog.DiscardHandler)
+	reg, err := newPlugins(ctx, settings, logger)
+	if err != nil {
+		t.Fatalf("配置缺失时 newPlugins 报错：%v", err)
+	}
+	if _, ok := reg.Get(hongguo.Name); !ok {
+		t.Fatalf("配置缺失时 %q 未注册", hongguo.Name)
+	}
+
+	if err := settings.Set(ctx, store.PluginSettingKey(hongguo.Name, store.PluginItemEnabled), "false"); err != nil {
+		t.Fatalf("Set enabled: %v", err)
+	}
+	reg, err = newPlugins(ctx, settings, logger)
+	if err != nil {
+		t.Fatalf("停用时 newPlugins 报错：%v", err)
+	}
+	h := newHandler(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name)), sourceList(reg))
+
+	rec := serve(t, h, http.MethodGet, "/api/status")
+	var status struct {
+		Sources []struct {
+			Enabled bool   `json:"enabled"`
+			Reason  string `json:"reason"`
+		} `json:"sources"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("解析 /api/status: %v", err)
+	}
+	if len(status.Sources) != 1 {
+		t.Fatalf("sources = %+v, 期望 1 个源", status.Sources)
+	}
+	if status.Sources[0].Enabled || !strings.Contains(status.Sources[0].Reason, "enabled=false") {
+		t.Fatalf("停用的源 = %+v, 期望 enabled=false 且原因里带配置键", status.Sources[0])
 	}
 }

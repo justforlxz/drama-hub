@@ -14,12 +14,22 @@ import (
 )
 
 // SeriesSyncer 是「新增剧目」的依赖：按上游剧 id 把一个剧同步入库。生产实现是
-// *provider.Source（SyncSeries 签名一致，见 internal/provider），测试注入假实现。
+// *sync.Syncer（签名一致，见 internal/sync），测试注入假实现。
 //
 // 接口定义在消费方（docs/DEV-STANDARDS.md「代码组织」）：本包只用这一个方法，
-// 不 import provider，也不预建别的数据源方法。
+// 不 import sync / plugin，也不预建别的数据源方法。
 type SeriesSyncer interface {
 	SyncSeries(ctx context.Context, st *store.Store, sid string) error
+}
+
+// Source 是一个播放源在状态页上的展示身份。装配根从注册表取名字（= Plugin.Name()），
+// 配一句人看得懂的标签；本包不 import plugin，也不猜有哪些源。
+//
+// 其余状态（是否启用、生效配置、不可用原因）由本包每请求现读 settings 得出，
+// 因此改配置下一次读即生效（硬约束 5）。
+type Source struct {
+	Name  string // = Plugin.Name()，也是 drama.provider / episode.source 的值
+	Label string // 状态页展示用；空 = 只显示 Name
 }
 
 // Server 汇总管理 API 与三页管理界面。它实现 http.Handler，由 cmd 挂到 `/` 上；
@@ -28,21 +38,23 @@ type Server struct {
 	st       *store.Store
 	settings *store.Settings
 	syncer   SeriesSyncer
+	sources  []Source
 	logger   *slog.Logger
 	mux      *http.ServeMux
 }
 
-// NewServer 构造路由表。st / settings / syncer 不可为 nil；logger 用于请求与
-// 同步日志。
+// NewServer 构造路由表。st / settings / syncer 不可为 nil；sources 是状态页要列的
+// 播放源（装配根按注册表给，空表示没有源）；logger 用于请求与同步日志。
 //
 // 路由分两类：三页界面（`/`、`/merges`、`/status` 与内嵌的 `/static/`）与
 // 管理 API（`/api/` 子树）。不注册 catch-all：未登记路径由 ServeMux 兜底 404，
 // 这是「未知路径 → 404」的前提（cmd 的装配注释同此约定）。
-func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, logger *slog.Logger) *Server {
+func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, sources []Source, logger *slog.Logger) *Server {
 	s := &Server{
 		st:       st,
 		settings: settings,
 		syncer:   syncer,
+		sources:  sources,
 		logger:   logger,
 		mux:      http.NewServeMux(),
 	}

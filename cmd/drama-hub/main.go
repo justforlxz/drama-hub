@@ -13,10 +13,12 @@ import (
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/httpx"
-	"github.com/justforlxz/drama-hub/internal/provider"
+	"github.com/justforlxz/drama-hub/internal/plugin"
+	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
 	"github.com/justforlxz/drama-hub/internal/segment"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
+	"github.com/justforlxz/drama-hub/internal/sync"
 	"github.com/justforlxz/drama-hub/internal/vfs"
 	"github.com/justforlxz/drama-hub/internal/web"
 	"github.com/justforlxz/drama-hub/internal/webdav"
@@ -51,10 +53,18 @@ func main() {
 	}
 	defer func() { _ = db.Close() }()
 
+	settings := store.NewSettings(db.DB)
+	plugins, err := newPlugins(context.Background(), settings, logger)
+	if err != nil {
+		logger.Error("注册插件失败", "err", err)
+		os.Exit(1)
+	}
+
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           newHandler(logger, store.NewStore(db.DB), store.NewSettings(db.DB), provider.NewSource(nil, logger)),
+		Addr: addr,
+		Handler: newHandler(logger, store.NewStore(db.DB), settings,
+			sync.New(mustPlugin(plugins, hongguo.Name)), sourceList(plugins)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -99,7 +109,7 @@ func main() {
 //
 // 请求日志中间件只在装配根挂一次：/healthz、/dav/、/s/、/ 与未知路径都经它，
 // 每请求恰一条访问日志（token 段掩码，见 internal/httpx）。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer) http.Handler {
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, sources []web.Source) http.Handler {
 	cutter := segment.NewCutter(st, settings, logger, stream.Verify)
 	streamSrv := stream.NewServer(st, settings, logger)
 
@@ -128,8 +138,59 @@ func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, 
 	mux.Handle(segment.Route, cutter)
 	// `/s/` 兜底：未单独注册的 `/s/` 子路径仍是 501（「已规划未实现」的既有语义）。
 	mux.Handle("/s/", streamSrv)
-	mux.Handle("/", web.NewServer(st, settings, syncer, logger))
+	mux.Handle("/", web.NewServer(st, settings, syncer, sources, logger))
 	return httpx.RequestLogger(logger, mux)
+}
+
+// 插件配置的兜底值（契约默认值见 docs/PLUGIN-CONTRACT.md「配置」）。
+const defaultPluginTimeoutSec = 30
+
+// newPlugins 显式注册内置插件（ADR-0006 第 5 条：没有 init() 自动注册，装配根逐个
+// Register）。插件配置现读 settings（硬约束 5）：base_url 空 = 用插件内置地址，
+// request_timeout_sec 决定出站 client 的超时。
+//
+// 配置读不出来（值非法、库被手改）时用插件默认值并 warn：配置错不该让服务起不来，
+// 原因与现状在状态页看得见（plugin.<源>.* 三行）。
+func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logger) (*plugin.Registry, error) {
+	baseURL, err := settings.String(ctx, store.PluginSettingKey(hongguo.Name, store.PluginItemBaseURL))
+	if err != nil {
+		logger.Warn("读插件 base_url 失败，用插件内置地址", "plugin", hongguo.Name, "err", err)
+		baseURL = ""
+	}
+	timeoutSec, err := settings.Int(ctx, store.PluginSettingKey(hongguo.Name, store.PluginItemRequestTimeout))
+	if err != nil {
+		logger.Warn("读插件 request_timeout_sec 失败，用默认值", "plugin", hongguo.Name, "err", err)
+		timeoutSec = defaultPluginTimeoutSec
+	}
+	reg := plugin.NewRegistry()
+	if err := reg.Register(hongguo.New(hongguo.Config{
+		BaseURL:    baseURL,
+		HTTPClient: &http.Client{Timeout: time.Duration(timeoutSec) * time.Second},
+		Logger:     logger,
+	})); err != nil {
+		return nil, err
+	}
+	return reg, nil
+}
+
+// mustPlugin 取已注册的插件。名字写死在内置清单里，取不到只可能是装配 bug，
+// 启动阶段 panic 是允许的（DEV-STANDARDS「错误处理」）。
+func mustPlugin(reg *plugin.Registry, name string) plugin.Plugin {
+	p, ok := reg.Get(name)
+	if !ok {
+		panic("装配错误：插件 " + name + " 未注册")
+	}
+	return p
+}
+
+// sourceList 把注册表里的源翻成状态页要展示的清单（标签是人看的，不放注册表）。
+func sourceList(reg *plugin.Registry) []web.Source {
+	labels := map[string]string{hongguo.Name: "红果官网 SSR"}
+	out := make([]web.Source, 0, len(reg.Names()))
+	for _, name := range reg.Names() {
+		out = append(out, web.Source{Name: name, Label: labels[name]})
+	}
+	return out
 }
 
 // handleHealthz 是存活探测：只证明进程还能接请求。

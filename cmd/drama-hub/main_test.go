@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -54,13 +55,11 @@ func TestHandler_Healthz(t *testing.T) {
 	}
 }
 
-// TestHandler_UnimplementedMounts 覆盖三个挂载点的占位语义：
+// TestHandler_UnimplementedMounts 覆盖仍是占位的挂载点语义：
 // 任意方法、任意子路径都是 501（AC2/AC3/AC4/AC7）。
+// /dav/ 已在 M4 接上真实 WebDAV，其契约归 internal/webdav（含「无认证 → 401」）。
 func TestHandler_UnimplementedMounts(t *testing.T) {
 	cases := []struct{ method, path string }{
-		{http.MethodGet, "/dav/"},
-		{http.MethodPost, "/dav/"},
-		{http.MethodPut, "/dav/x/y"},
 		{http.MethodGet, "/s/x"},
 		{http.MethodGet, "/api/"},
 		{http.MethodGet, "/api/x"},
@@ -87,7 +86,7 @@ func TestHandler_UnknownPathNotFound(t *testing.T) {
 }
 
 // TestHandler_LogsRequests（F5 AC7）证明装配根每请求恰一条访问日志：对
-// /healthz、/dav/、/nope 各发一次，每次 1 条含 method/path/status/duration_ms
+// /healthz、/dav/（无认证 → 401）、/nope 各发一次，每次 1 条含 method/path/status/duration_ms
 // 四字段的 JSON 日志，路径与状态和响应一致。logger 级别设为 Debug，避免级别
 // 过滤影响条数。
 func TestHandler_LogsRequests(t *testing.T) {
@@ -97,7 +96,7 @@ func TestHandler_LogsRequests(t *testing.T) {
 		wantCode int
 	}{
 		{"/healthz", "/healthz", http.StatusOK},
-		{"/dav/", "/dav/", http.StatusNotImplemented},
+		{"/dav/", "/dav/", http.StatusUnauthorized},
 		{"/nope", "/nope", http.StatusNotFound},
 	}
 	for _, c := range cases {
@@ -284,5 +283,77 @@ func TestHandler_SegmentRoute(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), token) {
 		t.Error("日志里出现 token 明文")
+	}
+}
+
+// TestHandler_WebDAV 覆盖 M4 的装配面：`/dav/` 已从占位 501 换成真实 WebDAV
+// （无认证 401；带认证 PROPFIND 207；strm 里的 token 由装配根的 signToken 生成，
+// 与 internal/stream 的签名一致——这条断言能挡住 TokenFunc 接错）。
+func TestHandler_WebDAV(t *testing.T) {
+	ctx := context.Background()
+	const (
+		user   = "davuser"
+		pass   = "davpass"
+		secret = "0123456789abcdef0123456789abcdef"
+	)
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "dav.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	for k, v := range map[store.SettingKey]string{
+		store.KeyWebDAVUser:   user,
+		store.KeyWebDAVPass:   pass,
+		store.KeyStreamSecret: secret,
+	} {
+		if err := settings.Set(ctx, k, v); err != nil {
+			t.Fatalf("Set %s: %v", k, err)
+		}
+	}
+	dramaID, err := st.UpsertDrama(ctx, store.Drama{Provider: "web", ProviderID: "p1", Title: "测试剧", Year: 2024})
+	if err != nil {
+		t.Fatalf("UpsertDrama: %v", err)
+	}
+	epID, err := st.UpsertEpisode(ctx, store.Episode{DramaID: dramaID, EpNo: 1, Title: "开局", Source: "web", Vid: "v1"})
+	if err != nil {
+		t.Fatalf("UpsertEpisode: %v", err)
+	}
+	h := newHandler(slog.New(slog.DiscardHandler), st, settings)
+
+	// 无认证 → 401（不是 501：说明 /dav/ 已接上真实 handler）。
+	if rec := serve(t, h, "PROPFIND", "/dav/"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("PROPFIND /dav/（无认证）状态码 = %d, 期望 401", rec.Code)
+	}
+
+	// 带认证 PROPFIND → 207。
+	req := httptest.NewRequest("PROPFIND", "/dav/", nil)
+	req.SetBasicAuth(user, pass)
+	req.Header.Set("Depth", "1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND /dav/ 状态码 = %d, 期望 207", rec.Code)
+	}
+
+	// strm 里的 token/uid 与出流端点一致：Sign(secret, episode.id) + `/e/<id>`。
+	// 文件名含空格与中文，请求目标必须是转义后的形式（真实客户端也这样发）。
+	path := "/dav/" + url.PathEscape("测试剧 (2024)") + "/Season%2001/" +
+		url.PathEscape("测试剧 - S01E01 - 开局") + ".strm"
+	req = httptest.NewRequest(http.MethodGet, path, nil)
+	req.SetBasicAuth(user, pass)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s 状态码 = %d, 期望 200", path, rec.Code)
+	}
+	uid := strconv.FormatInt(epID, 10)
+	want := "/s/" + stream.Sign([]byte(secret), uid) + "/e/" + uid + "\n"
+	if rec.Body.String() != want {
+		t.Errorf("strm 内容 = %q, 期望 %q", rec.Body.String(), want)
+	}
+	if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(rec.Body.Len()) {
+		t.Errorf("Content-Length = %q, body 长度 = %d", cl, rec.Body.Len())
 	}
 }

@@ -87,6 +87,10 @@ CREATE TABLE IF NOT EXISTS source_state (
 | `source_state.last_ok_at` | 状态页「上次成功」 | 调度器 | 状态页 |
 | `source_state.last_error` | 状态页「上次失败原因」；成功一轮后清空 | 调度器 | 状态页 |
 
+**S4 对端确认（MKACG-606）**：调度器的全部读写点（启动铺空行、每轮读游标、写回
+游标 + 三个时间 + 错误、状态页读五列）都只用上面五列，**够用，不需要新增或修改列**；
+`next_due` 继续不落库（请求时由 `last_run_at` + 现读 `refresh_interval_sec` 算出）。
+
 ### 0003：直链不落库
 
 ```sql

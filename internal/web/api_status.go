@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/justforlxz/drama-hub/internal/httpx"
+	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
@@ -55,6 +57,10 @@ type cacheView struct {
 //
 // enabled 取 plugin.<源>.enabled（缺失按 true），base_url / request_timeout_sec 取
 // 对应配置项；reason 非空说明这个源当前不可用或不可调度，页面上直接显示。
+//
+// 调度字段（running / last_* / interval_sec / next_due_at）来自调度器：上次运行、
+// 上次成功、上次错误都读 source_state，next_due_at 是请求时按 last_run_at + 现读
+// interval 算出来的（库里没有这一列）。空字符串 = 还没发生过。
 type sourceView struct {
 	Name              string `json:"name"`
 	Label             string `json:"label"`
@@ -62,6 +68,13 @@ type sourceView struct {
 	BaseURL           string `json:"base_url"`
 	RequestTimeoutSec int    `json:"request_timeout_sec"`
 	Reason            string `json:"reason"`
+
+	Running     bool   `json:"running"`
+	LastRunAt   string `json:"last_run_at"`
+	LastOkAt    string `json:"last_ok_at"`
+	LastError   string `json:"last_error"`
+	IntervalSec int    `json:"interval_sec"`
+	NextDueAt   string `json:"next_due_at"`
 }
 
 // statusView 是 GET /api/status 的响应体：同步计数 + 运行配置 + 播放源 + 缓存面。
@@ -104,10 +117,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
+	schedule, err := s.schedule.Status(ctx)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, statusView{
 		Totals:  totals,
 		Config:  cfg,
-		Sources: s.readSources(ctx),
+		Sources: s.readSources(ctx, schedule),
 		Cache:   newCacheView(cfg.StrmPrefix),
 	})
 }
@@ -154,16 +172,41 @@ func (s *Server) readConfig(ctx context.Context) (configView, error) {
 	return out, nil
 }
 
-// readSources 读一遍各播放源的配置。
+// readSources 读一遍各播放源的配置，并合上调度器给的调度现状。
 //
 // 读不出来不让看板整页失败：该源标成未启用并把原因写进 reason —— 看板的职责是
 // 让人看见缺什么。插件未启用或配置缺失时服务照常启动，原因就在这里可见。
-func (s *Server) readSources(ctx context.Context) []sourceView {
+func (s *Server) readSources(ctx context.Context, schedule []scheduler.SourceStatus) []sourceView {
+	byName := make(map[string]scheduler.SourceStatus, len(schedule))
+	for _, st := range schedule {
+		byName[st.Name] = st
+	}
 	out := make([]sourceView, 0, len(s.sources))
 	for _, src := range s.sources {
-		out = append(out, s.readSource(ctx, src))
+		v := s.readSource(ctx, src)
+		applySchedule(&v, byName[src.Name])
+		out = append(out, v)
 	}
 	return out
+}
+
+// applySchedule 把一个源的调度现状填进它的视图。时间写成 UTC RFC3339 文本（与库里
+// 的写法一致），零值写空串；时区转换归页面 JS（fmtTime）。
+func applySchedule(v *sourceView, st scheduler.SourceStatus) {
+	v.Running = st.Running
+	v.LastRunAt = formatTime(st.LastRunAt)
+	v.LastOkAt = formatTime(st.LastOkAt)
+	v.LastError = st.LastError
+	v.IntervalSec = st.IntervalSec
+	v.NextDueAt = formatTime(st.NextDueAt)
+}
+
+// formatTime 把调度器给的时间写成响应里的文本；零值写空串（页面显示「—」）。
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // readSource 读一个播放源的三项配置（键格式由 store.PluginSettingKey 给）。

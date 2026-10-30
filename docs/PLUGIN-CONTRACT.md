@@ -227,8 +227,11 @@ if err := reg.Register(hongguo.New(hongguo.Config{
 - 新增 `kindBool` 到 `internal/store` 的配置注册表；`settings` 的 key 校验从
   「7 个固定 key 的 switch」改成「固定 key + `plugin.<源>.<项>` 前缀模式」。
   这是 `internal/store` 的改动，归 S2。
-- 配置热读：`Settings` 现有实现每次读都查库、不缓存，因此改完下一次读取即生效
-  （硬约束 5 已满足，不需要新增机制）。
+- 配置生效方式分两类（与硬性要求 2「构造期不可变配置」一致）：`plugin.<源>.enabled`
+  与 `refresh_interval_sec`（全局与源级覆盖）热读——调度器每次醒来重读 settings，
+  改完最多 60 秒按新值算；`plugin.<源>.base_url` 与 `plugin.<源>.request_timeout_sec`
+  改后需重启（`Settings` 每次读都查库、不缓存，但插件实例与 `*http.Client` 在构造期
+  定型，不得为实现热读去改插件接口）。
 
 ## 第一个实现：红果
 

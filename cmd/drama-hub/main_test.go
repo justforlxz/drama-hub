@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
+	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
 	"github.com/justforlxz/drama-hub/internal/sync"
@@ -30,7 +31,7 @@ func newTestHandler(t *testing.T) http.Handler {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return newHandler(slog.New(slog.DiscardHandler), store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer(), testSources())
+	return newHandler(slog.New(slog.DiscardHandler), store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer(), fakeSchedule{}, testSources())
 }
 
 // testSyncer 是管理 API 的数据源依赖。cmd 的测试不触发同步，只为满足装配参数；
@@ -39,6 +40,13 @@ func testSyncer() web.SeriesSyncer {
 	logger := slog.New(slog.DiscardHandler)
 	return sync.New(hongguo.New(hongguo.Config{BaseURL: "http://127.0.0.1:1", Logger: logger}), nil)
 }
+
+// fakeSchedule 是管理面的调度依赖替身：cmd 的测试不跑调度器循环，只验证接线。
+type fakeSchedule struct{}
+
+func (fakeSchedule) Trigger(context.Context, string) error { return nil }
+
+func (fakeSchedule) Status(context.Context) ([]scheduler.SourceStatus, error) { return nil, nil }
 
 // testSources 是状态页的播放源清单，形状与生产一致（名字来自插件）。
 func testSources() []web.Source {
@@ -138,7 +146,7 @@ func TestHandler_LogsRequests(t *testing.T) {
 			}
 			defer func() { _ = db.Close() }()
 			h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
-				store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer(), testSources())
+				store.NewStore(db.DB), store.NewSettings(db.DB), testSyncer(), fakeSchedule{}, testSources())
 
 			rec := serve(t, h, http.MethodGet, c.path)
 			if rec.Code != c.wantCode {
@@ -210,7 +218,7 @@ func TestHandler_StreamEpisode(t *testing.T) {
 	}
 	uid := "e" + strconv.FormatInt(epID, 10)
 	token := stream.Sign([]byte(secret), uid)
-	h := newHandler(logger, st, settings, testSyncer(), testSources())
+	h := newHandler(logger, st, settings, testSyncer(), fakeSchedule{}, testSources())
 
 	rec := serve(t, h, http.MethodGet, "/s/"+token+"/e/"+uid)
 	if rec.Code != http.StatusOK {
@@ -270,7 +278,7 @@ func TestHandler_SegmentRoute(t *testing.T) {
 		t.Fatalf("Set stream_secret: %v", err)
 	}
 	buf := &bytes.Buffer{}
-	h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), st, settings, testSyncer(), testSources())
+	h := newHandler(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), st, settings, testSyncer(), fakeSchedule{}, testSources())
 
 	// 正确签名 + 库中不存在的集：走到 handler 后是 404，而不是 501 兜底。
 	uid := "e999"
@@ -354,7 +362,7 @@ func TestHandler_WebDAV(t *testing.T) {
 	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
 		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
-	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer(), testSources())
+	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources())
 
 	// 无认证 → 401（不是 501：说明 /dav/ 已接上真实 handler）。
 	if rec := serve(t, h, "PROPFIND", "/dav/"); rec.Code != http.StatusUnauthorized {
@@ -432,7 +440,7 @@ func TestHandler_MergedPlaylist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateMergeGroup: %v", err)
 	}
-	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer(), testSources())
+	h := newHandler(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources())
 
 	uid := "m" + strconv.FormatInt(gid, 10)
 	token := stream.Sign([]byte(secret), uid)
@@ -513,7 +521,7 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 	if !ok {
 		t.Fatalf("注册表里没有 %q：装配根必须显式注册内置插件", hongguo.Name)
 	}
-	h := newHandler(logger, st, settings, sync.New(p, nil), sourceList(reg))
+	h := newHandler(logger, st, settings, sync.New(p, nil), fakeSchedule{}, sourceList(reg))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/dramas", strings.NewReader(`{"series_id":"7503745441910017049"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -582,7 +590,7 @@ func TestPluginDisabledStillStarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("停用时 newPlugins 报错：%v", err)
 	}
-	h := newHandler(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name), nil), sourceList(reg))
+	h := newHandler(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name), nil), fakeSchedule{}, sourceList(reg))
 
 	rec := serve(t, h, http.MethodGet, "/api/status")
 	var status struct {

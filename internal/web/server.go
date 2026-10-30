@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/justforlxz/drama-hub/internal/httpx"
+	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
@@ -38,22 +39,33 @@ type Server struct {
 	st       *store.Store
 	settings *store.Settings
 	syncer   SeriesSyncer
+	schedule Schedule
 	sources  []Source
 	logger   *slog.Logger
 	mux      *http.ServeMux
 }
 
-// NewServer 构造路由表。st / settings / syncer 不可为 nil；sources 是状态页要列的
-// 播放源（装配根按注册表给，空表示没有源）；logger 用于请求与同步日志。
+// Schedule 是刷新调度的依赖：手动触发一轮，以及状态页要显示的调度现状。
+// 生产实现是 *scheduler.Scheduler（签名一致）；测试注入假实现。
+//
+// 接口定义在消费方：本包只要这两个动作，不关心三段、单飞锁与游标。
+type Schedule interface {
+	Trigger(ctx context.Context, source string) error
+	Status(ctx context.Context) ([]scheduler.SourceStatus, error)
+}
+
+// NewServer 构造路由表。st / settings / syncer / schedule 不可为 nil；sources 是
+// 状态页要列的播放源（装配根按注册表给，空表示没有源）；logger 用于请求与同步日志。
 //
 // 路由分两类：三页界面（`/`、`/merges`、`/status` 与内嵌的 `/static/`）与
 // 管理 API（`/api/` 子树）。不注册 catch-all：未登记路径由 ServeMux 兜底 404，
 // 这是「未知路径 → 404」的前提（cmd 的装配注释同此约定）。
-func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, sources []Source, logger *slog.Logger) *Server {
+func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, schedule Schedule, sources []Source, logger *slog.Logger) *Server {
 	s := &Server{
 		st:       st,
 		settings: settings,
 		syncer:   syncer,
+		schedule: schedule,
 		sources:  sources,
 		logger:   logger,
 		mux:      http.NewServeMux(),
@@ -73,6 +85,7 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 	s.mux.HandleFunc("GET /api/dramas/{id}/merge-groups", s.handleListMergeGroups)
 	s.mux.HandleFunc("POST /api/dramas/{id}/merge-groups", s.handleCreateMergeGroup)
 	s.mux.HandleFunc("DELETE /api/merge-groups/{id}", s.handleDeleteMergeGroup)
+	s.mux.HandleFunc("POST /api/refresh", s.handleRefresh)
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
 	return s
 }

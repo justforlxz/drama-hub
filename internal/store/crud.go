@@ -223,6 +223,62 @@ func (s *Store) DeleteDrama(ctx context.Context, id int64) error {
 	return nil
 }
 
+// ExistingProviderIDs 返回某个源已在库的 provider_id 集合。
+//
+// 一轮「新剧灌库」用它算差集（枚举到的标识里哪些库里还没有）：一次查询取全量身份，
+// 不做「每部剧一次 SELECT」。集合是只读快照，调用方不要改它。
+func (s *Store) ExistingProviderIDs(ctx context.Context, provider string) (map[string]struct{}, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT provider_id FROM drama WHERE provider = ?`, provider)
+	if err != nil {
+		return nil, fmt.Errorf("列 %s 的已有作品标识: %w", provider, err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("读取作品标识行: %w", err)
+		}
+		out[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历 %s 的作品标识: %w", provider, err)
+	}
+	return out, nil
+}
+
+// StaleProviderIDs 返回某个源里 sync_at 最旧的 limit 部作品的 provider_id，按 sync_at
+// 升序（同一时间按 id 升序保证顺序确定）。
+//
+// 一轮「存量轮转」用它挑这一批要刷新的剧。limit <= 0 返回空切片：refresh_batch=0
+// 表示关闭存量轮转，不是报错。
+func (s *Store) StaleProviderIDs(ctx context.Context, provider string, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT provider_id FROM drama WHERE provider = ? ORDER BY sync_at, id LIMIT ?`,
+		provider, limit)
+	if err != nil {
+		return nil, fmt.Errorf("列 %s 最旧的 %d 部作品: %w", provider, limit, err)
+	}
+	defer rows.Close()
+
+	out := make([]string, 0, limit)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("读取待刷新作品标识: %w", err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历 %s 最旧作品: %w", provider, err)
+	}
+	return out, nil
+}
+
 // UpsertEpisode 以 (drama_id, ep_no) 为身份写入或更新一集，返回行 id。
 //
 // 冲突时只更新可变态（title / duration_sec / source / vid / play_url / play_url_at），

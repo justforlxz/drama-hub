@@ -1,0 +1,237 @@
+# 数据模型
+
+状态：定稿（2026-10-30，MKACG-604 / stage 1）
+当前基线：`internal/store/migrations/0001_init.sql`（`main @ d0bb513`）
+本文的 SQL 是**草案**，落地时机：0002 归 S5，0003 必须与它的代码改动同一个提交。
+
+## 上游能给什么（先定数据来源，再定列）
+
+红果 `GET /player/{id}` 的一个响应里（`seriesDetail`）能给到的：
+
+| 上游字段 | 内容 | 实测 |
+|---|---|---|
+| `series_name` | 剧名 | 948/948 部有值 |
+| `series_cover` | 封面 URL | 948/948 部非空；**无签名、不过期**（`p3-novel.byteimg.com/...~tplv-shrink:640:0.image`） |
+| `series_intro` | 简介 | 948/948 部非空 |
+| `tags` | 分类标签数组 | 948/948 部非空；抽样 800 部里每部 3–12 个（均值 6.99），去重 259 个 |
+| `episode_cnt` | 声明总集数 | 948/948 部 = `len(vid_list)` |
+| `vid_list` | 全部集标识数组 | 下标即集号 |
+| `first_visible_time` | 上线时间（unix 秒） | 部分缺失 → `year` 尽力而为 |
+| `accessible_episode_cnt` | **免付费可见集数** | 88/88 部 = 3（全集需付费，`protectedPlayback=true`） |
+
+**给不到的**（因此不能进列，或必须恒为空）：每集标题、每集时长、每集直链（除第 1 集
+的 10 秒预览）、任何付费解锁后的数据。取证见 `docs/L1-CORPUS-SCOPE.md`。
+逐集去取的成本是 1 请求 × 2847 万集（≈ 720 天），已否决。
+
+## 表结构变更
+
+### 0002：剧目分类 + 数据源调度状态
+
+```sql
+-- 0002_add_genre_and_source_state.sql
+
+-- 主类型：上游声明的第一个标签（红果 tags[0]，948 部样本 100% 有值）。
+-- WebDAV 的 /<类型>/ 一级目录按本列分组；空串表示上游未声明，目录兜底为「其他」。
+ALTER TABLE drama ADD COLUMN genre TEXT NOT NULL DEFAULT '';
+
+-- 全部标签：上游 tags 的原样 JSON 数组（保序、去重）。只为「刷新下来的数据全部入库」
+-- 的保真，不做检索；归类只认 genre 单值。
+ALTER TABLE drama ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+
+-- 目录列举：WHERE genre = ? ORDER BY title 走本索引（同一条索引也覆盖纯 genre 的
+-- DISTINCT / GROUP BY，因此不再单建 (genre)）。
+CREATE INDEX IF NOT EXISTS idx_drama_genre_title ON drama (genre, title);
+
+-- /全部/ 目录的列举：ORDER BY title。
+CREATE INDEX IF NOT EXISTS idx_drama_title ON drama (title);
+
+-- 数据源级调度状态：每源一行。
+--
+-- cursor 是插件枚举的不透明断点（全库枚举跨重启续跑的唯一依据）；
+-- last_* 驱动状态页与「下次时间由配置推导、不依赖内存残留」。
+-- 不存 next_due_at：它由 last_run_at + 当前 interval 现算，存下来就是第二份真值。
+-- 与 settings 分表：settings 是运行配置（人写），本表是调度进展（框架写）。
+CREATE TABLE IF NOT EXISTS source_state (
+    name        TEXT PRIMARY KEY,
+    cursor      TEXT NOT NULL DEFAULT '',
+    last_run_at TEXT NOT NULL DEFAULT '',
+    last_ok_at  TEXT NOT NULL DEFAULT '',
+    last_error  TEXT NOT NULL DEFAULT ''
+);
+```
+
+每列 / 每个索引的用途：
+
+| 对象 | 用途 | 谁写 | 谁读 |
+|---|---|---|---|
+| `drama.genre` | `/<类型>/` 一级目录的分类键；一条剧只属一个类型 | 框架（`Work().Genres[0]`） | `internal/vfs` 目录列举 |
+| `drama.tags` | 保真：上游声明的全部标签 | 框架（`Work().Genres`） | 只出现在管理面/AI 检索，不进目录 |
+| `idx_drama_genre_title` | `/<类型>/` 目录的分页列举（`WHERE genre=? ORDER BY title`）；也覆盖 `SELECT DISTINCT genre` 与 `GROUP BY genre` | — | `internal/vfs`、`internal/web` |
+| `idx_drama_title` | `全部/` 目录的分页列举（`ORDER BY title`） | — | `internal/vfs` |
+| `source_state.cursor` | 枚举断点，38 小时全量灌库续跑 | 调度器（每轮成功后写） | 调度器 |
+| `source_state.last_run_at` | 算 `next_due` 的唯一真值来源（重启可算） | 调度器 | 调度器、状态页 |
+| `source_state.last_ok_at` | 状态页「上次成功」 | 调度器 | 状态页 |
+| `source_state.last_error` | 状态页「上次失败原因」；成功一轮后清空 | 调度器 | 状态页 |
+
+### 0003：直链不落库
+
+```sql
+-- 0003_drop_play_url.sql
+
+-- 直链是请求时向插件解析的短时凭据，持久化等于把过期链接写进库；
+-- 播放改为请求时解析（DESIGN：直链不落库）。
+ALTER TABLE episode DROP COLUMN play_url;
+ALTER TABLE episode DROP COLUMN play_url_at;
+```
+
+**0003 必须与它的代码改动同一个提交**，否则仓库处于编译不过的状态：
+
+- `internal/store/crud.go`：`episodeColumns` / `scanEpisode` / `UpsertEpisode` 去掉两列；
+  `store.Episode` 去掉 `PlayURL` / `PlayURLAt`。
+- `internal/store/stats.go`：`PlayableEpisodes` 现在按 `play_url <> ''` 计数
+  （`internal/store/stats.go:30`）。删列后该定义不存在，改成按「最近一次 `Resolve` 是否
+  成功」无法从库里得知 —— 因此**直接删掉 `PlayableEpisodes` 字段与它在
+  `internal/web/api_dramas.go` 的 `Playable` 输出**，管理面不再展示「可播集数」。
+  理由：这个数字在当前实现里恒为 0（同步从不写 `play_url`），删列只是让它别再骗人。
+- `internal/segment`、`internal/stream`：它们已经不读 `play_url`（走 `FetchDirectURL`），
+  只需把取直链改为调 `plugin.Resolve`。
+
+## 字段来源逐个定稿
+
+### 类型 / 分类
+
+- **来源**：`Work().Genres`，即上游 `seriesDetail.tags`，保序。
+- **两个落点**：`drama.genre` = `Genres[0]`（主类型，目录用，单值）；
+  `drama.tags` = 全部标签的 JSON 数组（保真用）。
+- **为什么不用「多对多两张表」**：目录只需要一个单值类型；多值表要
+  `drama_genre` 关联表（≈ 200 万行）+ 两条查询路径，换来的能力 2.0 用不到
+  （没有「按标签筛」的对外接口）。JSON 列足以保真。
+- **空值**：`Genres` 为空 → `genre = ''`，目录兜底为 `其他`（`docs/DIRECTORY-CONTRACT.md`）。
+  实测 948/948 部有标签，但兜底必须有：兜底不是给红果的，是给第二个插件的。
+- **改名/改分类**：刷新时 `genre` 随 `tags[0]` 覆盖。这会让剧在 WebDAV 里换目录
+  ——Emby 会当成「旧剧消失 + 新剧出现」。这是上游行为的忠实反映，不做稳定性妥协。
+
+### 海报
+
+- **不新增列、不新增表**：复用现有 `artifact`（`kind='cover'`）。
+- **key 约定**：`<provider>/<provider_id>`（确定性派生，无需在 `drama` 上加外键列）。
+- **为什么复用 `artifact` 而不是加 `drama.cover_path`**：`internal/cache` 已经在管理
+  `artifact`（`kind IN ('cover','index')`），封面下载/落盘/读回已有实现；
+  并且 `artifact` 不被淘汰（ADR-0004 只让 rclone 淘汰视频分片），满足
+  「源图失效不影响已入库海报」。
+- `drama.cover_url` 保留为**上游原值**（溯源用），不做本地路径回填：两列表达两件事。
+- 上游封面地址无签名、不过期（实测），所以「源图失效」目前不是红果的问题；
+  本地资产仍要做，理由是第二个源可能会给短时签名链。
+
+### 剧集信息
+
+- `episode.ep_no` = `vid_list` 下标 + 1；`episode.vid` = `vid_list[i]`。
+- `episode.title` **恒为空**、`episode.duration_sec` **恒为 0**：
+  源侧批量拿不到（每集要 1 请求，2847 万次已否决）。
+  → 契约上这是**允许留零值**（`docs/PLUGIN-CONTRACT.md` `Episode` 注释），
+  实现上不许为此逐集抓。
+  → NFO 的 `<title>` 因此回落到 `第 N 集`（`internal/vfs/tree.go:embyLabel` 已这么写）。
+- `episode.source` = 插件名（`"web"`）。
+- `drama.episode_total` = `episode_cnt`；`drama.sync_at` = 本次刷新时间（UTC RFC3339）。
+
+### 合并数据
+
+- `merge_group` / `merge_item` **完全不新增、不修改**。
+- **刷新不冲掉编排**：这是结构保证——刷新只做 `UpsertDrama` / `UpsertEpisode` /
+  `RebuildEmbyItems`，而 `RebuildEmbyItems` 是**读** `merge_group` + `merge_item`
+  再重算派生表（`internal/store/merge.go:232` 起），不写这两张表。
+- 需要 Review 的一条：任何新的刷新代码 **MUST NOT** 写 `merge_*`，也 MUST NOT
+  `DELETE FROM emby_item`（那是 `RebuildEmbyItems` 的职责，它整体替换但保留合并语义）。
+
+### 播放入口（直链不落库）
+
+- 库中**没有任何一列**保存直链（0003 删两列后）。
+- 请求路径：`stream/segment` → 框架 → `plugin.Resolve(ref, epNo)` → `Stream.URL` → 字节中继。
+- 失败语义：`ErrNoStream` / `ErrNotFound` → **502，不写库、不缓存坏值**。
+- 红果实况：只有第 1 集有直链且是 10 秒预览，第 2..N 集 `ErrNoStream`，
+  第 4 集起 `ErrNotFound`。这是源侧事实，不是本服务缺陷。
+
+## provider 标识
+
+`Plugin.Name()` 直接进 `drama.provider` / `episode.source`。红果插件返回 **`"web"`**。
+
+- **理由**：库中已有 `provider='web'` 的数据；改名要写数据迁移（`UPDATE drama SET
+  provider='hongguo' WHERE provider='web'` + 同等的 `episode.source`），而 2.0 不需要
+  「同一剧目出现在两个源」。零迁移、零风险。
+- **被否决的备选**：`Name()="hongguo"` + 0002 里带一条 `UPDATE`。
+  否决理由：迁移一旦写错就污染身份列（`UNIQUE(provider, provider_id)`），
+  而收益只是名字好看。
+- **代价**：`"web"` 这个名字不表达「红果」。缓解：状态页与文档一律显示
+  `web（红果官网 SSR）`，接口层用 `WorkRef.Plugin` 而不是硬编码字符串。
+
+## 增删改语义
+
+| 情形 | 处理 | 理由 |
+|---|---|---|
+| 源里新增剧目 | 插入 | L1 的正向情形 |
+| 源里新增集（连载中） | 追加 `ep_no` 更大的行，`episode_total` 更新 | 现有 `UpsertEpisode` 已支持 |
+| 源里剧目标题/简介/封面/标签变化 | 覆盖 | 上游是真值 |
+| 源里集数变少 | **不删任何 `episode` 行**，只更新 `episode_total` | 删除会连带删 `merge_item`（`ON DELETE CASCADE`），静默破坏人工编排；少集的剧在 Emby 里多出几集，比丢掉编排轻 |
+| 源里剧目消失（下架） | **不删 `drama` 行**，只在 `source_state.last_error` / 日志里留痕 | 同上；且 sitemap 会滞后（实测最新 53 部缺失），把「枚举不到」当「下架」会误删正在上架的剧 |
+| 用户显式删剧 | `DELETE FROM drama`（现有 `DeleteDrama`，级联删集与编排） | 唯一删除入口 |
+
+一句话：**自动流程只增改，删除只能由人发起。**
+
+## 0002 的 dry-run 验证（已跑过）
+
+验证方式：把本文上面两个 `sql` 代码块**原样抽出来**（不是手抄），放进仓库副本的
+`internal/store/migrations/`，用**仓库自己的迁移 runner**（`store.Open` → `migrate`）跑：
+
+```sh
+# 从本文抽出两个 SQL 块 → 0002 / 0003
+python3 -c 'import re,io;s=io.open("docs/DATA-MODEL.md",encoding="utf-8").read();b=re.findall(r"```sql\n(.*?)```",s,re.S);io.open("/tmp/d/0002_add_genre_and_source_state.sql","w").write(b[0]);io.open("/tmp/d/0003_drop_play_url.sql","w").write(b[1])'
+cp /tmp/d/000{2,3}_*.sql <repo-copy>/internal/store/migrations/
+cd <repo-copy> && go test ./internal/store/ -run TestS1 -v
+```
+
+这样本文就是 SQL 的唯一真值：文档改了而验证没重跑，抽取出来的文件就会跑失败
+（本次改稿时它确实失败过一次——旧 schema 里的 `next_due_at` 已删）。
+
+结果：
+
+```
+首次 applied=3                       # 空库 → 最新（0001+0002+0003）
+二次 applied=0                       # 重复执行幂等
+user_version=3                       # 两次打开后都停在 3
+play_url 已移除: no such column: play_url
+索引 idx_drama_genre_title / idx_drama_title 均存在
+默认值 genre="" tags="[]"
+迁移 0001 0001_init.sql    (3806 bytes)
+迁移 0002 ...              (1590 bytes)
+迁移 0003 ...              (275 bytes)
+```
+
+三条要写清楚的幂等边界：
+
+1. **幂等的保证在 runner，不在 SQL。** `migrate` 用 `PRAGMA user_version` 比对版本，
+   第二次调用一个文件都不执行（`applied=0`）。因此「重复执行幂等」= 重复 `Open` 幂等。
+2. **裸重复执行 SQL 不幂等**，且这是 SQLite 的语义决定的：`ADD COLUMN` /
+   `DROP COLUMN` 重复执行必然报错。不许为此写成「先查 `pragma_table_info` 再决定」
+   的动态 SQL —— 那会让迁移文件变成不可 review 的脚本。
+3. **迁移文件名必须从 0001 连续递增**（`migrate.go` 强制），所以 0002、0003 之间
+   不能留空号；如果 S5 决定把删列提前，编号整体前移，内容不变。
+
+## 对现有代码的影响清单（给 S5 的输入，不是本文的实现）
+
+| 文件 | 影响 |
+|---|---|
+| `internal/store/crud.go` | `Drama` 加 `Genre`/`Tags`；`Episode` 删 `PlayURL`/`PlayURLAt`；列清单与 scan 同步 |
+| `internal/store/migrations/0002_*.sql`、`0003_*.sql` | 新增（内容见上） |
+| `internal/store/state.go`（新） | `source_state` 的读写：`LoadState` / `SaveState` |
+| `internal/store/stats.go` | 删 `PlayableEpisodes` |
+| `internal/web/api_dramas.go` | 删 `dramaView.Playable`、`episodeView.HasPlayURL` |
+| `internal/provider/provider.go` | `SyncSeries` 的写库部分移到 `internal/sync`，本包退化为 `internal/plugin/hongguo` |
+| `docs/DEV-STANDARDS.md` | 「配置」表加 5 个新 key；「数据源」章改指向插件契约 |
+
+## 2.0 明确不做
+
+- 类型/标签的多对多表、按标签检索接口。
+- 海报之外的图片资产（剧照、演员头像）：上游 `celebrities` 有数据但不进 2.0。
+- 每集标题/时长的补齐（源侧拿不到，逐集抓已否决）。
+- 跨源同剧去重。
+- `drama` / `episode` 的软删除列：不删就不需要 `deleted_at`。

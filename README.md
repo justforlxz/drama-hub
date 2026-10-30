@@ -122,6 +122,13 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
 - `docs/TEST-STANDARDS.md` — 测试分层、必须覆盖的协议断言
 - `docs/ACCEPTANCE.md` — 真机验收清单
 - `docs/adr/` — 架构决策记录
+- **2.0（框架 + 播放源插件化）设计定稿件**：
+  - `docs/PLUGIN-CONTRACT.md` — 插件接口、错误语义、注册与配置
+  - `docs/SCHEDULER-MODEL.md` — 刷新调度、并发、超时、失败隔离、手动触发
+  - `docs/DATA-MODEL.md` — 字段来源、`0002`/`0003` 迁移草案、增删改语义
+  - `docs/DIRECTORY-CONTRACT.md` — `/全部/` 与 `/<类型>/` 目录树、同名冲突、Emby 影响
+  - `docs/L1-CORPUS-SCOPE.md` — 「获取全部的剧集」口径与红果实测数字
+  - `docs/adr/0006-framework-plugin-boundary.md` — 框架 / 插件边界决策
 
 ## 状态
 

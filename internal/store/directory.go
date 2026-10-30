@@ -24,7 +24,7 @@ import (
 // 按字节序升序。
 //
 // 只有根目录用它，必须一次拿到全部 68 个分类，因此这是一条覆盖索引全扫
-// （60 万行约 74ms，随行数线性增长）。其它层不要用它，用 GenresIn 点查。
+// （60 万行约 74ms，随行数线性增长）。其它层不要用它，用 GenreExists 点查。
 func (s *Store) ListGenres(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT genre FROM drama ORDER BY genre`)
 	if err != nil {

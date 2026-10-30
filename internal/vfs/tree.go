@@ -231,7 +231,7 @@ func (t *Tree) listSeason(ctx context.Context, genreDir, shardDir, dramaDir stri
 
 // genresForDir 返回某个分类目录名对应的库内 genre 原值集合。
 //
-// 目录名 → 取值集合是**纯映射**：兜底名「其他」对应 `genre=”` 与「上游真的叫
+// 目录名 → 取值集合是**纯映射**：兜底名「其他」对应 genre 为空串 与「上游真的叫
 // 其他」两种取值（契约要求合并），其余目录名就是 genre 原值。因此这里只做存在性
 // 判断（`GenreExists`，`EXISTS` 点查，O(log n)），不做任何列举式查询。
 //

@@ -59,7 +59,8 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 - 迁移文件 `internal/store/migrations/NNNN_<verb>_<subject>.sql`，只向前，不改历史文件。启动时自动执行到最新。
 - 所有 SQL 只在 `internal/store` 出现；其它包通过方法访问。SQL 字符串拼接一律用参数占位。
 - 连接参数固定：`journal_mode=WAL`、`busy_timeout=5000`、`foreign_keys=ON`。
-- 派生的 `emby_item` 表由 `store.RebuildEmbyItems(dramaID)` 幂等重建，调用点只有同步完成与合并变更两处。
+- 派生的 `emby_item` 表由 `store.RebuildEmbyItems(dramaID)` 幂等重建，调用点只有同步完成（`provider.SyncSeries`）与合并变更（`CreateMergeGroup` / `DeleteMergeGroup`）两处。重建是「整体替换」：先删该剧全部行再按源集号顺序插入，对外集号从 1 起连续；单集占 1 个集号、合并组也只占 1 个。
+- 合并编排只在 `internal/store/merge.go`：`merge_group`（组）+ `merge_item`（组内成员，`ord` 即时间轴顺序）+ `emby_item`（派生）。`CreateMergeGroup` 校验成员至少 2 集、同剧、不重复、不与已有组重叠（违反返回 `ErrInvalid`，不落库）。
 - 时间统一存 UTC 的 RFC3339 文本；展示时区转换在 Web 层做。
 - store 用哨兵错误表达结果：查询/删除无行返回 `ErrNotFound`，唯一/主键约束冲突由 `wrapWriteErr` 统一映射为 `ErrConflict`（均可 `errors.Is` 判断），不向调用方泄漏裸 `*sqlite.Error`。
 - `drama` / `episode` 的写入一律 upsert：`drama` 以 `(provider, provider_id)`、`episode` 以 `(drama_id, ep_no)` 为幂等身份，冲突时只更新可变业务列，身份列与入参 `id` 被忽略，返回行 id。
@@ -90,29 +91,47 @@ ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（�
 
 ## 出流（stream）
 
-模块 `internal/stream`，装配在 `/s/` 前缀下。本阶段只有一个端点：
+模块 `internal/stream` 与 `internal/segment`（合并集部分），装配在 `/s/` 前缀下：
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/s/{token}/e/{uid}` | GET / HEAD | 单集 MP4 字节中继，Range 透传 |
-| `/s/{token}/seg/{uid}/{seq}.ts` | GET | 单集分片：MPEG-TS，`Cache-Control: public, max-age=86400`（M6） |
-| `/s/` 子树其余路径 | 任意 | 501（合并集属 M7） |
+| `/s/{token}/e/{uid}` | GET / HEAD | 单集 MP4 字节中继，Range 透传；**uid 是合并集句柄时返回自造 m3u8**（M7，由装配根按 uid 分派） |
+| `/s/{token}/e/{uid}/master.m3u8` | GET | 合并集 playlist 的标准别名（部分客户端会自行追加） |
+| `/s/{token}/seg/{uid}/{seq}.ts` | GET | 分片：单集按片内序、合并集按跨集时间轴（M6/M7），MPEG-TS |
+| `/s/` 子树其余路径 | 任意 | 501（已规划未实现） |
 
 `GET` 路由模式同时匹配 `HEAD`（Go 1.22 ServeMux 行为），不单独注册；`HEAD` 与
 `GET` 对同一 URL 的上游响应必须给出同一 `Content-Length`，且 `HEAD` 不读上游 body。
 
 ### uid 规则
 
-`uid = "e" + strconv.FormatInt(episode.id, 10)`（如 `e42`）。
-
-- 派生自**稳定的** `episode.id`（M1 的 upsert 保证同 id），不读 `emby_item`：那是
-  幂等重建的派生表，id 可能在重建中变化，而签名 URL 的缓存键必须长期稳定。
-- `e` 前缀把单集与合并集的 uid 空间分开（DESIGN D3）。**合并集 uid 不得匹配
-  `^e[0-9]+$`。**
-- 不匹配 `^e[0-9]+$`、超出 int64、或库中无该行 → 404。
+- 单集 `uid = "e" + strconv.FormatInt(episode.id, 10)`（如 `e42`），派生自稳定的
+  `episode.id`，不读 `emby_item`：那是幂等重建的派生表，而签名 URL 的缓存键必须
+  长期稳定。
+- 合并集 `uid = "m" + strconv.FormatInt(merge_group.id, 10)`（如 `m3`）。**合并集
+  uid 不得匹配 `^e[0-9]+$`**（DESIGN D3：uid 区分内容类型，装配根靠前缀分派）。
+- 单集 uid 只由 stream 消费；合并集 uid 的存续由 `emby_item` 派生表的 rebuild 保证
+  （`merge_group.id` 稳定，组删除后派生表重建、uid 不再出现）。
 
 uid 只是出流 URL 的句柄，与硬约束 6（对外集号只由 `emby_item` 决定）无关；
-本模块不读、不写 `emby_item`。
+stream 不读、不写 `emby_item`。
+
+### 合并集（M7）
+
+合并集 = 虚拟 HLS 分片聚合（ADR-0001，AGENTS 硬约束 2），实现分三层：
+
+1. **编排**（`internal/store/merge.go`）：`CreateMergeGroup` / `DeleteMergeGroup` /
+   `RebuildEmbyItems` 维护 `merge_group` / `merge_item` / `emby_item` 三张表。
+   合并变更与同步完成是派生表重建的两个调用点（硬约束 6：对外集号只由派生表
+   决定，合并调整只重建派生表、不动 `drama` / `episode`）。
+2. **时间轴**（`internal/segment/timeline.go` + `merged.go`）：`NewTimeline` 按成员
+   顺序把各集分片拼成连续 seq 空间，回答 `seq → (集号, 集内秒, 绝对起点)`。
+3. **端点**：playlist 渲染 `BuildPlaylist`（`#EXT-X-DISCONTINUITY` 插在集边界），
+   分片按时间轴解析后 `-c copy` 现切；切片的 `-output_ts_offset` 用绝对起点保证
+   跨集 DTS 连续（否则播放器在集边界因时间戳回退丢帧）。
+
+错误矩阵与单集一致：索引未就绪 503 + `Retry-After`（不出半截流，ADR-0001）；
+坏签名 401；未知组/越界 seq 404。
 
 ### 鉴权
 
@@ -308,11 +327,16 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 ```
 
 - 剧目录 `<剧名> (<年份>)`：年份来自 `drama.year`；`year=0` 显式写成 `(<0>)`，不省略。
-- 季目录恒为 `Season 01`（M3；`season` 是 M7 的 `emby_item` 概念）。
-- 集号 `S%02dE%02d`；`<标签>` = `episode.title`，空则 `第<ep_no>集`。
+- 季目录恒为 `Season 01`（`emby_item.season` 恒为 1，1.0 单季）。
+- 集号 `S%02dE%02d`：**对外集号取 `emby_item.ep_no`**（硬约束 6），不是 `episode.ep_no`。
+- `<标签>` = `embyLabel`：单集取源集标题、空则 `第<对外集号>集`；**合并集取
+  `第 A-B 集`**（A/B 是组内最小/最大源集号，A==B 时退化为 `第 A 集`）。
 - 目录名与文件名里的 `/ \ : * ? " < > |` 一律替换为 `_`（Windows + WebDAV 非法字符集）。
 - 路径以 `/` 分隔、相对 vfs 根、无前导 `/`；WebDAV 的绝对路径由 `internal/webdav` 映射。
 
+**数据源是 `emby_item` 派生表**（`store.ListEmbyItems`），不是 `episode`：一个合并组
+在树里只产出 1 条文件对，Emby 因此显示为 1 集、对外集号连续（硬约束 6）。合并调整
+只重建派生表，`drama` / `episode` 原始数据不动。
 ### strm 形态
 
 一行 URL + 尾 `\n`，前缀取 `settings.strm_prefix`：
@@ -321,7 +345,8 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 {strm_prefix}/s/{token}/e/{uid}
 ```
 
-- `uid` = `episode.id` 的十进制（M3 临时约定；M7 若改 `emby_item.uid` 规则需同步改 vfs）。
+- `uid` 取 `emby_item.uid`：单集 `e<episode.id>`、合并集 `m<merge_group.id>`（M7，
+  与 stream / segment 的 uid 规则一致；派生表是唯一真值，硬约束 6）。
 - `token` 由装配根注入的 `vfs.TokenFunc(secret, uid string) string` 计算，签名算法是
   `internal/stream` 的 ADR-0003 HMAC —— vfs（rank 30）不 import stream（rank 40）。
 - `strm_prefix` 与 `stream_secret` 每次渲染现读，改值即时生效（硬约束 5）。
@@ -333,7 +358,7 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 
 | 文件 | 根元素 | 字段 | 说明 |
 |---|---|---|---|
-| 集 `.nfo` | `episodedetails` | `title` / `season` / `episode` / `runtime` | `runtime` 单位是**分钟**（`duration_sec / 60` 向下取整）；写秒会被 Emby 放大 60 倍 |
+| 集 `.nfo` | `episodedetails` | `title` / `season` / `episode` / `runtime` | 字段全部取自 `emby_item`：`episode` 是**对外集号**，`runtime` 单位是**分钟**（`runtime_sec / 60` 向下取整）；写秒会被 Emby 放大 60 倍 |
 | `tvshow.nfo` | `tvshow` | `title` / `year` / `plot` | `plot` 来自 `drama.plot` |
 
 `aired` 不写：`play_url_at` 是采集时间，不是播出日期。
@@ -345,11 +370,10 @@ pattern `GET /s/{token}/seg/{uid}/{file}` 挂在顶层 mux 上，`file` 形如 `
 都取这个值（硬约束 3）。
 
 ### 查询成本
-
 `Render` 是**常数次查询**、与全库规模无关：按目录名 `ListDramas` 匹配单部剧（1 次），
-集级文件再取该剧的 `ListEpisodes`（1 次）；`.strm` 另加两次现读设置。全树遍历
-（1 次 `ListDramas` + 每剧 1 次 `ListEpisodes`）只属于 `List`，避免 Emby/rclone
-逐个文件 GET 时把整库集表读一遍。
+集级文件再取该剧的 `ListEmbyItems`（1 次，内部一次 `IN` 查询取单集源集、每组一次成员
+查询）；`.strm` 另加两次现读设置。全树遍历（1 次 `ListDramas` + 每剧 1 次
+`ListEmbyItems`）只属于 `List`，避免 Emby/rclone 逐个文件 GET 时把整库集表读一遍。
 
 ## WebDAV（internal/webdav）
 

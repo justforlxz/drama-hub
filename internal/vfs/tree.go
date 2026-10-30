@@ -39,14 +39,18 @@ type Node struct {
 // root 是树的固定一级目录。
 const root = "短剧"
 
-// seasonDir 是季目录名。M3 恒为 1（season 是 M7 的 emby_item 概念）。
+// seasonDir 是季目录名。1.0 只有单季，emby_item.season 恒为 1；目录名与派生表
+// 的 season 字段在这里必须一致。
 const seasonDir = "Season 01"
 
 // List 枚举整棵树的目录与文件节点，路径无前导 /。
 //
-// 每次请求现算：1 次 ListDramas + 每剧 1 次 ListEpisodes。目录（根、剧目录、
-// Season 01）IsDir=true，strm/nfo 文件 IsDir=false。M4 用它回答 PROPFIND 的
-// 目录成员与类型。
+// 每次请求现算：1 次 ListDramas + 每剧 1 次 ListEmbyItems（派生表）。目录（根、
+// 剧目录、Season 01）IsDir=true，strm/nfo 文件 IsDir=false。M4 用它回答 PROPFIND
+// 的目录成员与类型。
+//
+// 对外一集（单集或合并集）由 emby_item 决定：一个合并组在这里只产出 1 条文件对，
+// Emby 因此把它显示为 1 集（硬约束 6）。
 func (t *Tree) List(ctx context.Context) ([]Node, error) {
 	dramas, err := t.dramaEntries(ctx)
 	if err != nil {
@@ -62,8 +66,8 @@ func (t *Tree) List(ctx context.Context) ([]Node, error) {
 			Node{Path: dir + "/tvshow.nfo", IsDir: false},
 			Node{Path: season, IsDir: true},
 		)
-		for _, ep := range d.episodes {
-			base := episodeBase(d.drama, ep)
+		for _, item := range d.items {
+			base := embyBase(d.drama, item)
 			nodes = append(nodes,
 				Node{Path: season + "/" + base + ".strm", IsDir: false},
 				Node{Path: season + "/" + base + ".nfo", IsDir: false},
@@ -73,15 +77,15 @@ func (t *Tree) List(ctx context.Context) ([]Node, error) {
 	return nodes, nil
 }
 
-// dramaEntry 是 List 的数据视图：一部剧与其全部集。
+// dramaEntry 是 List 的数据视图：一部剧与其全部对外剧集。
 type dramaEntry struct {
-	drama    store.Drama
-	episodes []store.Episode
+	drama store.Drama
+	items []store.EmbyItem
 }
 
-// dramaEntries 读回全部剧目与其集，供 List 枚举整棵树（1+N 次查询）。
+// dramaEntries 读回全部剧目与其派生剧集，供 List 枚举整棵树（1+N 次查询）。
 //
-// Render 不走这里：它按目录名只取一部剧再取其集（见 dramaByDir），
+// Render 不走这里：它按目录名只取一部剧再取派生剧集（见 dramaByDir），
 // 单文件渲染不随全库规模放大。
 func (t *Tree) dramaEntries(ctx context.Context) ([]dramaEntry, error) {
 	dramas, err := t.st.ListDramas(ctx)
@@ -90,11 +94,11 @@ func (t *Tree) dramaEntries(ctx context.Context) ([]dramaEntry, error) {
 	}
 	out := make([]dramaEntry, 0, len(dramas))
 	for _, d := range dramas {
-		eps, err := t.st.ListEpisodes(ctx, d.ID)
+		items, err := t.st.ListEmbyItems(ctx, d.ID)
 		if err != nil {
-			return nil, fmt.Errorf("列集 drama_id=%d: %w", d.ID, err)
+			return nil, fmt.Errorf("列对外剧集 drama_id=%d: %w", d.ID, err)
 		}
-		out = append(out, dramaEntry{drama: d, episodes: eps})
+		out = append(out, dramaEntry{drama: d, items: items})
 	}
 	return out, nil
 }
@@ -105,15 +109,18 @@ func dramaDir(d store.Drama) string {
 	return sanitizeName(d.Title) + " (" + strconv.Itoa(d.Year) + ")"
 }
 
-// episodeBase 是集文件名主干（不含扩展名）：<剧名> - S01E01 - <标签>。
+// embyBase 是对外剧集的文件名主干（不含扩展名）：<剧名> - S01E01 - <标签>。
 // NFO 的 <title> 与 .strm/.nfo 的文件名共用它，杜绝两处漂移。
-func episodeBase(d store.Drama, ep store.Episode) string {
-	return sanitizeName(d.Title) + " - " + episodeNumber(ep) + " - " + episodeLabel(ep)
+//
+// 集号取 emby_item.ep_no、标签见 embyLabel，两者都只来自派生表（硬约束 6）：
+// 合并调整重算派生表后文件名随之变化。
+func embyBase(d store.Drama, item store.EmbyItem) string {
+	return sanitizeName(d.Title) + " - " + embyNumber(item) + " - " + embyLabel(item)
 }
 
-// episodeNumber 是集号文本 S%02dE%02d（M3 恒为 S01）。
-func episodeNumber(ep store.Episode) string {
-	return "S01E" + twoDigit(ep.EpNo)
+// embyNumber 是集号文本 S%02dE%02d（1.0 恒为 Season 01）。
+func embyNumber(item store.EmbyItem) string {
+	return "S" + twoDigit(item.Season) + "E" + twoDigit(item.EpNo)
 }
 
 // twoDigit 把集号格式化为两位，超过两位时按原宽度展开。
@@ -124,11 +131,22 @@ func twoDigit(n int) string {
 	return strconv.Itoa(n)
 }
 
-// episodeLabel 是集标签：episode.Title，空则回退 第<N>集。
-func episodeLabel(ep store.Episode) string {
-	label := sanitizeName(ep.Title)
+// embyLabel 是对外剧集的标签：
+//
+//   - 合并集：`第 A-B 集`（A/B 是组内最小/最大源集号；A==B 时退化为 `第 A 集`）
+//   - 单集：源集标题；空则回退 `第 N 集`（N 是对外集号）
+//
+// 文件名主干与 NFO <title> 共用本函数，避免两处漂移。
+func embyLabel(item store.EmbyItem) string {
+	if item.Kind == "merged" {
+		if item.EpFrom == item.EpTo {
+			return "第" + strconv.Itoa(item.EpFrom) + "集"
+		}
+		return "第" + strconv.Itoa(item.EpFrom) + "-" + strconv.Itoa(item.EpTo) + "集"
+	}
+	label := sanitizeName(item.Title)
 	if label == "" {
-		label = "第" + strconv.Itoa(ep.EpNo) + "集"
+		label = "第" + strconv.Itoa(item.EpNo) + "集"
 	}
 	return label
 }
@@ -159,26 +177,26 @@ func (t *Tree) Render(ctx context.Context, p string) ([]byte, error) {
 	if req.isShow {
 		return renderShowNFO(d)
 	}
-	eps, err := t.st.ListEpisodes(ctx, d.ID)
+	items, err := t.st.ListEmbyItems(ctx, d.ID)
 	if err != nil {
-		return nil, fmt.Errorf("列集 drama_id=%d: %w", d.ID, err)
+		return nil, fmt.Errorf("列对外剧集 drama_id=%d: %w", d.ID, err)
 	}
-	for _, ep := range eps {
-		if episodeBase(d, ep) != req.episodeBase {
+	for _, item := range items {
+		if embyBase(d, item) != req.itemBase {
 			continue
 		}
 		if req.ext == ".strm" {
-			return t.renderStrm(ctx, ep)
+			return t.renderStrm(ctx, item)
 		}
-		return renderEpisodeNFO(ep)
+		return renderItemNFO(item)
 	}
 	return nil, ErrNotFound
 }
 
-// dramaByDir 按目录名精确匹配一部剧：1 次 ListDramas，不枚举其余剧的集。
+// dramaByDir 按目录名精确匹配一部剧：1 次 ListDramas，不枚举其余剧的剧集。
 //
 // Render 的成本因此与全库规模无关：剧级文件 1 次查询，集级文件 2 次
-// （ListDramas + 该剧的 ListEpisodes）。全树遍历只属于 List。
+// （ListDramas + 该剧的 ListEmbyItems）。全树遍历只属于 List。
 func (t *Tree) dramaByDir(ctx context.Context, dir string) (store.Drama, error) {
 	dramas, err := t.st.ListDramas(ctx)
 	if err != nil {
@@ -194,17 +212,17 @@ func (t *Tree) dramaByDir(ctx context.Context, dir string) (store.Drama, error) 
 
 // renderRequest 是 parsePath 的解构结果。
 type renderRequest struct {
-	dramaDir    string // 剧目录名
-	isShow      bool   // true = 剧级 tvshow.nfo；false = 集级文件
-	episodeBase string // 集文件名主干（isShow 时为空）
-	ext         string // ".strm" / ".nfo"（isShow 时为空）
+	dramaDir string // 剧目录名
+	isShow   bool   // true = 剧级 tvshow.nfo；false = 集级文件
+	itemBase string // 文件名主干（isShow 时为空）
+	ext      string // ".strm" / ".nfo"（isShow 时为空）
 }
 
 // parsePath 解析相对路径；ok=false 表示不是本树里可渲染的文件形状。
 //
 // 合法：短剧/<剧目录>/tvshow.nfo（3 段）
 //
-//	短剧/<剧目录>/Season 01/<集文件名>.strm|.nfo（4 段）
+//	短剧/<剧目录>/Season 01/<文件名>.strm|.nfo（4 段）
 func parsePath(p string) (renderRequest, bool) {
 	p = strings.TrimPrefix(p, "/")
 	segs := strings.Split(p, "/")
@@ -220,7 +238,7 @@ func parsePath(p string) (renderRequest, bool) {
 		if name == "" {
 			return renderRequest{}, false
 		}
-		return renderRequest{dramaDir: segs[1], episodeBase: name, ext: ext}, true
+		return renderRequest{dramaDir: segs[1], itemBase: name, ext: ext}, true
 	}
 	return renderRequest{}, false
 }

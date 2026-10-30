@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
-	"strconv"
 
 	"github.com/justforlxz/drama-hub/internal/store"
 )
@@ -14,10 +13,11 @@ const xmlHeader = `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>` + "
 
 // renderStrm 渲染 strm 内容：一行 URL + 尾换行。
 //
-// 形态 `{strm_prefix}/s/{token}/e/{uid}\n`。uid = episode 主键十进制；
-// token 由注入的 TokenFunc 计算；strm_prefix 与 stream_secret 每次现读，
-// 改值即时生效（硬约束 5）。缺 stream_secret 时透传 store.ErrSettingMissing。
-func (t *Tree) renderStrm(ctx context.Context, ep store.Episode) ([]byte, error) {
+// 形态 `{strm_prefix}/s/{token}/e/{uid}\n`。uid 取 emby_item.uid（单集
+// `e<episode.id>`、合并集 `m<group.id>`），派生表的 uid 是唯一真值（硬约束 6）。
+// token 由注入的 TokenFunc 计算；strm_prefix 与 stream_secret 每次现读，改值
+// 即时生效（硬约束 5）。缺 stream_secret 时透传 store.ErrSettingMissing。
+func (t *Tree) renderStrm(ctx context.Context, item store.EmbyItem) ([]byte, error) {
 	prefix, err := t.settings.String(ctx, store.KeyStrmPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("读 strm_prefix: %w", err)
@@ -26,7 +26,7 @@ func (t *Tree) renderStrm(ctx context.Context, ep store.Episode) ([]byte, error)
 	if err != nil {
 		return nil, fmt.Errorf("读 stream_secret: %w", err)
 	}
-	uid := strconv.FormatInt(ep.ID, 10)
+	uid := item.UID
 	return []byte(prefix + "/s/" + t.token(secret, uid) + "/e/" + uid + "\n"), nil
 }
 
@@ -49,16 +49,17 @@ type showNFO struct {
 	Plot    string   `xml:"plot"`
 }
 
-// renderEpisodeNFO 渲染集 NFO：根 episodedetails，字段 title/season/episode/runtime。
+// renderItemNFO 渲染集 NFO：根 episodedetails，字段 title/season/episode/runtime。
 //
-// title 与文件名共用 episodeBase 的标签部分（同一个 episodeLabel）；runtime 取
-// DurationSec/60 向下取整（短于 60 秒为 0，Emby 视为未知，由探测媒体文件补）。
-func renderEpisodeNFO(ep store.Episode) ([]byte, error) {
+// 字段全部来自 emby_item 派生表：title 与文件名共用 embyLabel，episode 是对外
+// 集号（合并集也是 1 集），runtime 取 runtime_sec/60 向下取整（短于 60 秒为 0，
+// Emby 视为未知，由探测媒体文件补）。
+func renderItemNFO(item store.EmbyItem) ([]byte, error) {
 	return marshalNFO(episodeNFO{
-		Title:   episodeLabel(ep),
-		Season:  1,
-		Episode: ep.EpNo,
-		Runtime: ep.DurationSec / 60,
+		Title:   embyLabel(item),
+		Season:  item.Season,
+		Episode: item.EpNo,
+		Runtime: item.RuntimeSec / 60,
 	})
 }
 

@@ -13,6 +13,8 @@ var (
 	ErrNotFound = errors.New("记录不存在")
 	// ErrConflict 表示写入触发唯一或主键约束冲突。
 	ErrConflict = errors.New("唯一约束冲突")
+	// ErrInvalid 表示入参违反业务约束（合并编排的集数、归属、重叠等）。
+	ErrInvalid = errors.New("入参非法")
 )
 
 // SQLite 扩展结果码。modernc.org/sqlite 在每条连接上启用扩展结果码

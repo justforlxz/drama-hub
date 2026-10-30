@@ -9,8 +9,10 @@
 // rank 40/50/60 的包可 import 本包；与同为 30 的 provider 同级、互不 import。
 // 规则见 docs/DEV-STANDARDS.md「代码组织」，由 scripts/check-deps.sh 强制。
 //
-// 边界：只读 drama / episode 两张表；读写 emby_item、封面下载、HTTP 处理、
-// 缓存与分页都不在本包。出流 token 的算法（HMAC，ADR-0003）属 internal/stream
+// 边界：只读 drama / episode / emby_item 三张表；封面下载、HTTP 处理、
+// 缓存与分页都不在本包。树与文件内容的**数据源是 emby_item 派生表**（硬约束 6：
+// 对外集号只由它决定）——单集与合并集在同一棵树里各占一条文件对；派生表的重建
+// 属 internal/store，本包只读。出流 token 的算法（HMAC，ADR-0003）属 internal/stream
 // （rank 40），本包通过 NewTree 注入的 TokenFunc 计算，不自行实现签名。
 //
 // 渲染契约见 docs/DEV-STANDARDS.md「虚拟文件树与渲染」。

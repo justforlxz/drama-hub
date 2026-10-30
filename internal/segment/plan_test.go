@@ -172,11 +172,11 @@ func TestTimeline(t *testing.T) {
 	}
 
 	want := []Slice{
-		{Seq: 0, EpisodeID: 11, EpNo: 1, StartSec: 0, Dur: 4}, // 首片
-		{Seq: 1, EpisodeID: 11, EpNo: 1, StartSec: 4, Dur: 4},
-		{Seq: 2, EpisodeID: 11, EpNo: 1, StartSec: 8, Dur: 2}, // 第 1 集末片
-		{Seq: 3, EpisodeID: 22, EpNo: 2, StartSec: 0, Dur: 5}, // 跨集边界：第 2 集首片
-		{Seq: 4, EpisodeID: 22, EpNo: 2, StartSec: 5, Dur: 3}, // 末片
+		{Seq: 0, EpisodeID: 11, EpNo: 1, StartSec: 0, Dur: 4, OffsetSec: 0}, // 首片
+		{Seq: 1, EpisodeID: 11, EpNo: 1, StartSec: 4, Dur: 4, OffsetSec: 4},
+		{Seq: 2, EpisodeID: 11, EpNo: 1, StartSec: 8, Dur: 2, OffsetSec: 8},  // 第 1 集末片
+		{Seq: 3, EpisodeID: 22, EpNo: 2, StartSec: 0, Dur: 5, OffsetSec: 10}, // 跨集边界：第 2 集首片
+		{Seq: 4, EpisodeID: 22, EpNo: 2, StartSec: 5, Dur: 3, OffsetSec: 15}, // 末片
 	}
 	for _, w := range want {
 		got, ok := tl.At(w.Seq)

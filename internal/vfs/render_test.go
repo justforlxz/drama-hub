@@ -14,13 +14,21 @@ import (
 // dramaDirA 是 fixture 里剧 A 的目录名（独立于被测代码拼出）。
 const dramaDirA = "短剧/" + titleA + " (2024)"
 
-// strmPath / nfoPath 是 fixture 里剧 A 某集的两条渲染路径。
+// singleItem 独立构造单集派生行（与 store 的 uid 规则一致：`e<episode.id>`）。
+func singleItem(ep store.Episode) store.EmbyItem {
+	return store.EmbyItem{
+		Kind: "single", Season: 1, EpNo: ep.EpNo, UID: "e" + strconv.FormatInt(ep.ID, 10),
+		EpisodeID: ep.ID, EpFrom: ep.EpNo, EpTo: ep.EpNo, Title: ep.Title, RuntimeSec: ep.DurationSec,
+	}
+}
+
+// strmPath / nfoPath 是 fixture 里剧 A 某集的两条渲染路径（独立于被测代码拼出）。
 func (f fixture) strmPath(ep store.Episode) string {
-	return dramaDirA + "/Season 01/" + episodeBase(store.Drama{Title: titleA}, ep) + ".strm"
+	return dramaDirA + "/Season 01/" + embyBase(store.Drama{Title: titleA}, singleItem(ep)) + ".strm"
 }
 
 func (f fixture) nfoPath(ep store.Episode) string {
-	return dramaDirA + "/Season 01/" + episodeBase(store.Drama{Title: titleA}, ep) + ".nfo"
+	return dramaDirA + "/Season 01/" + embyBase(store.Drama{Title: titleA}, singleItem(ep)) + ".nfo"
 }
 
 // AC3：strm 内容 = {prefix}/s/{token}/e/{uid}\n，单行、尾换行；两个前缀用例。
@@ -43,7 +51,7 @@ func TestRenderStrm(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Render(%s): %v", path, err)
 				}
-				uid := strconv.FormatInt(ep.ID, 10)
+				uid := "e" + strconv.FormatInt(ep.ID, 10)
 				want := tt.prefix + "/s/" + stubToken(testSecret, uid) + "/e/" + uid + "\n"
 				if string(body) != want {
 					t.Errorf("strm 内容 = %q, 期望 %q", body, want)
@@ -182,7 +190,7 @@ func uidForPath(t *testing.T, path string, f fixture) string {
 	t.Helper()
 	for _, ep := range []store.Episode{f.epA1, f.epA2} {
 		if path == f.strmPath(ep) {
-			return strconv.FormatInt(ep.ID, 10)
+			return "e" + strconv.FormatInt(ep.ID, 10)
 		}
 	}
 	t.Fatalf("路径 %s 不在 fixture 里", path)
@@ -255,7 +263,7 @@ func TestRenderStrmReadsSettingsLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("改后 Render: %v", err)
 	}
-	uid := strconv.FormatInt(f.epA1.ID, 10)
+	uid := "e" + strconv.FormatInt(f.epA1.ID, 10)
 	if want := "https://changed.example/s/" + stubToken(testSecret, uid) + "/e/" + uid + "\n"; string(body) != want {
 		t.Errorf("改前缀后 strm = %q, 期望 %q", body, want)
 	}

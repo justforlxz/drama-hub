@@ -25,9 +25,10 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
 | `/dav/` 及全部子路径 | 任意 | 207/200/401/404/405 | 只读 WebDAV：PROPFIND 207（带 getcontentlength）、GET strm/nfo 200；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401 |
-| `/s/{token}/e/{uid}` | GET / HEAD | 200/206/416 | 单集 MP4 出流：HMAC 签名 + Range 透传 |
-| `/s/{token}/seg/{uid}/{seq}.ts` | GET | 200/404/502/503 | 单集分片：现转封装 MPEG-TS，索引未就绪 503 |
-| `/s/` 其余子路径 | 任意 | 501 | 合并集与播放列表属后续阶段（M7） |
+| `/s/{token}/e/{uid}` | GET / HEAD | 200/206/416（单集）<br/>200（合并集） | 单集 MP4 出流：HMAC 签名 + Range 透传；**uid 是合并集句柄（`m…`）时返回自造 m3u8** |
+| `/s/{token}/e/{uid}/master.m3u8` | GET | 200/404 | 合并集 playlist 的标准别名 |
+| `/s/{token}/seg/{uid}/{seq}.ts` | GET | 200/404/502/503 | 分片：现转封装 MPEG-TS（单集按片内序、合并集按跨集时间轴），索引未就绪 503 |
+| `/s/` 其余子路径 | 任意 | 501 | 已规划未实现 |
 | `/api/` 及全部子路径 | 任意 | 501 | 管理 API，后续接入 |
 | 其它路径（含 `/`） | 任意 | 404 | 未装配；管理界面属后续阶段 |
 
@@ -41,6 +42,12 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 `Retry-After`）；切片走 `ffmpeg -ss <切点> -t <片长> -c copy -f mpegts`，单片
 返回 `video/mp2t` 并带 `Cache-Control: public, max-age=86400`。ffmpeg 失败 → 502，
 失败结果不落库、不缓存。
+
+合并集（`uid = m<group_id>`）是虚拟 HLS 分片聚合：strm 指向合并集时返回自造
+playlist（`#EXT-X-VERSION:4` + `#EXT-X-DISCONTINUITY` 在集边界），分片 URL 指回
+`/s/{token}/seg/{uid}/{seq}.ts`，seq 是跨集连续时间轴；切片按 `seq → (集号, 集内秒)`
+解析，`-output_ts_offset` 保证跨集时间戳连续。合并编排（N 集并 1）通过管理 API
+重建 `emby_item` 派生表（属 R1）。
 
 ```bash
 curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}
@@ -91,6 +98,6 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
 
 ## 状态
 
-实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。
+实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、合并编排与派生表重建齐备，待真机验收（P5）。
 
 设计基线见 MKACG-580 附件 `DESIGN-drama-hub.md`。

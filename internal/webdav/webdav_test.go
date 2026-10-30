@@ -97,6 +97,10 @@ func newFixture(t *testing.T) fixture {
 		}
 		epIDs = append(epIDs, id)
 	}
+	// vfs 树只认 emby_item 派生表（硬约束 6）：等价于生产里「同步完成」的重建。
+	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
+	}
 
 	// 与 cmd 的装配方式一致：handler 挂在 MountPath 上，路径前缀由它自己剥。
 	mux := http.NewServeMux()
@@ -297,7 +301,7 @@ func TestGet_Files(t *testing.T) {
 		{
 			name: "strm/首集", ep: f.epIDs[0], ext: ".strm",
 			wantBytes: func(f fixture) []byte {
-				uid := strconv.FormatInt(f.epIDs[0], 10)
+				uid := "e" + strconv.FormatInt(f.epIDs[0], 10)
 				return []byte(f.prefix + "/s/" + tokenFor("0123456789abcdef0123456789abcdef", uid) + "/e/" + uid + "\n")
 			},
 		},
@@ -307,7 +311,7 @@ func TestGet_Files(t *testing.T) {
 		{
 			name: "strm/第二集", ep: f.epIDs[1], ext: ".strm",
 			wantBytes: func(f fixture) []byte {
-				uid := strconv.FormatInt(f.epIDs[1], 10)
+				uid := "e" + strconv.FormatInt(f.epIDs[1], 10)
 				return []byte(f.prefix + "/s/" + tokenFor("0123456789abcdef0123456789abcdef", uid) + "/e/" + uid + "\n")
 			},
 		},

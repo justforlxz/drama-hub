@@ -2,8 +2,11 @@ package vfs
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/justforlxz/drama-hub/internal/store"
@@ -79,6 +82,11 @@ func seedTree(t *testing.T, strmPrefix string, withSecret bool) fixture {
 	if err != nil {
 		t.Fatalf("UpsertEpisode 2: %v", err)
 	}
+	// 派生表是 vfs 的唯一数据源（硬约束 6）：seed 后必须重建一次，等价于
+	// 「同步完成」那个生产调用点。
+	if _, err := st.RebuildEmbyItems(ctx, aID); err != nil {
+		t.Fatalf("RebuildEmbyItems A: %v", err)
+	}
 
 	if withSecret {
 		if err := settings.Set(ctx, store.KeyStreamSecret, testSecret); err != nil {
@@ -129,12 +137,16 @@ func TestList(t *testing.T) {
 }
 
 // AC2：命名是纯函数（表驱动）。
+// AC2：命名是纯函数（表驱动）。
 func TestNames(t *testing.T) {
 	drama := func(title string, year int) store.Drama {
 		return store.Drama{Title: title, Year: year}
 	}
-	ep := func(no int, title string) store.Episode {
-		return store.Episode{EpNo: no, Title: title}
+	single := func(epNo int, title string) store.EmbyItem {
+		return store.EmbyItem{Kind: "single", EpNo: epNo, Season: 1, Title: title, EpFrom: epNo, EpTo: epNo}
+	}
+	merged := func(epNo, from, to int) store.EmbyItem {
+		return store.EmbyItem{Kind: "merged", EpNo: epNo, Season: 1, EpFrom: from, EpTo: to}
 	}
 
 	tests := []struct {
@@ -145,14 +157,17 @@ func TestNames(t *testing.T) {
 		{"剧目录/正常", dramaDir(drama("你好世界", 2024)), "你好世界 (2024)"},
 		{"剧目录/空年显式化为0", dramaDir(drama("无年份", 0)), "无年份 (0)"},
 		{"剧目录/非法字符替换", dramaDir(drama(`a/b\c:d*e?f"g<h>i|j`, 2021)), "a_b_c_d_e_f_g_h_i_j (2021)"},
-		{"集号/一位补零", episodeNumber(ep(1, "开局")), "S01E01"},
-		{"集号/两位原样", episodeNumber(ep(12, "")), "S01E12"},
-		{"集号/超两位展开", episodeNumber(ep(100, "")), "S01E100"},
-		{"标签/有标题", episodeLabel(ep(1, "开局")), "开局"},
-		{"标签/空标题回退", episodeLabel(ep(7, "")), "第7集"},
-		{"标签/标题里的非法字符也替换", episodeLabel(ep(1, "a/b")), "a_b"},
-		{"文件名主干/有标签", episodeBase(drama("测试剧", 2024), ep(1, "开局")), "测试剧 - S01E01 - 开局"},
-		{"文件名主干/无标签", episodeBase(drama("测试剧", 2024), ep(2, "")), "测试剧 - S01E02 - 第2集"},
+		{"集号/一位补零", embyNumber(single(1, "开局")), "S01E01"},
+		{"集号/两位原样", embyNumber(single(12, "")), "S01E12"},
+		{"集号/超两位展开", embyNumber(single(100, "")), "S01E100"},
+		{"标签/有标题", embyLabel(single(1, "开局")), "开局"},
+		{"标签/空标题回退", embyLabel(single(7, "")), "第7集"},
+		{"标签/标题里的非法字符也替换", embyLabel(single(1, "a/b")), "a_b"},
+		{"标签/合并集范围", embyLabel(merged(1, 1, 10)), "第1-10集"},
+		{"标签/合并集单集退化为第N集", embyLabel(merged(1, 3, 3)), "第3集"},
+		{"文件名主干/有标签", embyBase(drama("测试剧", 2024), single(1, "开局")), "测试剧 - S01E01 - 开局"},
+		{"文件名主干/无标签", embyBase(drama("测试剧", 2024), single(2, "")), "测试剧 - S01E02 - 第2集"},
+		{"文件名主干/合并集", embyBase(drama("测试剧", 2024), merged(1, 1, 10)), "测试剧 - S01E01 - 第1-10集"},
 	}
 	for _, tt := range tests {
 		if tt.got != tt.want {
@@ -215,5 +230,72 @@ func TestRenderNotFound(t *testing.T) {
 		if body != nil {
 			t.Errorf("Render(%q) 返回了 %d 字节, 期望 nil", p, len(body))
 		}
+	}
+}
+
+// AC（M7/硬约束 6）：合并组在树里只产出 1 条文件对，标签是「第 A-B 集」，
+// 且 strm 的 uid 是合并集句柄 m<group_id>（不是任一单集 uid）。
+func TestListMergedGroupCollapsesToOne(t *testing.T) {
+	ctx := context.Background()
+	f := seed(t, "")
+	st := store.NewStore(f.db.DB)
+
+	// 把 fixture 的两集并成 1 集。
+	gid, err := st.CreateMergeGroup(ctx, 1, "第1-2集", []int64{f.epA1.ID, f.epA2.ID})
+	if err != nil {
+		t.Fatalf("CreateMergeGroup: %v", err)
+	}
+	items, err := st.ListEmbyItems(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListEmbyItems: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("合并后对外剧集数 = %d, 期望 1：%+v", len(items), items)
+	}
+
+	nodes, err := f.tree.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	season := "短剧/" + titleA + " (2024)" + "/Season 01"
+	base := titleA + " - S01E01 - 第1-2集"
+	wantStrm := season + "/" + base + ".strm"
+	wantNFO := season + "/" + base + ".nfo"
+
+	got := map[string]bool{}
+	for _, n := range nodes {
+		if strings.HasPrefix(n.Path, season+"") && !n.IsDir {
+			got[n.Path] = true
+		}
+	}
+	// 合并后季目录下只剩这一条文件对（其余节点不含集文件）。
+	if len(got) != 2 || !got[wantStrm] || !got[wantNFO] {
+		t.Fatalf("合并后季目录文件 = %v, 期望 %q 与 %q", got, wantStrm, wantNFO)
+	}
+
+	// strm 的 uid 是 m<group_id>，token 由注入的 TokenFunc 计算。
+	uid := "m" + strconv.FormatInt(gid, 10)
+	body, err := f.tree.Render(ctx, wantStrm)
+	if err != nil {
+		t.Fatalf("Render(%s): %v", wantStrm, err)
+	}
+	if want := "/s/" + stubToken(testSecret, uid) + "/e/" + uid + "\n"; string(body) != want {
+		t.Errorf("合并集 strm = %q, 期望 %q", body, want)
+	}
+
+	// NFO 的 episode 号是对外集号 1，标题是「第1-2集」。
+	nfo, err := f.tree.Render(ctx, wantNFO)
+	if err != nil {
+		t.Fatalf("Render(%s): %v", wantNFO, err)
+	}
+	var parsed episodeNFO
+	if err := xml.Unmarshal(nfo, &parsed); err != nil {
+		t.Fatalf("解析合并集 NFO: %v\n%s", err, nfo)
+	}
+	if parsed.Title != "第1-2集" {
+		t.Errorf("合并集 NFO title = %q, 期望 第1-2集", parsed.Title)
+	}
+	if parsed.Episode != 1 {
+		t.Errorf("合并集 NFO episode = %d, 期望 1（对外集号）", parsed.Episode)
 	}
 }

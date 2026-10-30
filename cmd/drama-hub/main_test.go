@@ -37,7 +37,7 @@ func newTestHandler(t *testing.T) http.Handler {
 // BaseURL 指向本机 1 端口，即使误触发同步也只会立刻连接失败，不会打到真站。
 func testSyncer() web.SeriesSyncer {
 	logger := slog.New(slog.DiscardHandler)
-	return sync.New(hongguo.New(hongguo.Config{BaseURL: "http://127.0.0.1:1", Logger: logger}))
+	return sync.New(hongguo.New(hongguo.Config{BaseURL: "http://127.0.0.1:1", Logger: logger}), nil)
 }
 
 // testSources 是状态页的播放源清单，形状与生产一致（名字来自插件）。
@@ -513,7 +513,7 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 	if !ok {
 		t.Fatalf("注册表里没有 %q：装配根必须显式注册内置插件", hongguo.Name)
 	}
-	h := newHandler(logger, st, settings, sync.New(p), sourceList(reg))
+	h := newHandler(logger, st, settings, sync.New(p, nil), sourceList(reg))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/dramas", strings.NewReader(`{"series_id":"7503745441910017049"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -582,7 +582,7 @@ func TestPluginDisabledStillStarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("停用时 newPlugins 报错：%v", err)
 	}
-	h := newHandler(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name)), sourceList(reg))
+	h := newHandler(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name), nil), sourceList(reg))
 
 	rec := serve(t, h, http.MethodGet, "/api/status")
 	var status struct {

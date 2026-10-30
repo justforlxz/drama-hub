@@ -26,8 +26,8 @@ var (
 //
 // 注册表认两组 key：下面列出的固定 key，以及插件配置的前缀模式
 // plugin.<源>.<项>（真值见 docs/DEV-STANDARDS.md「配置」表与
-// docs/PLUGIN-CONTRACT.md「配置」）。缓存上限与 LRU 天数由缓存代理负责（ADR-0004），
-// 不属于本服务配置。
+// docs/PLUGIN-CONTRACT.md「配置」）。缓存上限与 LRU 天数（cache_max_mb /
+// cache_lru_days）由 S7 实现，本包暂不注册。
 type SettingKey string
 
 // settings 表的 key 常量。
@@ -39,6 +39,7 @@ const (
 	KeyPinDays      SettingKey = "pin_days"
 	KeyWebDAVUser   SettingKey = "webdav_user"
 	KeyWebDAVPass   SettingKey = "webdav_pass"
+	KeyCacheDir     SettingKey = "cache_dir"
 )
 
 // 插件配置的项名（docs/PLUGIN-CONTRACT.md「配置」）。
@@ -256,6 +257,9 @@ func specFor(key SettingKey) (settingSpec, bool) {
 		return settingSpec{kind: kindString, required: true}, true
 	case KeyWebDAVPass:
 		return settingSpec{kind: kindString, required: true}, true
+	case KeyCacheDir:
+		// 缓存根目录：海报等本地资产落 <cache_dir>/cover/…；写盘时按需 MkdirAll。
+		return settingSpec{kind: kindString, def: "./data/cache"}, true
 	}
 	return pluginSpecFor(string(key))
 }

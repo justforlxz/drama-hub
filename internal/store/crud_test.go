@@ -35,13 +35,19 @@ func countRows(t *testing.T, db dbtx, table string) int {
 }
 
 // assertDramaEqual 逐字段比较两部剧（不含 ID）。
+//
+// Shard 不读 want.Shard：它由 provider_id 派生（UpsertDrama 重算、入参被忽略），
+// 所以期望值是 ShardOf(want.ProviderID)。
 func assertDramaEqual(t *testing.T, got, want Drama) {
 	t.Helper()
 	if got.Provider != want.Provider || got.ProviderID != want.ProviderID ||
 		got.Title != want.Title || got.Year != want.Year || got.Plot != want.Plot ||
 		got.CoverURL != want.CoverURL || got.EpisodeTotal != want.EpisodeTotal ||
-		got.SyncAt != want.SyncAt {
+		got.SyncAt != want.SyncAt || got.Genre != want.Genre || got.Tags != want.Tags {
 		t.Errorf("Drama 字段不一致：got %+v, want %+v", got, want)
+	}
+	if wantShard := ShardOf(want.ProviderID); got.Shard != wantShard {
+		t.Errorf("Drama.Shard = %d, 期望按身份派生 %d", got.Shard, wantShard)
 	}
 }
 
@@ -91,6 +97,54 @@ func TestUpsertDramaIdempotent(t *testing.T) {
 		t.Fatalf("DramaByID: %v", err)
 	}
 	assertDramaEqual(t, got, second)
+}
+
+// AC：genre / tags 是可变态（刷新时被上游覆盖），空值取 schema 默认。
+func TestUpsertDramaGenreTags(t *testing.T) {
+	s := NewStore(newCRUDTestDB(t).DB)
+	ctx := context.Background()
+
+	d := Drama{
+		Provider: "web", ProviderID: "g1", Title: "剧",
+		Genre: "爱情", Tags: `["爱情","都市"]`,
+	}
+	id, err := s.UpsertDrama(ctx, d)
+	if err != nil {
+		t.Fatalf("UpsertDrama: %v", err)
+	}
+	got, err := s.DramaByID(ctx, id)
+	if err != nil {
+		t.Fatalf("DramaByID: %v", err)
+	}
+	if got.Genre != "爱情" || got.Tags != `["爱情","都市"]` {
+		t.Fatalf("genre/tags = (%q, %q), 期望上游原值", got.Genre, got.Tags)
+	}
+
+	// 刷新：tags[0] 变了 → genre 随之上移，tags 整体被覆盖。
+	d.Genre, d.Tags = "家庭", `["家庭"]`
+	if _, err := s.UpsertDrama(ctx, d); err != nil {
+		t.Fatalf("第二次 UpsertDrama: %v", err)
+	}
+	got, err = s.DramaByID(ctx, id)
+	if err != nil {
+		t.Fatalf("DramaByID(刷新后): %v", err)
+	}
+	if got.Genre != "家庭" || got.Tags != `["家庭"]` {
+		t.Fatalf("刷新后 genre/tags = (%q, %q), 期望被覆盖", got.Genre, got.Tags)
+	}
+
+	// 上游未声明标签：落成空串 / "[]"（不是 NULL）。
+	zeroID, err := s.UpsertDrama(ctx, Drama{Provider: "web", ProviderID: "g2", Title: "无标签剧"})
+	if err != nil {
+		t.Fatalf("UpsertDrama(无标签): %v", err)
+	}
+	zero, err := s.DramaByID(ctx, zeroID)
+	if err != nil {
+		t.Fatalf("DramaByID(无标签): %v", err)
+	}
+	if zero.Genre != "" || zero.Tags != "" {
+		t.Fatalf("零值 genre/tags = (%q, %q), 期望 (\"\", \"\")", zero.Genre, zero.Tags)
+	}
 }
 
 // AC2：按 (provider, provider_id) 命中逐字段一致；未命中 ErrNotFound。

@@ -73,7 +73,7 @@ playlist 是 `segment` 表的**纯函数**（`segment.BuildPlaylist`）：一次
 
 | 参数 | 默认 | 范围 | 说明 |
 |---|---|---|---|
-| `cache_dir` | `./data/cache` | 绝对或相对路径 | 缓存根目录；启动时 `MkdirAll` |
+| `cache_dir` | `./data/cache` | 绝对或相对路径 | 缓存根目录；首次写盘时按需 `MkdirAll`（空目录不占位） |
 | `cache_max_mb` | `8192` | 0–1048576 | 分片缓存上限；`0` = 不按大小淘汰 |
 | `cache_lru_days` | `30` | 1–365 | 超过 N 天未命中的条目删除 |
 

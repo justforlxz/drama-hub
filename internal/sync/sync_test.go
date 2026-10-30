@@ -10,12 +10,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
 	"github.com/justforlxz/drama-hub/internal/store"
@@ -110,7 +113,7 @@ func newTestSyncer(t *testing.T, srv *httptest.Server, clock *fakeClock) *Syncer
 		HTTPClient: srv.Client(),
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	s := New(p)
+	s := New(p, nil)
 	s.now = clock.now
 	return s
 }
@@ -178,6 +181,13 @@ func TestSyncSeriesWritesDramaAndEpisodes(t *testing.T) {
 	}
 	if d.Year != 2025 {
 		t.Fatalf("year = %d, 期望 2025（首见时间 1747533495）", d.Year)
+	}
+	// 该 fixture 的 seriesDetail 没有 tags：genre 留空串、tags 落空数组（兜底「其他」）。
+	if d.Genre != "" || d.Tags != "[]" {
+		t.Fatalf("无标签页面的 genre/tags = (%q, %q), 期望 (\"\", \"[]\")", d.Genre, d.Tags)
+	}
+	if want := store.ShardOf(fixtureSID); d.Shard != want {
+		t.Fatalf("shard = %d, 期望按身份派生 %d", d.Shard, want)
 	}
 	syncAt, err := time.Parse(time.RFC3339, d.SyncAt)
 	if err != nil {
@@ -351,7 +361,7 @@ func TestSyncWithoutEpisodeKeys(t *testing.T) {
 			Episodes: []plugin.Episode{{No: 1}, {No: 2}},
 		},
 	}
-	s := New(p)
+	s := New(p, nil)
 	s.now = (&fakeClock{t: time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)}).now
 
 	if err := s.SyncSeries(context.Background(), st, "w1"); err != nil {
@@ -392,7 +402,7 @@ func TestSyncValidatesEpisodes(t *testing.T) {
 				Work:     plugin.Work{Ref: plugin.WorkRef{Plugin: "fake", ID: "w1"}, Title: "假剧"},
 				Episodes: tc.episodes,
 			}}
-			s := New(p)
+			s := New(p, nil)
 
 			err := s.SyncSeries(context.Background(), st, "w1")
 			if !errors.Is(err, plugin.ErrSchema) {
@@ -402,5 +412,244 @@ func TestSyncValidatesEpisodes(t *testing.T) {
 				t.Fatalf("校验失败却写了库：(剧,集) = (%d,%d)", dramas, episodes)
 			}
 		})
+	}
+}
+
+// coverCDN 是可切换响应的假封面源，并记录请求次数。
+type coverCDN struct {
+	mu       sync.Mutex
+	status   int
+	body     []byte
+	requests int
+}
+
+func (c *coverCDN) set(status int, body []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.status, c.body = status, body
+}
+
+func (c *coverCDN) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.requests
+}
+
+func newCoverCDN(t *testing.T) (*coverCDN, *httptest.Server) {
+	t.Helper()
+	c := &coverCDN{status: http.StatusOK, body: []byte("\xff\xd8\xff\xe0 poster")}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		c.mu.Lock()
+		c.requests++
+		status, body := c.status, c.body
+		c.mu.Unlock()
+		if status == http.StatusOK {
+			w.Header().Set("Content-Type", "image/jpeg")
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return c, srv
+}
+
+// AC：genre = Genres[0]、tags = 保序去重的 JSON 数组、shard 按身份派生；刷新时
+// 三列随上游覆盖（改名/改分类是上游行为的忠实反映）。
+func TestSyncSeriesWritesGenreTagsShard(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	p := &fakePlugin{name: "fake", detail: plugin.WorkDetail{
+		Work: plugin.Work{
+			Ref: plugin.WorkRef{Plugin: "fake", ID: "w1"}, Title: "剧",
+			Genres: []string{"爱情", "都市", "爱情"},
+		},
+		Episodes: []plugin.Episode{{No: 1}},
+	}}
+	s := New(p, nil)
+
+	if err := s.SyncSeries(ctx, st, "w1"); err != nil {
+		t.Fatalf("SyncSeries: %v", err)
+	}
+	d, err := st.DramaByProviderID(ctx, "fake", "w1")
+	if err != nil {
+		t.Fatalf("DramaByProviderID: %v", err)
+	}
+	if d.Genre != "爱情" {
+		t.Fatalf("genre = %q, 期望 tags[0] = 爱情", d.Genre)
+	}
+	if d.Tags != `["爱情","都市"]` {
+		t.Fatalf("tags = %q, 期望保序去重的 JSON 数组", d.Tags)
+	}
+	if want := store.ShardOf("w1"); d.Shard != want {
+		t.Fatalf("shard = %d, 期望 fnv32a(provider_id)%%%d = %d", d.Shard, store.ShardCount, want)
+	}
+
+	// 刷新：tags[0] 从「爱情」变「家庭」→ genre 跟着换目录（tags 整体被覆盖）。
+	p.detail.Work.Genres = []string{"家庭"}
+	if err := s.SyncSeries(ctx, st, "w1"); err != nil {
+		t.Fatalf("第二次 SyncSeries: %v", err)
+	}
+	d, err = st.DramaByProviderID(ctx, "fake", "w1")
+	if err != nil {
+		t.Fatalf("DramaByProviderID(刷新后): %v", err)
+	}
+	if d.Genre != "家庭" || d.Tags != `["家庭"]` {
+		t.Fatalf("刷新后 genre/tags = (%q, %q), 期望被上游覆盖", d.Genre, d.Tags)
+	}
+
+	// 上游未声明标签：genre 空串、tags 空数组（不是 null）。
+	p.detail.Work.Genres = nil
+	if err := s.SyncSeries(ctx, st, "w1"); err != nil {
+		t.Fatalf("第三次 SyncSeries: %v", err)
+	}
+	d, err = st.DramaByProviderID(ctx, "fake", "w1")
+	if err != nil {
+		t.Fatalf("DramaByProviderID(无标签): %v", err)
+	}
+	if d.Genre != "" || d.Tags != "[]" {
+		t.Fatalf("无标签时 genre/tags = (%q, %q), 期望 (\"\", \"[]\")", d.Genre, d.Tags)
+	}
+}
+
+// AC：同步后海报落到 <cache_dir> 且 artifact(kind='cover') 有行；把源图改成 404 后
+// 重跑仍能取到（命中本地资产，不回源）。
+func TestSyncSeriesLocalizesCover(t *testing.T) {
+	ctx := context.Background()
+	cdn, srv := newCoverCDN(t)
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cover-sync.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	if err := settings.Set(ctx, store.KeyCacheDir, cacheDir); err != nil {
+		t.Fatalf("设置 cache_dir: %v", err)
+	}
+
+	p := &fakePlugin{name: "fake", detail: plugin.WorkDetail{
+		Work: plugin.Work{
+			Ref: plugin.WorkRef{Plugin: "fake", ID: "w1"}, Title: "剧",
+			CoverURL: srv.URL + "/cover.jpg",
+		},
+		Episodes: []plugin.Episode{{No: 1}, {No: 2}},
+	}}
+	s := New(p, cache.NewCoverCache(st, settings, srv.Client()))
+
+	if err := s.SyncSeries(ctx, st, "w1"); err != nil {
+		t.Fatalf("SyncSeries: %v", err)
+	}
+	row, err := st.ArtifactByKey(ctx, store.ArtifactKindCover, "fake/w1")
+	if err != nil {
+		t.Fatalf("ArtifactByKey: %v", err)
+	}
+	if !strings.HasPrefix(row.Path, cacheDir+string(filepath.Separator)) {
+		t.Fatalf("海报路径 %q 不在 cache_dir %q 下", row.Path, cacheDir)
+	}
+	if _, err := os.Stat(row.Path); err != nil {
+		t.Fatalf("海报文件不在: %v", err)
+	}
+
+	// 源图 404 后重跑：同步成功，且不再回源（本地资产）。
+	cdn.set(http.StatusNotFound, nil)
+	before := cdn.count()
+	if err := s.SyncSeries(ctx, st, "w1"); err != nil {
+		t.Fatalf("源图 404 后 SyncSeries: %v", err)
+	}
+	if got := cdn.count(); got != before {
+		t.Fatalf("命中本地海报后仍回源：%d → %d", before, got)
+	}
+	again, err := st.ArtifactByKey(ctx, store.ArtifactKindCover, "fake/w1")
+	if err != nil {
+		t.Fatalf("第二次 ArtifactByKey: %v", err)
+	}
+	if again != row {
+		t.Fatalf("重跑后索引行变了：%+v → %+v", row, again)
+	}
+	if _, err := os.Stat(row.Path); err != nil {
+		t.Fatalf("重跑后海报文件不可用: %v", err)
+	}
+}
+
+// AC：先编排合并组，再触发一次同步 → merge_group / merge_item 一行不变，派生表
+// 仍保留合并语义（刷新只增改 drama/episode，绝不写 merge_*）。
+func TestSyncKeepsMergeGroups(t *testing.T) {
+	ctx := context.Background()
+	_, srv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series.html"))
+	st := newTestStore(t)
+	clock := &fakeClock{t: time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)}
+	s := newTestSyncer(t, srv, clock)
+
+	if err := s.SyncSeries(ctx, st, fixtureSID); err != nil {
+		t.Fatalf("预备同步: %v", err)
+	}
+	d, err := st.DramaByProviderID(ctx, hongguo.Name, fixtureSID)
+	if err != nil {
+		t.Fatalf("DramaByProviderID: %v", err)
+	}
+	eps, err := st.ListEpisodes(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("ListEpisodes: %v", err)
+	}
+	groupID, err := st.CreateMergeGroup(ctx, d.ID, "第 1-2 集", []int64{eps[0].ID, eps[1].ID})
+	if err != nil {
+		t.Fatalf("CreateMergeGroup: %v", err)
+	}
+
+	groupsBefore, err := st.ListMergeGroups(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("ListMergeGroups: %v", err)
+	}
+	membersBefore, err := st.ListMergeMembers(ctx, groupID)
+	if err != nil {
+		t.Fatalf("ListMergeMembers: %v", err)
+	}
+	embyBefore, err := st.ListEmbyItems(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("ListEmbyItems: %v", err)
+	}
+
+	clock.advance(time.Hour)
+	if err := s.SyncSeries(ctx, st, fixtureSID); err != nil {
+		t.Fatalf("刷新同步: %v", err)
+	}
+
+	groupsAfter, err := st.ListMergeGroups(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("ListMergeGroups(刷新后): %v", err)
+	}
+	membersAfter, err := st.ListMergeMembers(ctx, groupID)
+	if err != nil {
+		t.Fatalf("ListMergeMembers(刷新后): %v", err)
+	}
+	if !reflect.DeepEqual(groupsBefore, groupsAfter) {
+		t.Fatalf("刷新冲掉了 merge_group：%+v → %+v", groupsBefore, groupsAfter)
+	}
+	if !reflect.DeepEqual(membersBefore, membersAfter) {
+		t.Fatalf("刷新冲掉了 merge_item：%+v → %+v", membersBefore, membersAfter)
+	}
+
+	// 派生表整体重建（UID 稳定），合并语义保留：m<groupID> 仍是那条对外集。
+	embyAfter, err := st.ListEmbyItems(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("ListEmbyItems(刷新后): %v", err)
+	}
+	if len(embyAfter) != len(embyBefore) {
+		t.Fatalf("刷新后对外集数 = %d, 期望 %d（合并组占 1 个）", len(embyAfter), len(embyBefore))
+	}
+	mergedUID := "m" + strconv.FormatInt(groupID, 10)
+	found := false
+	for _, it := range embyAfter {
+		if it.UID == mergedUID {
+			found = true
+			if it.Kind != "merged" || it.EpFrom != eps[0].EpNo || it.EpTo != eps[1].EpNo {
+				t.Fatalf("重建后的合并集 = %+v, 期望 kind=merged 覆盖第 1-2 集", it)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("刷新后派生表里找不到合并集 %s", mergedUID)
 	}
 }

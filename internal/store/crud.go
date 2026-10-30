@@ -9,7 +9,8 @@ import (
 
 // Drama 是 drama 表的一行，对应上游剧目。
 //
-// ID 是输出字段：UpsertDrama 忽略入参 ID，读回时才有意义。SyncAt 是不透明
+// ID 是输出字段：UpsertDrama 忽略入参 ID，读回时才有意义。Shard 同样是输出字段：
+// 它由 provider_id 派生（ShardOf），调用方传什么都会被重算。SyncAt 是不透明
 // TEXT，调用方按 docs/DEV-STANDARDS.md 写 UTC RFC3339，store 不解析、不格式化、
 // 不校验。
 type Drama struct {
@@ -22,6 +23,15 @@ type Drama struct {
 	CoverURL     string
 	EpisodeTotal int
 	SyncAt       string
+	// Genre 是主类型（上游声明的第一个标签），WebDAV 的 `/<类型>/` 一级目录按它分组；
+	// 空串表示上游未声明，目录兜底为「其他」。
+	Genre string
+	// Tags 是上游全部标签的 JSON 数组（UTF-8 TEXT，保序去重）。store 把它当不透明
+	// 文本：不解析、不校验，只为「刷新下来的数据全部入库」的保真。
+	Tags string
+	// Shard 是目录分片键 fnv32a(provider_id) % ShardCount，由 UpsertDrama 按身份
+	// 计算后存下（入参被忽略），只服务分类目录的列举。
+	Shard int
 }
 
 // Episode 是 episode 表的一行，对应某部剧的一集。
@@ -86,7 +96,7 @@ func (s *Store) InTx(ctx context.Context, fn func(tx *Store) error) error {
 }
 
 // dramaColumns 是 drama 表的显式列清单，顺序必须与 scanDrama 的 Scan 顺序一致。
-const dramaColumns = `SELECT id, provider, provider_id, title, year, plot, cover_url, episode_total, sync_at FROM drama`
+const dramaColumns = `SELECT id, provider, provider_id, title, year, plot, cover_url, episode_total, sync_at, genre, tags, shard FROM drama`
 
 // episodeColumns 是 episode 表的显式列清单，顺序必须与 scanEpisode 的 Scan 顺序一致。
 const episodeColumns = `SELECT id, drama_id, ep_no, title, duration_sec, source, vid, play_url, play_url_at FROM episode`
@@ -94,7 +104,7 @@ const episodeColumns = `SELECT id, drama_id, ep_no, title, duration_sec, source,
 // scanDrama 按 dramaColumns 的顺序读出一行；scan 传 *sql.Row.Scan 或 *sql.Rows.Scan。
 func scanDrama(scan func(dest ...any) error) (Drama, error) {
 	var d Drama
-	if err := scan(&d.ID, &d.Provider, &d.ProviderID, &d.Title, &d.Year, &d.Plot, &d.CoverURL, &d.EpisodeTotal, &d.SyncAt); err != nil {
+	if err := scan(&d.ID, &d.Provider, &d.ProviderID, &d.Title, &d.Year, &d.Plot, &d.CoverURL, &d.EpisodeTotal, &d.SyncAt, &d.Genre, &d.Tags, &d.Shard); err != nil {
 		return Drama{}, err
 	}
 	return d, nil
@@ -111,23 +121,30 @@ func scanEpisode(scan func(dest ...any) error) (Episode, error) {
 
 // UpsertDrama 以 (provider, provider_id) 为身份写入或更新一部剧，返回行 id。
 //
-// 冲突时只更新可变态（title / year / plot / cover_url / episode_total / sync_at），
-// provider 与 provider_id 是身份、不被覆盖。入参 ID 被忽略，避免调用方陈旧 id
-// 造成主键冲突。唯一/主键约束冲突返回 ErrConflict。
+// 冲突时只更新可变态（title / year / plot / cover_url / episode_total / sync_at /
+// genre / tags），provider 与 provider_id 是身份、不被覆盖；shard 不入可变态，
+// 而是每次按身份重算（ShardOf），所以不存在「身份没变但分片漂了」的状态。
+//
+// 入参 ID 与 Shard 被忽略，避免调用方陈旧 id 造成主键冲突、也避免分片层依赖
+// 调用方是否记得算。唯一/主键约束冲突返回 ErrConflict。
 func (s *Store) UpsertDrama(ctx context.Context, d Drama) (int64, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx,
-		`INSERT INTO drama(provider, provider_id, title, year, plot, cover_url, episode_total, sync_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO drama(provider, provider_id, title, year, plot, cover_url, episode_total, sync_at, genre, tags, shard)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(provider, provider_id) DO UPDATE
 		 SET title = excluded.title,
 		     year = excluded.year,
 		     plot = excluded.plot,
 		     cover_url = excluded.cover_url,
 		     episode_total = excluded.episode_total,
-		     sync_at = excluded.sync_at
+		     sync_at = excluded.sync_at,
+		     genre = excluded.genre,
+		     tags = excluded.tags,
+		     shard = excluded.shard
 		 RETURNING id`,
 		d.Provider, d.ProviderID, d.Title, d.Year, d.Plot, d.CoverURL, d.EpisodeTotal, d.SyncAt,
+		d.Genre, d.Tags, ShardOf(d.ProviderID),
 	).Scan(&id)
 	if err != nil {
 		return 0, wrapWriteErr("写入剧目", err)

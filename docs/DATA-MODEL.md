@@ -4,6 +4,13 @@
 当前基线：`internal/store/migrations/0001_init.sql`（`main @ d0bb513`）
 本文的 SQL 是**草案**，落地时机：0002 归 S5，0003 必须与它的代码改动同一个提交。
 
+**实际落地编号**（2026-10-30，MKACG-608 的 PL 裁定）：迁移文件名必须从 0001 连续、
+不许留空号，而「删 `play_url`」随 S8（MKACG-612）落地，因此两类约束同时成立的唯一
+结果是编号整体前移 —— 仓库里现在是 `0002_add_genre_and_source_state.sql`
+（本文「0002」块）与 `0003_segment_cache.sql`（本文「0004」块），删列由 S8 以
+`0004_drop_play_url.sql` 落地。SQL 内容逐字不变，本章的「0004」指的是 artifact
+重建这件事，不是文件名。因此 S3 收口时是 `applied=3` / `user_version=3`。
+
 ## 上游能给什么（先定数据来源，再定列）
 
 红果 `GET /player/{id}` 的一个响应里（`seriesDetail`）能给到的：

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -81,7 +83,7 @@ func TestMigrateToLatest(t *testing.T) {
 
 	want := []string{
 		"artifact", "drama", "emby_item", "episode",
-		"merge_group", "merge_item", "segment", "settings",
+		"merge_group", "merge_item", "segment", "settings", "source_state",
 	}
 	if got := tableNames(t, db); !reflect.DeepEqual(got, want) {
 		t.Fatalf("表集合 = %v, 期望 %v", got, want)
@@ -325,5 +327,244 @@ func TestOpenInvalidPath(t *testing.T) {
 	if err == nil {
 		_ = db.Close()
 		t.Fatal("Open 不存在的目录返回 nil 错误")
+	}
+}
+
+// sortedNames 把索引名集合排成稳定顺序，供 t.Logf 输出。
+func sortedNames(set map[string]bool) []string {
+	names := make([]string, 0, len(set))
+	for name := range set {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// indexNames 返回某张表上的索引名集合（含自动索引）。
+func indexNames(t *testing.T, db *sql.DB, table string) map[string]bool {
+	t.Helper()
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA index_list(%s)`, table))
+	if err != nil {
+		t.Fatalf("PRAGMA index_list(%s): %v", table, err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("读 index_list 列名: %v", err)
+	}
+	names := make(map[string]bool)
+	for rows.Next() {
+		// PRAGMA 的列随 SQLite 版本增减（seq/name/unique/origin/partial），
+		// 只按列名取 name，不依赖位置。
+		raw := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range raw {
+			ptrs[i] = &raw[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatalf("扫描 index_list(%s): %v", table, err)
+		}
+		for i, c := range cols {
+			if strings.EqualFold(c, "name") {
+				if name, ok := raw[i].(string); ok {
+					names[name] = true
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 index_list(%s): %v", table, err)
+	}
+	return names
+}
+
+// columnDefaults 返回 PRAGMA table_info(table) 的 name → dflt_value（NULL 记为 ""）。
+func columnDefaults(t *testing.T, db *sql.DB, table string) map[string]string {
+	t.Helper()
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]string)
+	for rows.Next() {
+		var (
+			cid  int
+			name string
+			typ  string
+			nn   int
+			dflt sql.NullString
+			pk   int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &nn, &dflt, &pk); err != nil {
+			t.Fatalf("扫描 table_info(%s): %v", table, err)
+		}
+		out[name] = dflt.String
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 table_info(%s): %v", table, err)
+	}
+	return out
+}
+
+// AC：本段只落 0002（genre/tags/shard + 两索引 + source_state）与 0003（artifact
+// 重建），所以空库 applied=3、user_version=3；删列由 S8 以 0004 落地。
+func TestMigrateStopsAtS3(t *testing.T) {
+	db := openRaw(t, filepath.Join(t.TempDir(), "s3.db"))
+	ctx := context.Background()
+
+	applied, err := migrate(ctx, db)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if applied != 3 {
+		t.Fatalf("首次 applied = %d, 期望 3（0001+0002+0003）", applied)
+	}
+	if got := userVersion(t, db); got != 3 {
+		t.Fatalf("user_version = %d, 期望 3", got)
+	}
+	t.Logf("空库首次 applied=%d user_version=%d", applied, userVersion(t, db))
+
+	applied, err = migrate(ctx, db)
+	if err != nil {
+		t.Fatalf("第二次 migrate: %v", err)
+	}
+	if applied != 0 {
+		t.Fatalf("第二次 applied = %d, 期望 0", applied)
+	}
+	if got := userVersion(t, db); got != 3 {
+		t.Fatalf("第二次 user_version = %d, 期望 3", got)
+	}
+	t.Logf("二次执行 applied=%d user_version=%d", applied, userVersion(t, db))
+}
+
+// AC：drama 三列就位且默认值正确（插入只给必填列时它们是 ” / '[]' / 0）。
+func TestDramaGenreTagsShardColumns(t *testing.T) {
+	db := openRaw(t, filepath.Join(t.TempDir(), "genre.db"))
+	ctx := context.Background()
+	if _, err := migrate(ctx, db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	defaults := columnDefaults(t, db, "drama")
+	for _, tc := range []struct{ col, want string }{
+		{"genre", "''"},
+		{"tags", "'[]'"},
+		{"shard", "0"},
+	} {
+		got, ok := defaults[tc.col]
+		if !ok {
+			t.Fatalf("drama 缺列 %s", tc.col)
+		}
+		if got != tc.want {
+			t.Errorf("drama.%s 默认值 = %q, 期望 %q", tc.col, got, tc.want)
+		}
+	}
+
+	// 只给必填列 → 三列取 schema 默认值（不是 NULL，也不是空串以外的形态）。
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO drama(provider, provider_id, title) VALUES('web', 'p1', '剧')`); err != nil {
+		t.Fatalf("插入 drama: %v", err)
+	}
+	var genre, tags string
+	var shard int
+	if err := db.QueryRowContext(ctx,
+		`SELECT genre, tags, shard FROM drama WHERE provider_id = 'p1'`).Scan(&genre, &tags, &shard); err != nil {
+		t.Fatalf("读三列: %v", err)
+	}
+	if genre != "" || tags != "[]" || shard != 0 {
+		t.Fatalf("默认值 = (%q, %q, %d), 期望 (\"\", \"[]\", 0)", genre, tags, shard)
+	}
+
+	// 两条目录索引 + 淘汰索引必须就位（索引名是 docs/DATA-MODEL.md 的契约）。
+	dramaIdx := indexNames(t, db, "drama")
+	for _, name := range []string{"idx_drama_genre_shard_title", "idx_drama_title"} {
+		if !dramaIdx[name] {
+			t.Errorf("drama 缺索引 %s（现有 %v）", name, dramaIdx)
+		}
+	}
+	artifactIdx := indexNames(t, db, "artifact")
+	if !artifactIdx["idx_artifact_kind_last_used"] {
+		t.Errorf("artifact 缺索引 idx_artifact_kind_last_used（现有 %v）", artifactIdx)
+	}
+	t.Logf("drama 索引: %v", sortedNames(dramaIdx))
+	t.Logf("artifact 索引: %v", sortedNames(artifactIdx))
+	t.Logf("drama 默认值: genre=%s tags=%s shard=%s", defaults["genre"], defaults["tags"], defaults["shard"])
+}
+
+// AC：artifact 重建只扩 kind，重建前的 cover/index 两行逐字段保留；三类 kind 可写，
+// CHECK 拒绝未知 kind。
+func TestArtifactRebuildKeepsRows(t *testing.T) {
+	db := openRaw(t, filepath.Join(t.TempDir(), "artifact.db"))
+	ctx := context.Background()
+
+	files, err := migrations()
+	if err != nil {
+		t.Fatalf("读取迁移清单: %v", err)
+	}
+	// 先只跑到 0002，制造「重建前」的 artifact（旧 CHECK 只有 cover/index）。
+	for _, m := range files {
+		if m.version > 2 {
+			break
+		}
+		if err := applyMigration(ctx, db, m); err != nil {
+			t.Fatalf("预置迁移 %s: %v", m.name, err)
+		}
+	}
+
+	before := []Artifact{
+		{Kind: ArtifactKindCover, Key: "web/p1", Path: "/data/cache/cover/aa/aa.jpg", Bytes: 1234,
+			SHA256: "c0ffee", LastUsedAt: "2026-10-29T10:00:00Z"},
+		{Kind: ArtifactKindIndex, Key: "e42", Path: "/data/cache/index/bb/bb.json", Bytes: 4321,
+			SHA256: "", LastUsedAt: "2026-10-29T11:00:00Z"},
+	}
+	s := NewStore(db)
+	for _, a := range before {
+		if err := s.PutArtifact(ctx, a); err != nil {
+			t.Fatalf("预置 artifact %s/%s: %v", a.Kind, a.Key, err)
+		}
+	}
+
+	applied, err := migrate(ctx, db)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if applied != 1 {
+		t.Fatalf("重建段 applied = %d, 期望 1（只剩 0003）", applied)
+	}
+
+	for _, want := range before {
+		got, err := s.ArtifactByKey(ctx, want.Kind, want.Key)
+		if err != nil {
+			t.Fatalf("重建后读 %s/%s: %v", want.Kind, want.Key, err)
+		}
+		if got != want {
+			t.Errorf("重建后 %s/%s = %+v, 期望逐字段 %+v", want.Kind, want.Key, got, want)
+		}
+	}
+	if n := countRows(t, db, "artifact"); n != len(before) {
+		t.Fatalf("重建后 artifact 行数 = %d, 期望 %d", n, len(before))
+	} else {
+		t.Logf("重建后 artifact 行数 = %d，cover/index 两行逐字段保留", n)
+	}
+
+	// 三类 kind 都能写：cover/index 已在，补 segment。
+	seg := Artifact{Kind: ArtifactKindSegment, Key: "sha256:abc", Path: "/data/cache/seg/cc/cc.ts",
+		Bytes: 650000, SHA256: "abc", LastUsedAt: "2026-10-30T09:00:00Z"}
+	if err := s.PutArtifact(ctx, seg); err != nil {
+		t.Fatalf("写入 kind=segment: %v", err)
+	}
+	if _, err := s.ArtifactByKey(ctx, ArtifactKindSegment, seg.Key); err != nil {
+		t.Fatalf("读回 kind=segment: %v", err)
+	}
+
+	// 未知 kind 被 CHECK 拒绝，且不留行。
+	if err := s.PutArtifact(ctx, Artifact{Kind: "poster", Key: "k", Path: "/p", LastUsedAt: "x"}); err == nil {
+		t.Fatal("未知 kind 写入未报错（CHECK 未生效）")
+	}
+	if n := countRows(t, db, "artifact"); n != len(before)+1 {
+		t.Fatalf("拒绝未知 kind 后行数 = %d, 期望 %d", n, len(before)+1)
 	}
 }

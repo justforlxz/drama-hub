@@ -6,7 +6,8 @@
 // Content-Length（硬约束 3），本包不提供独立的长度字段或 Size 方法。
 //
 // 依赖方向：rank 30，可 import rank 20/10 的 internal 包（cache、store）；
-// rank 40/50/60 的包可 import 本包；与同为 30 的 provider 同级、互不 import。
+// rank 40/50/60 的包可 import 本包；与同为 30 的 plugin/hongguo、sync 同级、
+// 互不 import。
 // 规则见 docs/DEV-STANDARDS.md「代码组织」，由 scripts/check-deps.sh 强制。
 //
 // 边界：只读 drama / episode / emby_item 三张表；封面下载、HTTP 处理、

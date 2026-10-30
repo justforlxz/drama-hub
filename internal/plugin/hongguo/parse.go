@@ -1,4 +1,4 @@
-package provider
+package hongguo
 
 import (
 	"encoding/json"
@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/justforlxz/drama-hub/internal/plugin"
 )
 
 // series 是列表页解析出的剧目元数据（内部结构，无需导出）。
@@ -15,6 +17,7 @@ type series struct {
 	cover            string
 	intro            string
 	firstVisibleTime string
+	tags             []string
 	vids             []string
 }
 
@@ -28,17 +31,18 @@ var ldJSONRE = regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script\s*>`)
 
 // parsePlayerPage 从列表页 HTML 解析剧目元数据。sid 是请求时的身份，页面里两处
 // series_id 都必须与之一致——被锁的集会 302 到别的剧/别的集页面，身份不符一律
-// ErrParse。vid_list 必须存在、非空、元素全数字且无重复（下标即集号）。
+// plugin.ErrSchema。tags 缺失记为 nil（= 上游未声明）；vid_list 必须存在、非空、
+// 元素全数字且无重复（下标即集号）。
 func parsePlayerPage(html, sid string) (series, error) {
 	page, err := playerPage(html)
 	if err != nil {
 		return series{}, err
 	}
 	if !page.IsSuccess {
-		return series{}, fmt.Errorf("%w: isSuccess=false", ErrParse)
+		return series{}, fmt.Errorf("%w: isSuccess=false", plugin.ErrSchema)
 	}
 	if page.SeriesID != sid || page.SeriesDetail.SeriesID != sid {
-		return series{}, fmt.Errorf("%w: 页面 series_id=%q 与请求 sid=%q 不符", ErrParse, page.SeriesID, sid)
+		return series{}, fmt.Errorf("%w: 页面 series_id=%q 与请求 sid=%q 不符", plugin.ErrSchema, page.SeriesID, sid)
 	}
 	vids, err := validateVidList(page.SeriesDetail.VidList)
 	if err != nil {
@@ -50,23 +54,24 @@ func parsePlayerPage(html, sid string) (series, error) {
 		cover:            page.SeriesDetail.Cover,
 		intro:            page.SeriesDetail.Intro,
 		firstVisibleTime: page.SeriesDetail.FirstVisibleTime,
+		tags:             page.SeriesDetail.Tags,
 		vids:             vids,
 	}, nil
 }
 
 // parseDirectURL 从单集页 HTML 解析本集的直链。用 @type == "VideoObject" + 绑定
 // 校验过滤：页面里另有推荐位其它剧的 JSON-LD 块，不匹配的跳过；都匹配不上才
-// ErrParse。VideoObject 存在但 contentUrl 缺失 → ErrNoDirectURL。
+// plugin.ErrSchema；VideoObject 存在但 contentUrl 缺失 → plugin.ErrNoStream。
 func parseDirectURL(html, sid, vid string) (string, error) {
 	page, err := playerPage(html)
 	if err != nil {
 		return "", err
 	}
 	if !page.IsSuccess {
-		return "", fmt.Errorf("%w: isSuccess=false", ErrParse)
+		return "", fmt.Errorf("%w: isSuccess=false", plugin.ErrSchema)
 	}
 	if page.SeriesID != sid {
-		return "", fmt.Errorf("%w: 页面 series_id=%q 与请求 sid=%q 不符", ErrParse, page.SeriesID, sid)
+		return "", fmt.Errorf("%w: 页面 series_id=%q 与请求 sid=%q 不符", plugin.ErrSchema, page.SeriesID, sid)
 	}
 
 	for _, block := range ldJSONRE.FindAllStringSubmatch(html, -1) {
@@ -85,29 +90,29 @@ func parseDirectURL(html, sid, vid string) (string, error) {
 			continue // 别的剧/别的集的块
 		}
 		if v.ContentURL == "" {
-			return "", ErrNoDirectURL
+			return "", plugin.ErrNoStream
 		}
 		u, err := normalizeURL(v.ContentURL)
 		if err != nil {
-			return "", fmt.Errorf("%w: contentUrl 非法: %v", ErrParse, err)
+			return "", fmt.Errorf("%w: contentUrl 非法: %v", plugin.ErrSchema, err)
 		}
 		return u, nil
 	}
-	return "", fmt.Errorf("%w: 无绑定本集(%s/%s)的 VideoObject", ErrParse, sid, vid)
+	return "", fmt.Errorf("%w: 无绑定本集(%s/%s)的 VideoObject", plugin.ErrSchema, sid, vid)
 }
 
 // playerPage 从 HTML 里解出 _ROUTER_DATA，按 key 顺序取第一个 page 载荷。
 func playerPage(html string) (playerPageData, error) {
 	loc := routerDataRE.FindStringIndex(html)
 	if loc == nil {
-		return playerPageData{}, fmt.Errorf("%w: 缺 _ROUTER_DATA", ErrParse)
+		return playerPageData{}, fmt.Errorf("%w: 缺 _ROUTER_DATA", plugin.ErrSchema)
 	}
 	dec := json.NewDecoder(strings.NewReader(html[loc[1]-1:]))
 	var router struct {
 		LoaderData map[string]json.RawMessage `json:"loaderData"`
 	}
 	if err := dec.Decode(&router); err != nil {
-		return playerPageData{}, fmt.Errorf("%w: _ROUTER_DATA JSON 解码失败: %v", ErrParse, err)
+		return playerPageData{}, fmt.Errorf("%w: _ROUTER_DATA JSON 解码失败: %v", plugin.ErrSchema, err)
 	}
 	// 列表页与单集页两个 key 同构，按固定优先序取第一个存在的：列表页优先，
 	// 单集页兜底（实测两类页面各只有其中一个 key）。
@@ -118,30 +123,30 @@ func playerPage(html string) (playerPageData, error) {
 		}
 		var page playerPageData
 		if err := json.Unmarshal(raw, &page); err != nil {
-			return playerPageData{}, fmt.Errorf("%w: 解析 %s: %v", ErrParse, key, err)
+			return playerPageData{}, fmt.Errorf("%w: 解析 %s: %v", plugin.ErrSchema, key, err)
 		}
 		return page, nil
 	}
-	return playerPageData{}, fmt.Errorf("%w: loaderData 缺 player_(series_id)/page", ErrParse)
+	return playerPageData{}, fmt.Errorf("%w: loaderData 缺 player_(series_id)/page", plugin.ErrSchema)
 }
 
 // validateVidList 校验 vid_list：非空、元素全数字（1..30 位）、无重复。
 func validateVidList(vids []string) ([]string, error) {
 	if len(vids) == 0 {
-		return nil, fmt.Errorf("%w: vid_list 为空", ErrParse)
+		return nil, fmt.Errorf("%w: vid_list 为空", plugin.ErrSchema)
 	}
 	seen := make(map[string]bool, len(vids))
 	for _, v := range vids {
 		if len(v) == 0 || len(v) > 30 {
-			return nil, fmt.Errorf("%w: vid %q 长度非法", ErrParse, v)
+			return nil, fmt.Errorf("%w: vid %q 长度非法", plugin.ErrSchema, v)
 		}
 		for _, c := range v {
 			if c < '0' || c > '9' {
-				return nil, fmt.Errorf("%w: vid %q 含非数字字符", ErrParse, v)
+				return nil, fmt.Errorf("%w: vid %q 含非数字字符", plugin.ErrSchema, v)
 			}
 		}
 		if seen[v] {
-			return nil, fmt.Errorf("%w: vid %q 重复", ErrParse, v)
+			return nil, fmt.Errorf("%w: vid %q 重复", plugin.ErrSchema, v)
 		}
 		seen[v] = true
 	}
@@ -209,6 +214,7 @@ type playerPageData struct {
 		Cover            string   `json:"series_cover"`
 		Intro            string   `json:"series_intro"`
 		FirstVisibleTime string   `json:"first_visible_time"`
+		Tags             []string `json:"tags"`
 		VidList          []string `json:"vid_list"`
 	} `json:"seriesDetail"`
 }

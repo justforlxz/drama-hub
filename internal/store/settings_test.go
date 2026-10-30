@@ -365,3 +365,92 @@ func TestParseSettingStringKinds(t *testing.T) {
 		})
 	}
 }
+
+// 插件配置键 plugin.<源>.<项>：默认值来自 docs/PLUGIN-CONTRACT.md「配置」。
+//
+// 内置源默认启用（升级到 2.0 后红果不需要先手工开一下）；base_url 空 = 用插件
+// 内置地址；请求超时默认 30 秒。
+func TestPluginSettingDefaults(t *testing.T) {
+	s := NewSettings(newTestDB(t))
+	ctx := context.Background()
+
+	enabled, err := s.Bool(ctx, PluginSettingKey("web", PluginItemEnabled))
+	if err != nil {
+		t.Fatalf("Bool(plugin.web.enabled): %v", err)
+	}
+	if !enabled {
+		t.Error("plugin.web.enabled 默认应为 true")
+	}
+	baseURL, err := s.String(ctx, PluginSettingKey("web", PluginItemBaseURL))
+	if err != nil {
+		t.Fatalf("String(plugin.web.base_url): %v", err)
+	}
+	if baseURL != "" {
+		t.Errorf("plugin.web.base_url 默认应为空（用插件内置地址），实际 %q", baseURL)
+	}
+	timeout, err := s.Int(ctx, PluginSettingKey("web", PluginItemRequestTimeout))
+	if err != nil {
+		t.Fatalf("Int(plugin.web.request_timeout_sec): %v", err)
+	}
+	if timeout != 30 {
+		t.Errorf("plugin.web.request_timeout_sec 默认应为 30，实际 %d", timeout)
+	}
+}
+
+// 插件键的合法值与非法值：未知项、非法源名、越界、类型不符都拒绝且不落库。
+func TestPluginSettingValidation(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	valid := []struct {
+		key SettingKey
+		raw string
+	}{
+		{PluginSettingKey("web", PluginItemEnabled), "false"},
+		{PluginSettingKey("web", PluginItemEnabled), "true"},
+		{PluginSettingKey("web", PluginItemBaseURL), ""},
+		{PluginSettingKey("web", PluginItemBaseURL), "http://127.0.0.1:18080"},
+		{PluginSettingKey("web", PluginItemRequestTimeout), "5"},
+		{PluginSettingKey("web", PluginItemRequestTimeout), "300"},
+		{PluginSettingKey("src_2", PluginItemEnabled), "false"},
+	}
+	for _, c := range valid {
+		if err := s.Set(ctx, c.key, c.raw); err != nil {
+			t.Errorf("Set(%s, %q) = %v, 期望通过", c.key, c.raw, err)
+		}
+	}
+
+	invalid := []struct {
+		key SettingKey
+		raw string
+	}{
+		// 用另一个源名：同一 key 在上面已经写过合法值，hasRow 就没法证明「没落库」。
+		{PluginSettingKey("bad", PluginItemRequestTimeout), "4"},   // 越界
+		{PluginSettingKey("bad", PluginItemRequestTimeout), "301"}, // 越界
+		{PluginSettingKey("bad", PluginItemRequestTimeout), "30s"},
+		{PluginSettingKey("bad", PluginItemBaseURL), "/player"}, // 相对 URL
+		{PluginSettingKey("bad", PluginItemEnabled), "yes"},
+		{PluginSettingKey("web", "refresh_batch"), "10"},      // 未登记的项
+		{PluginSettingKey("", PluginItemEnabled), "true"},     // 空源名
+		{PluginSettingKey("-web", PluginItemEnabled), "true"}, // 首字符是分隔符
+		{PluginSettingKey("WEB", PluginItemEnabled), "true"},  // 大写不在允许字符集
+		{PluginSettingKey("web.x", PluginItemEnabled), "true"},
+	}
+	for _, c := range invalid {
+		if err := s.Set(ctx, c.key, c.raw); !errors.Is(err, ErrInvalidSetting) && !errors.Is(err, ErrUnknownSetting) {
+			t.Errorf("Set(%s, %q) = %v, 期望被拒", c.key, c.raw, err)
+		}
+		if hasRow(t, db, c.key) {
+			t.Errorf("非法插件配置 %s 被写入了库", c.key)
+		}
+	}
+
+	// 用错类型读取同样报 ErrInvalidSetting。
+	if _, err := s.String(ctx, PluginSettingKey("web", PluginItemEnabled)); !errors.Is(err, ErrInvalidSetting) {
+		t.Errorf("String(plugin.web.enabled) 错误 = %v, 期望 ErrInvalidSetting", err)
+	}
+	if _, err := s.Bool(ctx, PluginSettingKey("web", PluginItemBaseURL)); !errors.Is(err, ErrInvalidSetting) {
+		t.Errorf("Bool(plugin.web.base_url) 错误 = %v, 期望 ErrInvalidSetting", err)
+	}
+}

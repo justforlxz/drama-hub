@@ -9,6 +9,18 @@
 </section>
 
 <section class="block">
+  <h2>播放源</h2>
+  <div class="scroll">
+    <table class="grid">
+      <caption class="sr-only">播放源</caption>
+      <thead><tr><th>源</th><th>状态</th><th>说明</th></tr></thead>
+      <tbody id="sources"></tbody>
+    </table>
+  </div>
+  <p class="hint">配置键为 <code>plugin.&lt;源&gt;.enabled</code> / <code>.base_url</code> / <code>.request_timeout_sec</code>，改完下一次读取即生效。</p>
+</section>
+
+<section class="block">
   <h2>运行配置</h2>
   <div class="scroll">
     <table class="grid">

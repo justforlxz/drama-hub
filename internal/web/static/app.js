@@ -334,6 +334,7 @@ function initMerges() {
 
 function initStatus() {
   const totalsBox = document.getElementById('totals');
+  const sourcesBody = document.getElementById('sources');
   const configBody = document.getElementById('config');
   const cacheBody = document.getElementById('cache');
   const cacheNote = document.getElementById('cache-note');
@@ -378,6 +379,15 @@ function initStatus() {
       row('出流签名密钥', flag(c.stream_secret_set), 'stream_secret（ADR-0003）'),
       row('WebDAV 用户', flag(c.webdav_user_set), 'webdav_user'),
       row('WebDAV 密码', flag(c.webdav_pass_set), 'webdav_pass'));
+
+    sourcesBody.replaceChildren(...status.sources.map((src) => row(
+      src.label === src.name ? src.name : src.name + '（' + src.label + '）',
+      src.enabled
+        ? el('span', { class: 'tag', text: '已启用' })
+        : el('span', { class: 'tag warn', text: '已停用' }),
+      src.reason !== '' ? src.reason
+        : 'base_url ' + (src.base_url === '' ? '用插件默认地址' : src.base_url) +
+          '，请求超时 ' + src.request_timeout_sec + ' 秒')));
 
     const cache = status.cache;
     cacheBody.replaceChildren(

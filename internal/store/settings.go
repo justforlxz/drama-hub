@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -23,8 +24,10 @@ var (
 
 // SettingKey 是 settings 表的键。
 //
-// 注册表只认这里列出的 7 个 key（真值见 docs/DEV-STANDARDS.md「配置」表）。
-// 缓存上限与 LRU 天数由缓存代理负责（ADR-0004），不属于本服务配置。
+// 注册表认两组 key：下面列出的固定 key，以及插件配置的前缀模式
+// plugin.<源>.<项>（真值见 docs/DEV-STANDARDS.md「配置」表与
+// docs/PLUGIN-CONTRACT.md「配置」）。缓存上限与 LRU 天数由缓存代理负责（ADR-0004），
+// 不属于本服务配置。
 type SettingKey string
 
 // settings 表的 key 常量。
@@ -37,6 +40,21 @@ const (
 	KeyWebDAVUser   SettingKey = "webdav_user"
 	KeyWebDAVPass   SettingKey = "webdav_pass"
 )
+
+// 插件配置的项名（docs/PLUGIN-CONTRACT.md「配置」）。
+const (
+	PluginItemEnabled        = "enabled"
+	PluginItemBaseURL        = "base_url"
+	PluginItemRequestTimeout = "request_timeout_sec"
+)
+
+// PluginSettingKey 拼出插件配置键 plugin.<源>.<项>。
+//
+// 键的格式与校验都在本包：specFor 只认上面三项，非法源名或未知项返回
+// ErrUnknownSetting。调用方（装配根、状态页）不自己拼这个字符串。
+func PluginSettingKey(source, item string) SettingKey {
+	return SettingKey("plugin." + source + "." + item)
+}
 
 // minSecretBytes 是出流签名密钥的最小字节数（ADR-0003 的 HMAC 密钥）。
 const minSecretBytes = 32
@@ -130,6 +148,22 @@ func (s *Settings) Int(ctx context.Context, key SettingKey) (int, error) {
 	return n, nil
 }
 
+// Bool 读取一个布尔配置项。
+//
+// 无行时取默认值；必填项无行返回 ErrSettingMissing；key 未注册返回 ErrUnknownSetting；
+// 非布尔 key 用本方法读返回 ErrInvalidSetting。
+func (s *Settings) Bool(ctx context.Context, key SettingKey) (bool, error) {
+	value, err := s.value(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	b, ok := value.(bool)
+	if !ok {
+		return false, fmt.Errorf("%w: %s 不是布尔配置", ErrInvalidSetting, key)
+	}
+	return b, nil
+}
+
 // value 读取 key 的类型化值：库中有行则 JSON 解码，无行则取默认值或报缺。
 func (s *Settings) value(ctx context.Context, key SettingKey) (any, error) {
 	spec, ok := specFor(key)
@@ -154,6 +188,12 @@ func (s *Settings) value(ctx context.Context, key SettingKey) (any, error) {
 			return nil, fmt.Errorf("解码配置 %s: %w", key, err)
 		}
 		return n, nil
+	case kindBool:
+		var b bool
+		if err := json.Unmarshal([]byte(encoded), &b); err != nil {
+			return nil, fmt.Errorf("解码配置 %s: %w", key, err)
+		}
+		return b, nil
 	default: // 其余 kind 都存 JSON 字符串
 		var str string
 		if err := json.Unmarshal([]byte(encoded), &str); err != nil {
@@ -184,6 +224,7 @@ const (
 	kindURL                       // 空，或带 scheme 的绝对 URL
 	kindSecret                    // 至少 minSecretBytes 字节
 	kindInt                       // [min, max] 闭区间整数
+	kindBool                      // true / false
 )
 
 // settingSpec 是一个 key 的注册表条目。
@@ -216,7 +257,52 @@ func specFor(key SettingKey) (settingSpec, bool) {
 	case KeyWebDAVPass:
 		return settingSpec{kind: kindString, required: true}, true
 	}
+	return pluginSpecFor(string(key))
+}
+
+// pluginSpecFor 解析插件配置键 plugin.<源>.<项>。
+//
+// 源的取值：底层插件的 Name()（红果是 "web"），沿用 1.0 的 provider 标识；只允许
+// 小写字母、数字、下划线、短横线，首字符不能是分隔符——避免键里出现第二个分隔点或空段。
+func pluginSpecFor(key string) (settingSpec, bool) {
+	rest, ok := strings.CutPrefix(key, "plugin.")
+	if !ok {
+		return settingSpec{}, false
+	}
+	source, item, ok := strings.Cut(rest, ".")
+	if !ok || !validSourceName(source) {
+		return settingSpec{}, false
+	}
+	switch item {
+	case PluginItemEnabled:
+		// 内置源默认启用：升级到 2.0 后红果不需要先手工开一下。
+		return settingSpec{kind: kindBool, def: "true"}, true
+	case PluginItemBaseURL:
+		// 空 = 用插件内置默认地址，与「未设置」等价。
+		return settingSpec{kind: kindURL}, true
+	case PluginItemRequestTimeout:
+		return settingSpec{kind: kindInt, def: "30", min: 5, max: 300}, true
+	}
 	return settingSpec{}, false
+}
+
+// validSourceName 校验插件名能否作为配置键里的一段。
+func validSourceName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, c := range name {
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '_' || c == '-':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // parseSetting 校验并规范化 raw，返回可 JSON 编码的类型化值（string 或 int）。
@@ -250,6 +336,12 @@ func parseSetting(key SettingKey, raw string) (any, error) {
 			return nil, fmt.Errorf("%w: %s 不能为空", ErrInvalidSetting, key)
 		}
 		return raw, nil
+	case kindBool:
+		b, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s 不是布尔值: %q", ErrInvalidSetting, key, raw)
+		}
+		return b, nil
 	case kindInt:
 		n, err := strconv.Atoi(raw)
 		if err != nil {

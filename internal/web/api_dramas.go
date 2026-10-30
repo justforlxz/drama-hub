@@ -98,7 +98,7 @@ func (s *Server) handleListDramas(w http.ResponseWriter, r *http.Request) {
 //
 // 「增剧目」的唯一入口是数据源同步 —— 剧目与集的真值都在上游，手工插空剧只会
 // 产生一条永远没有集的记录。同步失败统一归 502：数据源在远端，失败几乎总是上游
-// 或页面结构问题，失败原因原样进响应体（provider 的错误文本不含直链与签名）。
+// 或页面结构问题，失败原因原样进响应体（插件的错误文本不含直链与签名）。
 // 成功返回 201 + 整份剧目列表，页面直接套用。
 func (s *Server) handleCreateDrama(w http.ResponseWriter, r *http.Request) {
 	var in struct {

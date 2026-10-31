@@ -54,7 +54,7 @@ func newAssembly(logger *slog.Logger, st *store.Store, settings *store.Settings,
 		reg = plugin.NewRegistry()
 	}
 	return newHandler(logger, st, settings, syncer, schedule, sources,
-		cache.New(st, settings, logger), stream.NewResolver(st, reg))
+		cache.New(st, settings, logger), stream.NewResolver(st, reg), "")
 }
 
 // stubSource 是装配测试用的最小插件：Resolve 恒给同一个直链。
@@ -590,7 +590,7 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 	}
 
 	logger := slog.New(slog.DiscardHandler)
-	reg, err := newPlugins(ctx, settings, logger)
+	reg, _, err := newPlugins(ctx, settings, logger)
 	if err != nil {
 		t.Fatalf("newPlugins: %v", err)
 	}
@@ -652,7 +652,7 @@ func TestPluginDisabledStillStarts(t *testing.T) {
 
 	// 先验「配置缺失照常启动」：没有任何 plugin.* 行，注册仍然成功。
 	logger := slog.New(slog.DiscardHandler)
-	reg, err := newPlugins(ctx, settings, logger)
+	reg, _, err := newPlugins(ctx, settings, logger)
 	if err != nil {
 		t.Fatalf("配置缺失时 newPlugins 报错：%v", err)
 	}
@@ -663,7 +663,7 @@ func TestPluginDisabledStillStarts(t *testing.T) {
 	if err := settings.Set(ctx, store.PluginSettingKey(hongguo.Name, store.PluginItemEnabled), "false"); err != nil {
 		t.Fatalf("Set enabled: %v", err)
 	}
-	reg, err = newPlugins(ctx, settings, logger)
+	reg, _, err = newPlugins(ctx, settings, logger)
 	if err != nil {
 		t.Fatalf("停用时 newPlugins 报错：%v", err)
 	}

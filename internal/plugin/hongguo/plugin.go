@@ -31,6 +31,47 @@ const DefaultBaseURL = "https://hongguoduanju.com"
 // sitemapIndexPath 是源侧目录索引，枚举（S5）与自检（Health）都以它为入口。
 const sitemapIndexPath = "/sitemap/hongguoduanju/index.xml"
 
+// 上游要的浏览器身份（MKACG-624）。
+//
+// 实测（2026-10-31）：无头请求与浏览器头请求在官网页面与 /video 直链上都是
+// 200/206，源侧当下不按 UA/Referer 拒绝。仍然发浏览器身份，因为源侧风控是既定
+// 事实——实测跑到约 1 万次 /player 后全量回 444（见 statusDropped），而 Go 默认
+// 出站 UA（Go-http-client/1.1）是最显眼的非浏览器标识；参考实现的原话是「官网
+// 不做鉴权，但要一个像浏览器的请求」。
+//
+// 这几个值是「浏览器长什么样」的事实，不会有人去调（调了就不再是浏览器），所以
+// 是代码常量而不是 settings 键（AGENTS.md 硬约束 5 的反面，理由同 cmd 的
+// coverTimeout：没有用户会为「UA 长什么样」调参）。
+const (
+	// outboundUA 是发往上游的 User-Agent：桌面 Chrome/122。
+	outboundUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+	// outboundAccept 是浏览器导航请求的 Accept。
+	outboundAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+	// outboundAcceptLanguage 是中文浏览器的 Accept-Language。
+	outboundAcceptLanguage = "zh-CN,zh;q=0.9"
+)
+
+// referer 返回发往上游的 Referer：站点根。
+//
+// 官网页面与 /video 直链是同一 origin（实测 14 部剧的 contentUrl 全在
+// hongguoduanju.com/video/public/ 下，没有第三方视频 CDN），所以播放链路也用这一个，
+// 而不是参考实现给移动端 CDN 的 novelquickapp.com。
+func referer(baseURL string) string {
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
+	return strings.TrimRight(baseURL, "/") + "/"
+}
+
+// PlaybackHeaderLines 返回取 /video 直链时要带的请求头（`名称: 值`，顺序固定），
+// 供 ffmpeg / ffprobe 的 -headers 使用：它们不走 http.Client，只能拿到这一串。
+//
+// 只含 UA 与 Referer：直链是媒体请求，页面那套 Accept / Accept-Language 不适用。
+// 身份的真值仍在本包的常量里（一份身份两处用），由装配根注入 internal/segment。
+func PlaybackHeaderLines(baseURL string) []string {
+	return []string{"User-Agent: " + outboundUA, "Referer: " + referer(baseURL)}
+}
+
 const (
 	// defaultTimeout 是 HTTPClient 为 nil 时的兜底出站超时。契约的配置默认值
 	// plugin.web.request_timeout_sec = 30（docs/PLUGIN-CONTRACT.md「配置」），
@@ -220,6 +261,18 @@ func pathOf(raw string) string {
 	return raw
 }
 
+// setOutboundHeaders 给一次出站请求挂上浏览器身份（UA / Accept /
+// Accept-Language / Referer）。
+//
+// 页面（/player、/category）、sitemap 与图片都走同一个 fetch，因此一套头覆盖全部
+// 出站；Referer 取本站站点根，换成绝对 sitemap loc 也仍然是本站。
+func (p *Plugin) setOutboundHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", outboundUA)
+	req.Header.Set("Accept", outboundAccept)
+	req.Header.Set("Accept-Language", outboundAcceptLanguage)
+	req.Header.Set("Referer", referer(p.baseURL))
+}
+
 // fetch 发一次 GET 并读回响应体，把结果映射成契约哨兵：
 //
 //	429 / 403 / 444  → ErrRejected（可重试，需退避）
@@ -234,6 +287,8 @@ func (p *Plugin) fetch(ctx context.Context, logPath, rawURL string, limit int64)
 	if err != nil {
 		return nil, fmt.Errorf("%w: 构造请求 %s: %v", plugin.ErrUpstream, logPath, err)
 	}
+	// 出站身份：源侧要一个「像浏览器的请求」（常量与理由见包内 outbound* 注释）。
+	p.setOutboundHeaders(req)
 	resp, err := p.client.Do(req)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

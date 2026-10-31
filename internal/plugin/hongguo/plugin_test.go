@@ -14,10 +14,11 @@ import (
 	"github.com/justforlxz/drama-hub/internal/plugin"
 )
 
-// fakeSite 是假官网：可替换的「路径 → 响应」回调 + 请求路径记录。
+// fakeSite 是假官网：可替换的「路径 → 响应」回调 + 请求路径与请求头记录。
 type fakeSite struct {
 	mu      sync.Mutex
 	paths   []string
+	headers []http.Header
 	respond func(path string) (int, string)
 }
 
@@ -51,6 +52,15 @@ func (f *fakeSite) requests() []string {
 	return append([]string(nil), f.paths...)
 }
 
+// headerList 返回收到的全部请求头（克隆，按到达顺序）。
+func (f *fakeSite) headerList() []http.Header {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]http.Header, len(f.headers))
+	copy(out, f.headers)
+	return out
+}
+
 // newFakeSite 起一个 httptest 假官网，初始响应固定为 status + body。
 func newFakeSite(t *testing.T, status int, body string) (*fakeSite, *httptest.Server) {
 	t.Helper()
@@ -62,6 +72,7 @@ func newFakeSite(t *testing.T, status int, body string) (*fakeSite, *httptest.Se
 		uri := r.URL.RequestURI()
 		f.mu.Lock()
 		f.paths = append(f.paths, uri)
+		f.headers = append(f.headers, r.Header.Clone())
 		respond := f.respond
 		f.mu.Unlock()
 		st, b := respond(uri)
@@ -335,4 +346,70 @@ func resolveCall(t *testing.T, p *Plugin) error {
 	t.Helper()
 	_, err := p.Resolve(context.Background(), testRef(), 1)
 	return err
+}
+
+// TestOutboundHeaders 覆盖 MKACG-624 AC4：每次出站都带浏览器身份，且 Referer
+// 跟着配置的 base_url 走（换成假站点也仍然指向本站根）。
+//
+// 判据是「每一条出站请求都带」：漏在一次 sitemap / 集页请求上，那条请求就是
+// Go-http-client/1.1，等于没做（源侧风控按请求看，不按平均看）。
+func TestOutboundHeaders(t *testing.T) {
+	fake, srv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series.html"))
+	p := newTestPlugin(t, srv)
+
+	if _, err := p.Work(context.Background(), testRef()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := p.Health(context.Background()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+
+	headers := fake.headerList()
+	if len(headers) != 2 {
+		t.Fatalf("出站请求数 = %d, 期望 2（Work + Health）", len(headers))
+	}
+	wantReferer := srv.URL + "/"
+	for i, h := range headers {
+		if got := h.Get("User-Agent"); got != outboundUA {
+			t.Errorf("第 %d 个请求 User-Agent = %q, 期望浏览器 UA", i, got)
+		}
+		if got := h.Get("Accept"); got != outboundAccept {
+			t.Errorf("第 %d 个请求 Accept = %q", i, got)
+		}
+		if got := h.Get("Accept-Language"); got != outboundAcceptLanguage {
+			t.Errorf("第 %d 个请求 Accept-Language = %q", i, got)
+		}
+		if got := h.Get("Referer"); got != wantReferer {
+			t.Errorf("第 %d 个请求 Referer = %q, 期望 %q（跟随 base_url）", i, got, wantReferer)
+		}
+	}
+}
+
+// TestPlaybackHeaderLines 钉住给 ffmpeg 的那一份身份：顺序固定、只含 UA 与
+// Referer（直链是媒体请求，页面那套 Accept 不适用），base_url 为空时回落到
+// 内置默认地址。
+func TestPlaybackHeaderLines(t *testing.T) {
+	got := PlaybackHeaderLines("https://mirror.example/base/")
+	want := []string{
+		"User-Agent: " + outboundUA,
+		"Referer: https://mirror.example/base/",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("PlaybackHeaderLines = %q, 期望 %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("PlaybackHeaderLines[%d] = %q, 期望 %q", i, got[i], want[i])
+		}
+	}
+
+	for _, base := range []string{"", DefaultBaseURL} {
+		if lines := PlaybackHeaderLines(base); lines[1] != "Referer: "+DefaultBaseURL+"/" {
+			t.Errorf("base_url = %q 时 Referer = %q, 期望内置默认地址", base, lines[1])
+		}
+	}
+	// 不返回共享切片：调用方（装配根）改了不该污染别的实例。
+	if a, b := PlaybackHeaderLines(""), PlaybackHeaderLines(""); &a[0] == &b[0] {
+		t.Error("PlaybackHeaderLines 返回了同一个底层数组")
+	}
 }

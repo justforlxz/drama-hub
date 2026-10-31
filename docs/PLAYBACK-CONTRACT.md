@@ -106,6 +106,9 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid
 返回 MPEG-TS 分片。顺序是：**查本地缓存 → 命中即回文件；未命中 → 生成、落缓存、再回**。
 
 - 生成：`ffmpeg -ss … -t … -c copy`（关键帧对齐时可 copy），不可 copy 时转码（现有 `Cutter`）。
+- 出站身份：`ffmpeg` / `ffprobe` 取直链 MUST 带 `-headers`（浏览器 UA + 源站根
+  `Referer`），与同步抓页面是同一份身份；这一份由装配根从插件常量注入
+  （`internal/segment` 不认识任何源），理由见 `docs/PLUGIN-CONTRACT.md` 硬性要求 8。
 - 生成失败：502，**不写缓存**（不许把坏值写进缓存）。
 - `Range`：分片是完整不可变对象，支持 `Range` 但不需要分段生成；`HEAD` 返回同样的
   `Content-Length`（硬约束 3）。

@@ -73,7 +73,7 @@ type Schedule interface {
 // 管理 API（`/api/` 子树）。不注册 catch-all：未登记路径由 ServeMux 兜底 404，
 // 这是「未知路径 → 404」的前提（cmd 的装配注释同此约定）。
 //
-// 写操作（POST / DELETE / PATCH）在 ServeHTTP 里先过令牌，路由表本身不重复这件事：
+// 写操作（非 GET/HEAD/OPTIONS）在 ServeHTTP 里先过令牌，路由表本身不重复这件事：
 // 新增写端点不需要记得加鉴权，忘不了。
 func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, schedule Schedule, sources []Source, adminToken string, logger *slog.Logger) *Server {
 	s := &Server{
@@ -115,7 +115,7 @@ const AdminTokenHeader = "X-Admin-Token"
 
 // ServeHTTP 实现 http.Handler。
 //
-// 写操作（POST / DELETE / PATCH）在分派前先验管理令牌：`/api/` 原本完全无鉴权，
+// 写操作（非 GET/HEAD/OPTIONS）在分派前先验管理令牌：`/api/` 原本完全无鉴权，
 // `POST /api/dramas` 能触发同步、`DELETE` 能删库，加写配置端点会同时放大它。
 // 读操作维持现状（单用户本机管理面，Emby 与页面都靠 GET 浏览）。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -126,13 +126,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// isAdminWrite 判断一次请求是不是受令牌保护的写操作：管理 API 的 POST / DELETE / PATCH。
+// isAdminWrite 判断一次请求是不是受令牌保护的写操作：管理 API 里所有非读方法。
 //
 // 按「方法 + /api/ 前缀」判定而不是逐个登记端点：新加的写端点默认受保护，漏不了。
+// 读方法只认 GET / HEAD / OPTIONS，其余（POST / PUT / DELETE / PATCH / …）都算写 ——
+// 硬列写方法等于给未来的 PUT 留门，注释里的「默认受保护」也就不再成立（MKACG-634）。
 func isAdminWrite(method, path string) bool {
 	switch method {
-	case http.MethodPost, http.MethodDelete, http.MethodPatch:
-	default:
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return false
 	}
 	return strings.HasPrefix(path, "/api/")

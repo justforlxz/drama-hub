@@ -8,7 +8,7 @@
 // ---- 通用 ----
 
 // ---- 管理令牌 ----
-// 写操作（POST / DELETE / PATCH）要带 X-Admin-Token（env DRAMA_HUB_ADMIN_TOKEN）。
+// 写操作（非 GET/HEAD/OPTIONS）要带 X-Admin-Token（env DRAMA_HUB_ADMIN_TOKEN）。
 // 令牌只存在 sessionStorage：关掉标签页就没了 —— 改配置是低频动作，不值得长期留在浏览器。
 const TOKEN_KEY = 'drama-hub-admin-token';
 const TOKEN_HEADER = 'X-Admin-Token';

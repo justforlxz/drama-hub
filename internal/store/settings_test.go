@@ -348,7 +348,12 @@ func TestStrmPrefixValidation(t *testing.T) {
 	s := NewSettings(newTestDB(t))
 	ctx := context.Background()
 
-	for _, raw := range []string{"/proxy", "proxy.local/stream", "not a url"} {
+	for _, raw := range []string{
+		"/proxy", "proxy.local/stream", "not a url",
+		// 归一化只去尾 `/`，去掉之后仍是「带 scheme 但没有 host」：前者剩 `http:`、
+		// 后者 host 为空，拼出的 .strm 都是 `http:/video/…`，Emby 拉不到（MKACG-634）。
+		"http://", "http:///path",
+	} {
 		if err := s.Set(ctx, KeyStrmPrefix, raw); !errors.Is(err, ErrInvalidSetting) {
 			t.Errorf("Set(strm_prefix, %q) 错误 = %v, 期望 ErrInvalidSetting", raw, err)
 		}

@@ -465,6 +465,10 @@ func parseSetting(key SettingKey, raw string) (any, error) {
 		// （`{strm_prefix}/video/…`、`{base_url}{path}`），留着尾斜杠会拼出
 		// `http://h:1//video/…`（MKACG-617 实测）。同一地址的两种写法归一成一种，
 		// 不算「纠正非法值」——非法值仍然报错、不猜。
+		//
+		// 归一化在校验之前，所以校验必须看「削过之后」的值：`http://` 削成 `http:`、
+		// `http:///path` 的 host 为空，两者 `IsAbs()` 都为真，拼出来的 .strm 是
+		// `http:/video/…`，Emby 拉不到（MKACG-634）。空串仍是合法值（按请求 Host 推导）。
 		raw = strings.TrimRight(raw, "/")
 		if raw == "" {
 			return "", nil
@@ -475,6 +479,9 @@ func parseSetting(key SettingKey, raw string) (any, error) {
 		}
 		if !u.IsAbs() {
 			return nil, fmt.Errorf("%w: %s 必须是带 scheme 的绝对 URL", ErrInvalidSetting, key)
+		}
+		if u.Host == "" {
+			return nil, fmt.Errorf("%w: %s 必须带 host（形如 http://host:port）", ErrInvalidSetting, key)
 		}
 		return raw, nil
 	case kindSecret:

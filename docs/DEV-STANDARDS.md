@@ -136,7 +136,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 
 | key | 默认 | 取值范围 | 生效时机 | 作用 |
 |---|---|---|---|---|
-| `strm_prefix` | `""` | URL 或空 | 即时（每次渲染 `.strm`） | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，尾 `/` 写入时归一掉）；空 = 按请求 `Host` 推导绝对地址（见上「`.strm` 的绝对地址」）。不指向 rclone/openlist |
+| `strm_prefix` | `""` | 带 host 的绝对 URL 或空 | 即时（每次渲染 `.strm`） | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，尾 `/` 写入时归一掉）；空 = 按请求 `Host` 推导绝对地址（见上「`.strm` 的绝对地址」）。不指向 rclone/openlist |
 | `stream_secret` | 必填 | ≥ 32 字节 | 即时（每请求） | 出流 HMAC 签名密钥（见 ADR-0003）；换了之后所有旧 URL 失效 |
 | `seg_target_sec` | `10` | 4–30 | 即时（仅未建索引的 uid，见下） | 分片目标时长；**只对还没建索引的 uid 生效**——已建索引的 uid 不重算，改了要等它下一次重建（`segment` 表被整体替换时） |
 | `webdav_user` / `webdav_pass` | 必填 | 非空字符串 | 即时（每请求） | WebDAV Basic 认证 |
@@ -145,7 +145,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 | `cache_lru_days` | `30` | 1–365 | ≤5 分钟（下一轮淘汰） | 超过 N 天未命中的缓存条目（三种 kind 都算）删除 |
 | `cover_timeout_sec` | `5` | 1–60 | 即时（每次海报下载） | 海报（`artifact(kind='cover')`）的单次出站超时。**不跟插件 `base_url` / `request_timeout_sec` 走**：封面 URL 是上游页面里的三方 CDN 绝对地址（实测 `p3-novel.byteimg.com`），`base_url` 改不到它，而页面的 30 s 超时会让一张卡住的图拖住整部剧的同步。取不到只记一条 warn，该剧不算同步失败（MKACG-620） |
 | `plugin.<源>.enabled` | `true` | 布尔 | 即时（每轮调度现读） | 是否参与**刷新调度**（缺失按 `true`）；手动同步（`POST /api/dramas`）与播放（`/video`）不受影响 |
-| `plugin.<源>.base_url` | `""` | URL 或空 | **重启后**（构造期注入） | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
+| `plugin.<源>.base_url` | `""` | 带 host 的绝对 URL 或空 | **重启后**（构造期注入） | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
 | `plugin.<源>.request_timeout_sec` | `30` | 5–300 | **重启后**（构造期注入） | 单次出站请求超时 |
 | `refresh_interval_sec` | `3600` | 300–86400 | ≤60 秒（调度器醒来） | 全局刷新间隔，一轮到期 = `last_run_at` + 本值 |
 | `plugin.<源>.refresh_interval_sec` | 空 = 继承全局 | 300–86400 | ≤60 秒（调度器醒来） | 源级间隔覆盖（用 `Settings.OptionalInt` 读，无行即「继承」） |
@@ -158,7 +158,10 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 `strm_prefix` 的尾 `/`（B2）：`{strm_prefix}/video/…` 是字符串拼接，库里存着
 `http://host/stream/` 会产出 `//video/`（MKACG-617 实测）。**写入时归一化**（`parseSetting`
 对 URL 类键 `TrimRight`，状态页显示的就是归一后的值），**渲染时再去一次**（存量手改的行
-也能拼对）；非法值照旧报错，不猜。
+也能拼对）。归一化在校验之前，所以校验看的是削过的值：`http://` 只剩 `http:`、
+`http:///path` 的 host 为空，两条都会被 `IsAbs` 放过而拼出 `http:/video/…`，因此
+URL 类键还要求 **host 非空**（MKACG-634）；空串仍是合法值（按请求 `Host` 推导）。
+非法值照旧报错，不猜。
 
 写接口的校验只有一份：`PATCH /api/settings` 走 `Settings.SetMany` → 同一条 `parseSetting`
 （`specFor` 的范围与类型）。越界 / 类型不符 → 400 且整批不落库，错误文本原样带回（页面
@@ -734,7 +737,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 ### 写操作鉴权（MKACG-622）
 
 `/api/` 的**读**操作维持无鉴权（单用户本机管理面；Emby 与页面都靠 GET 浏览），**写**操作
-（`POST` / `DELETE` / `PATCH`）一律要令牌 —— 在此之前 `POST /api/dramas` 能触发同步、
+（非 `GET` / `HEAD` / `OPTIONS` 即算写，含 `PUT`）一律要令牌 —— 在此之前 `POST /api/dramas` 能触发同步、
 `DELETE` 能删库，加写配置端点会同时放大这个风险。
 
 | 项 | 口径 |

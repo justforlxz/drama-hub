@@ -22,6 +22,9 @@ func TestAPI_WriteEndpointsRequireToken(t *testing.T) {
 		{http.MethodDelete, "/api/dramas/1", ""},
 		{http.MethodPost, "/api/refresh", `{"source":"web"}`},
 		{http.MethodPatch, "/api/settings", `{"settings":{"webdav_user":"alice"}}`},
+		// PUT 现在没有注册端点，但闸门按「非读即写」判定：日后加了 PUT 也默认受保护，
+		// 不需要回到这里登记（MKACG-634）。
+		{http.MethodPut, "/api/settings", `{"settings":{"webdav_user":"alice"}}`},
 	}
 
 	t.Run("没带令牌", func(t *testing.T) {
@@ -118,6 +121,21 @@ func TestAPI_PatchSettings(t *testing.T) {
 	}
 }
 
+// 空 strm_prefix 仍是合法值（= 按请求 Host 推导，MKACG-616 B1），不能因为补校验把它
+// 判成非法。它和上面两条负例一起把「先归一化、再要求 host」的顺序钉住（MKACG-634）。
+func TestAPI_PatchSettingsEmptyStrmPrefix(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	rec := do(t, srv, http.MethodPatch, "/api/settings", `{"settings":{"strm_prefix":""}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	got := decode[statusView](t, do(t, srv, http.MethodGet, "/api/status", ""))
+	if got.Config.StrmPrefix != "" {
+		t.Errorf("config.StrmPrefix = %q, 期望空串（Host 推导路径）", got.Config.StrmPrefix)
+	}
+}
+
 // TestAPI_PatchSettingsRejectsBatch 覆盖拒绝语义：未知键 / 越界值 / 空请求都是 400，
 // 而且整批不落库（半批生效最难排查）。边界值按下界合法性分别断言。
 func TestAPI_PatchSettingsRejectsBatch(t *testing.T) {
@@ -135,6 +153,10 @@ func TestAPI_PatchSettingsRejectsBatch(t *testing.T) {
 		{"空请求", `{"settings":{}}`},
 		{"空密码", `{"settings":{"webdav_pass":""}}`},
 		{"尾斜杠 URL 之外的非法值", `{"settings":{"strm_prefix":"not-a-url"}}`},
+		// 归一化（去尾 `/`）在校验之前，会把这两条削成 `http:` / 空 host 的 URL，
+		// 存进去之后 .strm 就是 `http:/video/…`，所以必须在校验里拦下（MKACG-634）。
+		{"只有 scheme 的 URL", `{"settings":{"strm_prefix":"http://"}}`},
+		{"空 host 的 URL", `{"settings":{"strm_prefix":"http:///path"}}`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

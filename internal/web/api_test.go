@@ -29,6 +29,10 @@ type fakeSyncer struct {
 	err   error
 }
 
+// Name 与下面 SyncSeries 写库用的 provider 一致（生产里是插件名 hongguo）；
+// 建剧 handler 拿它查「这部剧是否已存在」（MKACG-623）。
+func (f *fakeSyncer) Name() string { return "web" }
+
 func (f *fakeSyncer) SyncSeries(ctx context.Context, st *store.Store, sid string) error {
 	f.calls++
 	f.sid = sid
@@ -209,6 +213,37 @@ func TestAPI_CreateDrama(t *testing.T) {
 	after := decode[dramaList](t, do(t, srv, http.MethodGet, "/api/dramas", ""))
 	if len(after.Dramas) != len(created.Dramas) || after.Dramas[0] != created.Dramas[0] {
 		t.Errorf("POST 响应与 GET 不一致：\nPOST=%+v\nGET =%+v", created.Dramas, after.Dramas)
+	}
+}
+
+// TestAPI_CreateDrama_RepeatReturnsOK 锁定 PL 裁定（MKACG-623 G7）：新建 201、
+// 已存在 200。重复 POST 同一 series_id 时库里没有新行，回 Created 会让调用方以为
+// 每次都产生了新行；响应体仍是整份列表，与 GET 一致。
+func TestAPI_CreateDrama_RepeatReturnsOK(t *testing.T) {
+	srv, st, syncer := newTestServer(t)
+
+	first := do(t, srv, http.MethodPost, "/api/dramas", `{"series_id":"1001"}`)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("首次 POST 状态码 = %d, 期望 201（body=%s）", first.Code, first.Body.String())
+	}
+	second := do(t, srv, http.MethodPost, "/api/dramas", `{"series_id":"1001"}`)
+	if second.Code != http.StatusOK {
+		t.Fatalf("重复 POST 状态码 = %d, 期望 200（body=%s）", second.Code, second.Body.String())
+	}
+	if syncer.calls != 2 {
+		t.Errorf("数据源调用次数 = %d, 期望 2（重复同步仍要回源）", syncer.calls)
+	}
+	dramas, err := st.ListDramas(context.Background())
+	if err != nil {
+		t.Fatalf("ListDramas: %v", err)
+	}
+	if len(dramas) != 1 {
+		t.Errorf("重复同步后剧目数 = %d, 期望 1（不许建出第二行）", len(dramas))
+	}
+	repeated := decode[dramaList](t, second)
+	after := decode[dramaList](t, do(t, srv, http.MethodGet, "/api/dramas", ""))
+	if len(repeated.Dramas) != 1 || len(after.Dramas) != 1 || repeated.Dramas[0] != after.Dramas[0] {
+		t.Errorf("重复 POST 响应与 GET 不一致：\nPOST=%+v\nGET =%+v", repeated.Dramas, after.Dramas)
 	}
 }
 
@@ -653,6 +688,8 @@ type gatedSyncer struct {
 	entered chan struct{}
 	gate    chan struct{}
 }
+
+func (g *gatedSyncer) Name() string { return "web" }
 
 func (g *gatedSyncer) SyncSeries(ctx context.Context, _ *store.Store, _ string) error {
 	g.entered <- struct{}{}

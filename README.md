@@ -53,13 +53,13 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | 端点 | 方法 | 状态 | 说明 |
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
-| `/webdav/` 及全部子路径 | 任意 | 207/200/401/403/404/405/415/500 | 只读 WebDAV：PROPFIND 207（带 getcontentlength）、GET strm/nfo 200；树是 `/{分类}/{分片}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401；写意图被拒的状态码由协议层决定（`PUT` 404、`MOVE`/`COPY` 403、`DELETE`/无 body 的 `MKCOL` 405、带 body 的 `MKCOL` 415、`PROPPATCH` 500，逐格前置条件见 `docs/DEV-STANDARDS.md`「只读」） |
+| `/webdav/` 及全部子路径 | 任意 | 207/200/401/403/404/405/415/500 | 只读 WebDAV：PROPFIND 207（带 getcontentlength，**只支持 `Depth: 0/1`**——数值深度 ≥2 由 `x/net/webdav` 直接 400，不是本服务的缺陷）、GET strm/nfo 200；树是 `/{分类}/{分片}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401；写意图被拒的状态码由协议层决定（`PUT` 404、`MOVE`/`COPY` 403、`DELETE`/无 body 的 `MKCOL` 405、带 body 的 `MKCOL` 415、`PROPPATCH` 500，逐格前置条件见 `docs/DEV-STANDARDS.md`「只读」） |
 | `/video/{id}.m3u8` | GET / HEAD | 200/401/404/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
 | `/video/{id}/{seq}.ts` | GET / HEAD | 200/206/401/404/502/503 | MPEG-TS 分片：本地缓存命中即回，未命中现切并落缓存 |
 | `/s/{token}/…`、`/dav/…` | 任意 | 404 | 已退役（不留兼容层） |
 | `/`、`/merges`、`/status` | GET | 200 | 管理界面三页：剧目 / 合并编排 / 同步与缓存看板 |
 | `/static/app.css`、`/static/app.js` | GET | 200 | 内嵌样式与脚本（随二进制，无构建步骤） |
-| `/api/dramas` | GET / POST | 200 / 201 | 剧目列表（含计数）/ 按上游剧 id 同步入库 |
+| `/api/dramas` | GET / POST | 200 / 200·201 | 剧目列表（含计数）/ 按上游剧 id 同步入库：**新建 201、已存在（只更新）200** |
 | `/api/dramas/{id}` | DELETE | 204 | 删剧目（级联删集、合并组、对外集号） |
 | `/api/dramas/{id}/episodes` | GET | 200 | 该剧全部集，供合并编排挑选 |
 | `/api/dramas/{id}/merge-groups` | GET / POST | 200 / 201 | 合并组列表 / 建组（`episode_ids` 顺序即时间轴顺序） |
@@ -114,14 +114,16 @@ ffmpeg 失败 → 502 且不写缓存。
 
 ```bash
 open http://127.0.0.1:8080/            # 剧目（顶栏填管理令牌后才能同步/删除）
-curl -s -X POST -H 'Content-Type: application/json' \
+curl -i -X POST -H 'Content-Type: application/json' \
   -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
   -d '{"series_id":"7503745441910017049"}' http://127.0.0.1:8080/api/dramas
+# 首次同步该剧 → 201 Created；再发一次（库里只更新、不新增）→ 200 OK
 ```
 
 ```bash
 curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}
 curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8080/webdav/  # 207 + getcontentlength
+# PROPFIND 只认 Depth: 0 / 1（数值深度 ≥2 → 400，x/net/webdav 的限制）；递归靠逐层 Depth: 1
 ```
 
 每个请求输出一条结构化访问日志（`method` / `path` / `status` / `duration_ms`，见

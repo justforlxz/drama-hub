@@ -195,7 +195,7 @@ worker 数不复用 `ffmpeg` 那个常量（`internal/segment` 的闸），但�
 | 端点 | 方法 | 语义 | 状态码 |
 |---|---|---|---|
 | `/api/refresh` | POST `{"source":"web"}` | 立即跑一轮该源，不等 `next_due` | 202 已启动 / 404 无此源或未启用 / 409 该源正在跑 |
-| `/api/dramas` | POST `{"series_id":…}` | 保留为单剧补录入口（1.0 已有），走同一套 `Work` + 入库 | 201 / 502（不变） |
+| `/api/dramas` | POST `{"series_id":…}` | 保留为单剧补录入口（1.0 已有），走同一套 `Work` + 入库 | 201 新建 / 200 已更新 / 502（MKACG-623 细分 201/200，502 语义不变） |
 | `/api/status` | GET | 扩展为含 `sources[]`：`name` / `enabled` / `running` / `last_run_at` / `last_ok_at` / `next_due_at`（现算）/ `last_error` | 200 |
 
 手动触发与定时触发**共用同一把单飞锁**：先拿到锁的跑，另一个拿到 409 或被本轮跳过。

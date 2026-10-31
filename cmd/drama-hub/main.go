@@ -56,7 +56,7 @@ func main() {
 	defer func() { _ = db.Close() }()
 
 	settings := store.NewSettings(db.DB)
-	plugins, err := newPlugins(context.Background(), settings, logger)
+	plugins, sourceBaseURL, err := newPlugins(context.Background(), settings, logger)
 	if err != nil {
 		logger.Error("注册插件失败", "err", err)
 		os.Exit(1)
@@ -76,7 +76,7 @@ func main() {
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           newHandler(logger, st, settings, syncer, sched, sourceList(plugins), caches, resolver),
+		Handler:           newHandler(logger, st, settings, syncer, sched, sourceList(plugins), caches, resolver, sourceBaseURL),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -139,8 +139,9 @@ func main() {
 //
 // 请求日志中间件只在装配根挂一次：/healthz、/webdav/、/video/、/ 与未知路径都经它，
 // 每请求恰一条访问日志（见 internal/httpx）。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver) http.Handler {
-	cutter := segment.NewCutter(st, settings, logger, caches, resolver.DirectURL)
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver, sourceBaseURL string) http.Handler {
+	cutter := segment.NewCutter(st, settings, logger, caches, resolver.DirectURL,
+		hongguo.PlaybackHeaderLines(sourceBaseURL))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
@@ -192,7 +193,11 @@ const coverTimeout = 15 * time.Second
 //
 // 配置读不出来（值非法、库被手改）时用插件默认值并 warn：配置错不该让服务起不来，
 // 原因与现状在状态页看得见（plugin.<源>.* 三行）。
-func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logger) (*plugin.Registry, error) {
+//
+// 返回的 baseURL 是读到的源地址（可能为空 = 用插件内置默认）：播放面取直链时
+// ffmpeg 要带与页面同一份 Referer，装配根把它交给 newHandler，由
+// hongguo.PlaybackHeaderLines 补齐默认地址（见 internal/segment 的 NewCutter）。
+func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logger) (*plugin.Registry, string, error) {
 	baseURL, err := settings.String(ctx, store.PluginSettingKey(hongguo.Name, store.PluginItemBaseURL))
 	if err != nil {
 		logger.Warn("读插件 base_url 失败，用插件内置地址", "plugin", hongguo.Name, "err", err)
@@ -209,9 +214,9 @@ func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logg
 		HTTPClient: &http.Client{Timeout: time.Duration(timeoutSec) * time.Second},
 		Logger:     logger,
 	})); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return reg, nil
+	return reg, baseURL, nil
 }
 
 // mustPlugin 取已注册的插件。名字写死在内置清单里，取不到只可能是装配 bug，

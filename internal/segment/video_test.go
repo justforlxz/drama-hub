@@ -27,6 +27,17 @@ import (
 // testSecret 是测试用的出流密钥（literal，不用占位符，黄金 id 才能稳定）。
 const testSecret = "unit-test-secret-32-bytes-minimum!"
 
+// testFetchHeaders 是 rig 注入给出站子进程的请求头（生产里是 hongguo 的浏览器
+// UA/Referer）。内容不重要，但要能被假 CDN 逐字断言，因此用不会与 ffmpeg 默认
+// （`Lavf/...`）混淆的值。
+//
+// rig 默认带上它：ffprobe / ffmpeg 的 `-headers` 拼错会让所有切片测试一起失败，
+// 而不是只在专门的那条测试里。
+var testFetchHeaders = []string{
+	"User-Agent: drama-hub-test",
+	"Referer: https://example.test/site/",
+}
+
 // makeVideo 用容器内的 ffmpeg 现场生成测试源（进 t.TempDir()，不落版本库）。
 // -force_key_frames 每秒一个关键帧 + -sc_threshold 0 关掉场景切换插帧，
 // 于是「关键帧位置」在测试里是可断言的确定值。
@@ -100,6 +111,9 @@ type fakeCDN struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 	n   int
+	// seen 是每个请求收到的头（按到达顺序）：断言 ffprobe / ffmpeg 的 -headers
+	// 真的挂到了出站请求上（MKACG-624），而不是只写进了命令行。
+	seen []http.Header
 	// broken 为 true 时返回一段 HTML，让 ffmpeg / ffprobe 切不出 TS。
 	broken bool
 	// hanging 为 true 时永不回包（算索引超时那条路径）。
@@ -112,6 +126,7 @@ func newFakeCDN(t *testing.T, body []byte) *fakeCDN {
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.n++
+		f.seen = append(f.seen, r.Header.Clone())
 		broken, hanging := f.broken, f.hanging
 		f.mu.Unlock()
 		if hanging {
@@ -137,6 +152,15 @@ func (f *fakeCDN) hits() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.n
+}
+
+// seenHeaders 返回收到的全部请求头（克隆，避免与在跑的请求抢锁）。
+func (f *fakeCDN) seenHeaders() []http.Header {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]http.Header, len(f.seen))
+	copy(out, f.seen)
+	return out
 }
 
 func (f *fakeCDN) setBroken(v bool) {
@@ -210,7 +234,7 @@ func newRig(t *testing.T, segTarget string) *rig {
 				return "", fmt.Errorf("测试没有给剧集 %d 配源", ep.ID)
 			}
 			return f.url(), nil
-		})
+		}, testFetchHeaders)
 	return r
 }
 
@@ -449,6 +473,69 @@ func TestSegment_SliceThenCacheHit(t *testing.T) {
 	}
 	if !bytes.Equal(rec.Body.Bytes(), first.Body.Bytes()[:188]) {
 		t.Error("Range 返回的字节与完整分片的前缀不一致")
+	}
+}
+
+// TestFetchHeaders_ReachBothFFmpegCalls 覆盖 MKACG-624 AC4：注入的请求头经
+// `-headers` 真的挂到了源侧请求上——建索引的 ffprobe 与切片的 ffmpeg 都是。
+//
+// 判据是「每一个出站请求都带」，不是「出现过一次」：只写进其中一条命令行，
+// 另一条仍然是 Lavf 默认身份，而它在真机上就是被风控挑出来的那类请求。
+func TestFetchHeaders_ReachBothFFmpegCalls(t *testing.T) {
+	r := newRig(t, "4")
+	ep := r.addEpisode(t, 1, 12)
+	uid := "e" + strconv.FormatInt(ep.ID, 10)
+	id := r.id(uid)
+	cdn := r.cdn[ep.ID]
+
+	if rec := r.do(t, http.MethodGet, "/video/"+id+".m3u8"); rec.Code != http.StatusOK {
+		t.Fatalf("playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	probeReqs := cdn.hits()
+	if probeReqs == 0 {
+		t.Fatal("建索引没有回源：ffprobe 没有请求假 CDN")
+	}
+
+	if rec := r.do(t, http.MethodGet, "/video/"+id+"/0.ts"); rec.Code != http.StatusOK {
+		t.Fatalf("分片状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	seen := cdn.seenHeaders()
+	if len(seen) <= probeReqs {
+		t.Fatalf("切片没有回源：请求数 %d，建索引时已有 %d", len(seen), probeReqs)
+	}
+
+	for i, h := range seen {
+		stage := "切片（ffmpeg）"
+		if i < probeReqs {
+			stage = "建索引（ffprobe）"
+		}
+		if got := h.Get("User-Agent"); got != "drama-hub-test" {
+			t.Errorf("第 %d 次回源（%s）User-Agent = %q, 期望注入值", i, stage, got)
+		}
+		if got := h.Get("Referer"); got != "https://example.test/site/" {
+			t.Errorf("第 %d 次回源（%s）Referer = %q, 期望注入值", i, stage, got)
+		}
+	}
+}
+
+// TestHeaderBlock 是 headerBlock / headerArgs 的纯函数判据：CRLF 分隔、末行有
+// 终止符（ffmpeg 丢没有终止符的末行）、空输入不进命令行。
+func TestHeaderBlock(t *testing.T) {
+	if got := headerBlock(nil); got != "" {
+		t.Errorf("headerBlock(nil) = %q, 期望空串", got)
+	}
+	if got := headerArgs(""); got != nil {
+		t.Errorf("headerArgs(\"\") = %v, 期望 nil（nil 才是一个参数都不加）", got)
+	}
+
+	block := headerBlock(testFetchHeaders)
+	want := "User-Agent: drama-hub-test\r\nReferer: https://example.test/site/\r\n"
+	if block != want {
+		t.Fatalf("headerBlock = %q, 期望 %q", block, want)
+	}
+	args := headerArgs(block)
+	if len(args) != 2 || args[0] != "-headers" || args[1] != block {
+		t.Errorf("headerArgs = %q, 期望 [-headers %q]", args, block)
 	}
 }
 

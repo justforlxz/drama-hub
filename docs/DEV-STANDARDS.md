@@ -26,6 +26,10 @@
 - 业务错误不强求堆栈；跨层返回时只包装一次语义，避免 `"失败: 失败: 失败"`。
 - `panic` 只允许出现在 `main` 的启动装配阶段；请求路径里任何 panic 视为缺陷（recover 中间件只做兜底 + 记录，不吞掉不记录）。
 - 出站 HTTP 一律 `http.Client{Timeout: ...}` 或 `ctx` 超时；没有超时的出站调用视为缺陷。
+- 出站到源侧一律带浏览器身份：UA / `Accept` / `Accept-Language` / `Referer`（`Referer`
+  取源站根）。真值只有一份——插件里的常量；`ffmpeg` / `ffprobe` 不走 `http.Client`，
+  由装配根用同一份常量拼 `-headers` 注入 `internal/segment`（`Cutter`），不在
+  segment 里另写一个 UA。实测与理由见 MKACG-624、`docs/PLUGIN-CONTRACT.md` 硬性要求 8。
 
 ### HTTP 边界：错误类别与统一响应
 

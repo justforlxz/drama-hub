@@ -33,6 +33,9 @@ type Cutter struct {
 	caches   *cache.Cache
 	resolve  ResolveFunc
 	gate     chan struct{}
+	// headerBlock 是取直链时传给 ffmpeg / ffprobe 的 `-headers` 值（CRLF 分隔）；
+	// 空 = 不带。本包不认识任何源，这一份由装配根注入（见 NewCutter 的 headers）。
+	headerBlock string
 	// indexTimeout 是「按需建立索引」的硬上限，生产固定 indexDeadline；
 	// 测试把它调短，才能在 5 分钟测试预算里验证 503 那条路径。
 	indexTimeout time.Duration
@@ -40,14 +43,19 @@ type Cutter struct {
 
 // NewCutter 装配播放面。caches 是 S7 的本地缓存（分片落盘 + single-flight），
 // resolve 由装配根注入（stream.Resolver.DirectURL）。
-func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc) *Cutter {
+//
+// headers 是 ffmpeg / ffprobe 取直链时要带的出站请求头（`名称: 值` 每项一行），
+// 由装配根从插件侧的上游身份注入——源侧要浏览器 UA/Referer，而这两个子进程不走
+// http.Client，只能靠 `-headers`（见 docs/PLAYBACK-CONTRACT.md）。nil = 不带。
+func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc, headers []string) *Cutter {
 	return &Cutter{
-		st:       st,
-		settings: settings,
-		logger:   logger,
-		caches:   caches,
-		resolve:  resolve,
-		gate:     make(chan struct{}, ffmpegSlots()),
+		st:          st,
+		settings:    settings,
+		logger:      logger,
+		caches:      caches,
+		resolve:     resolve,
+		gate:        make(chan struct{}, ffmpegSlots()),
+		headerBlock: headerBlock(headers),
 
 		indexTimeout: indexDeadline,
 	}
@@ -105,7 +113,7 @@ func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, playURL s
 	if err := c.acquire(ctx); err != nil {
 		return nil, err
 	}
-	info, probeErr := probe(ctx, playURL)
+	info, probeErr := probe(ctx, playURL, c.headerBlock)
 	c.release()
 	if probeErr != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -190,22 +198,45 @@ func stderrTail(err error, out []byte) string {
 	return s
 }
 
+// headerBlock 把 `名称: 值` 列表拼成 ffmpeg / ffprobe 的 `-headers` 值：行间 CRLF，
+// 末尾再补一个 CRLF（ffmpeg 以 CRLF 切分，末行没有终止符会被丢掉）。
+// 空输入返回空串，调用方据此不加 `-headers`（测试与不需要头的源）。
+func headerBlock(headers []string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	return strings.Join(headers, "\r\n") + "\r\n"
+}
+
+// headerArgs 返回要插在输入前的 `-headers` 参数；block 为空时返回 nil，
+// 命令行里就一个多余参数都没有。
+//
+// ffmpeg 与 ffprobe 都支持它（`-headers` 是 http 协议的输入选项，位置在输入
+// 地址之前）：ffprobe 里实测带与不带都探出同一个 h264 / 10.066667 秒，带上是
+// 为了与 ffmpeg 走同一份出站身份。
+func headerArgs(block string) []string {
+	if block == "" {
+		return nil
+	}
+	return []string{"-headers", block}
+}
+
 // probe 执行 `ffprobe -skip_frame nokey`：只解出关键帧，收集 pts 与源时长。
 //
 // 失败返回 httpx.ErrUpstream（带 stderr 尾部与源 host；不含完整 URL —— 直链可能
 // 带签名）。
-func probe(ctx context.Context, src string) (sourceInfo, error) {
+func probe(ctx context.Context, src, headers string) (sourceInfo, error) {
 	dctx, cancel := context.WithTimeout(ctx, timeoutProbe)
 	defer cancel()
-	cmd := exec.CommandContext(dctx, "ffprobe",
+	args := append([]string{
 		"-v", "error",
 		"-select_streams", "v:0",
 		"-skip_frame", "nokey",
 		"-show_entries",
 		"frame=pts_time:format=duration:stream=codec_name,profile,level,pix_fmt,codec_tag_string,time_base",
 		"-of", "json",
-		src,
-	)
+	}, headerArgs(headers)...)
+	cmd := exec.CommandContext(dctx, "ffprobe", append(args, src)...)
 	out, err := cmd.Output()
 	if err != nil {
 		return sourceInfo{}, fmt.Errorf("ffprobe %s: %w（%s）", safeHost(src), httpx.ErrUpstream, stderrTail(err, out))
@@ -258,16 +289,20 @@ func probe(ctx context.Context, src string) (sourceInfo, error) {
 //
 // 字节全部收进内存再返回，调用方才能「先定状态码再写响应」：ffmpeg 中途失败时
 // 客户端看到的是干净的 502，不是半截流。单片 10s 约 2–5 MB（DESIGN §2）。
-func cut(ctx context.Context, src string, start, dur, offset float64) ([]byte, error) {
+//
+// headers 是 `-headers` 的值（见 headerBlock），空 = 不带。
+func cut(ctx context.Context, src string, start, dur, offset float64, headers string) ([]byte, error) {
 	dctx, cancel := context.WithTimeout(ctx, timeoutCut)
 	defer cancel()
-	args := []string{
+	args := append([]string{
 		"-v", "error",
+	}, headerArgs(headers)...)
+	args = append(args,
 		"-ss", formatSeconds(start),
 		"-i", src,
 		"-t", formatSeconds(dur),
 		"-c", "copy",
-	}
+	)
 	if offset > 0 {
 		args = append(args, "-output_ts_offset", formatSeconds(offset))
 	}

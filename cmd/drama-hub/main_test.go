@@ -7,22 +7,28 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
+	"github.com/justforlxz/drama-hub/internal/segment"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
 	"github.com/justforlxz/drama-hub/internal/sync"
+	"github.com/justforlxz/drama-hub/internal/vfs"
 	"github.com/justforlxz/drama-hub/internal/web"
 )
 
@@ -684,5 +690,162 @@ func TestPluginDisabledStillStarts(t *testing.T) {
 	}
 	if status.Sources[0].Enabled || !strings.Contains(status.Sources[0].Reason, "enabled=false") {
 		t.Fatalf("停用的源 = %+v, 期望 enabled=false 且原因里带配置键", status.Sources[0])
+	}
+}
+
+// g4Source 现场造一段 seconds 秒的真实视频并用假 CDN 提供（ffprobe 按 Range 读源），
+// 返回（直链, ffprobe 独立测得的时长）。时长真值来自 ffprobe，不取 fixture 字面值。
+func g4Source(t *testing.T, seconds int) (string, float64) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), fmt.Sprintf("ep%d.mp4", seconds))
+	out, err := exec.Command("ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=160x120:rate=10:duration=%d", seconds),
+		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+		"-g", "10", "-keyint_min", "10", "-sc_threshold", "0", path,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("生成测试视频失败: %v（%s）", err, out)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取 fixture: %v", err)
+	}
+	raw, err := exec.Command("ffprobe", "-v", "error",
+		"-show_entries", "format=duration", "-of", "csv=p=0", path).Output()
+	if err != nil {
+		t.Fatalf("ffprobe %s: %v", path, err)
+	}
+	dur, err := strconv.ParseFloat(strings.TrimSpace(string(raw)), 64)
+	if err != nil {
+		t.Fatalf("解析 ffprobe 时长 %q: %v", raw, err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "ep.mp4", time.Time{}, bytes.NewReader(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/ep.mp4", dur
+}
+
+// TestFirstPlay_BackfillsDurationIntoNFO 覆盖 G4（MKACG-621）：首播触发建索引时把
+// ffprobe 实测时长回填 episode.duration_sec，同事务重建派生表后重新取该集 .nfo，
+// <runtime>（分钟）与实测时长一致；没播过的集仍是 0，它的 .nfo 照常出、不阻断。
+func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
+	ctx := context.Background()
+	const secret = "g4-backfill-duration-test-secret"
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "g4.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	for k, v := range map[store.SettingKey]string{
+		store.KeyStreamSecret: secret,
+		store.KeySegTargetSec: "10",
+		// 缓存目录必须在临时目录里：默认的 ./data/cache 会写进源码树。
+		store.KeyCacheDir: filepath.Join(t.TempDir(), "cache"),
+	} {
+		if err := settings.Set(ctx, k, v); err != nil {
+			t.Fatalf("Set %s: %v", k, err)
+		}
+	}
+
+	dramaID, err := st.UpsertDrama(ctx, store.Drama{
+		Provider: "web", ProviderID: "g1", Title: "回填剧", Year: 2026, Genre: "爱情",
+	})
+	if err != nil {
+		t.Fatalf("UpsertDrama: %v", err)
+	}
+	urls := map[int64]string{}
+	// 65 秒（播过 → 回填 65 秒 = 1 分钟）与 12 秒（没播过 → 仍为 0）。
+	addEpisode := func(epNo, seconds int) (int64, float64) {
+		u, dur := g4Source(t, seconds)
+		id, err := st.UpsertEpisode(ctx, store.Episode{
+			DramaID: dramaID, EpNo: epNo, Source: "web", Vid: fmt.Sprintf("v%d", epNo),
+		})
+		if err != nil {
+			t.Fatalf("UpsertEpisode %d: %v", epNo, err)
+		}
+		urls[id] = u
+		return id, dur
+	}
+	playedID, playedDur := addEpisode(1, 65)
+	unplayedID, _ := addEpisode(2, 12)
+	// vfs 树与播放面都只认 emby_item 派生表（硬约束 6），等价于同步完成后的重建。
+	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
+	}
+
+	logger := slog.New(slog.DiscardHandler)
+	cutter := segment.NewCutter(st, settings, logger, cache.New(st, settings, logger),
+		func(_ context.Context, ep store.Episode) (string, error) { return urls[ep.ID], nil })
+	mux := http.NewServeMux()
+	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
+	tree := vfs.NewTree(st, settings, stream.ID, logger)
+
+	season := "短剧/爱情/" + shardOf("g1") + "/回填剧 (2026)/Season 01"
+	nfoOf := func(epNo int) string {
+		return fmt.Sprintf("%s/回填剧 - S01E%02d - 第%d集.nfo", season, epNo, epNo)
+	}
+
+	// 播放前：两集都是 0，.nfo 的 <runtime> 是 0 —— G4 要修的现状。
+	for _, epNo := range []int{1, 2} {
+		body, err := tree.Render(ctx, nfoOf(epNo))
+		if err != nil {
+			t.Fatalf("播放前取第 %d 集 .nfo: %v", epNo, err)
+		}
+		if want := "<runtime>0</runtime>"; !strings.Contains(string(body), want) {
+			t.Errorf("播放前第 %d 集 .nfo 缺 %s：%s", epNo, want, body)
+		}
+	}
+	before, err := st.EpisodeByID(ctx, playedID)
+	if err != nil {
+		t.Fatalf("EpisodeByID 播放前: %v", err)
+	}
+	t.Logf("播放前：episode.duration_sec=%d（ffprobe 实测 %.3f 秒）", before.DurationSec, playedDur)
+
+	// 播第 1 集 → 建索引 + 回填。
+	playID := "/video/" + stream.ID(secret, "e"+strconv.FormatInt(playedID, 10)) + ".m3u8"
+	if rec := serve(t, mux, http.MethodGet, playID); rec.Code != http.StatusOK {
+		t.Fatalf("GET %s 状态码 = %d, 期望 200（body: %s）", playID, rec.Code, rec.Body)
+	}
+
+	got, err := st.EpisodeByID(ctx, playedID)
+	if err != nil {
+		t.Fatalf("EpisodeByID: %v", err)
+	}
+	if want := int(math.Round(playedDur)); got.DurationSec != want {
+		t.Errorf("回填 duration_sec = %d, 期望 ffprobe 实测 %d（%.3f 秒）", got.DurationSec, want, playedDur)
+	}
+
+	// 重新取该集 .nfo：<runtime> 单位是分钟（Emby 用 TimeSpan.FromMinutes）。
+	body, err := tree.Render(ctx, nfoOf(1))
+	if err != nil {
+		t.Fatalf("回填后取第 1 集 .nfo: %v", err)
+	}
+	if want := fmt.Sprintf("<runtime>%d</runtime>", got.DurationSec/60); !strings.Contains(string(body), want) {
+		t.Errorf("回填后第 1 集 .nfo 缺 %s：%s", want, body)
+	}
+	items, err := st.ListEmbyItems(ctx, dramaID)
+	if err != nil {
+		t.Fatalf("ListEmbyItems: %v", err)
+	}
+	t.Logf("回填后：episode.duration_sec=%d, emby_item.runtime_sec=%d, .nfo=%s",
+		got.DurationSec, items[0].RuntimeSec, strings.TrimSpace(string(body)))
+
+	// 没播过的集：库里仍是 0，.nfo 照常出、仍是 0（不报错、不阻断）。
+	ep, err := st.EpisodeByID(ctx, unplayedID)
+	if err != nil {
+		t.Fatalf("EpisodeByID 未播放集: %v", err)
+	}
+	if ep.DurationSec != 0 {
+		t.Errorf("未播放集 duration_sec = %d, 期望 0", ep.DurationSec)
+	}
+	body, err = tree.Render(ctx, nfoOf(2))
+	if err != nil {
+		t.Fatalf("未播放集取 .nfo: %v", err)
+	}
+	if want := "<runtime>0</runtime>"; !strings.Contains(string(body), want) {
+		t.Errorf("未播放集 .nfo 缺 %s：%s", want, body)
 	}
 }

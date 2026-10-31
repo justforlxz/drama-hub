@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -85,7 +86,7 @@ func (c *Cutter) release() { <-c.gate }
 const indexDeadline = 30 * time.Second
 
 // ensureSegments 返回某集的分片索引；库里还没有（该 uid 第一次被播放）就同步
-// ffprobe 建一次并落库。
+// ffprobe 建一次并落库，顺手把实测时长回填到 episode.duration_sec。
 //
 // 索引按需建立、禁止批量预建（库里 2847 万集，全库预扫不可完成）。建立超时
 // （indexDeadline）返回 httpx.ErrUnavailable —— 边界包据此回 503 + Retry-After，
@@ -113,7 +114,13 @@ func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, playURL s
 		}
 		return nil, probeErr
 	}
-
+	// 首次建索引顺手把实测时长回填进 episode.duration_sec：ffprobe 已经拿到了真实
+	// 时长，白丢它会让 .nfo 的 <runtime> 恒为 0（Emby 全库时长 0、进度条与续播失真）。
+	// 回填排在写索引之前：反过来一旦索引写成功而回填失败，下次请求会命中已有索引
+	// 直接返回，时长就再也补不上了。
+	if _, err := c.st.BackfillEpisodeDuration(ctx, ep.ID, int(math.Round(info.durationSec))); err != nil {
+		return nil, fmt.Errorf("回填剧集 %d 时长: %w", ep.ID, err)
+	}
 	segs = planSegments(info, ep.ID, float64(target))
 	if err := c.st.ReplaceSegments(ctx, ep.ID, segs); err != nil {
 		return nil, fmt.Errorf("写入分片索引 episode_id=%d: %w", ep.ID, err)

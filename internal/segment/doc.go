@@ -11,7 +11,9 @@
 //     （`ServeSegment`），单集与合并集同一路径形态。
 //  2. 关键帧索引：`ensureSegments` 在第一次播放某个 uid 时同步 `ffprobe` 预扫，把切点
 //     按目标时长对齐到关键帧后写入 `segment` 表（30 s 硬上限，超时 503）。索引按需
-//     建立，禁止批量预建。
+//     建立，禁止批量预建；同一次探测还把源时长回填 `episode.duration_sec`
+//     （`store.BackfillEpisodeDuration`，只填 0）并重建该剧 `emby_item`，`.nfo` 的
+//     `<runtime>` 因此变成真实值。
 //  3. 时间轴映射：`Timeline` 把有序的各集分片拼成连续 seq 空间，回答
 //     `seq → (集号, 集内秒, 绝对起点)`（合并集播放的 O(1) 定位）。
 //  4. 播放列表生成：`BuildPlaylist` 把时间轴渲成 VOD m3u8，集边界插

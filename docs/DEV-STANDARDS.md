@@ -59,11 +59,11 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 - 迁移文件 `internal/store/migrations/NNNN_<verb>_<subject>.sql`，只向前，不改历史文件。启动时自动执行到最新。
 - 所有 SQL 只在 `internal/store` 出现；其它包通过方法访问。SQL 字符串拼接一律用参数占位。
 - 连接参数固定：`journal_mode=WAL`、`busy_timeout=5000`、`foreign_keys=ON`。
-- 派生的 `emby_item` 表由 `store.RebuildEmbyItems(dramaID)` 幂等重建，调用点只有同步完成（`internal/sync` 的 `Syncer.SyncSeries`）与合并变更（`CreateMergeGroup` / `DeleteMergeGroup`）两处。重建是「整体替换」：先删该剧全部行再按源集号顺序插入，对外集号从 1 起连续；单集占 1 个集号、合并组也只占 1 个。
+- 派生的 `emby_item` 表由 `store.RebuildEmbyItems(dramaID)` 幂等重建，调用点只有同步完成（`internal/sync` 的 `Syncer.SyncSeries`）、合并变更（`CreateMergeGroup` / `DeleteMergeGroup`）与首播回填时长（`store.BackfillEpisodeDuration`，事务内直接调 `rebuildEmbyItems`）三处。重建是「整体替换」：先删该剧全部行再按源集号顺序插入，对外集号从 1 起连续；单集占 1 个集号、合并组也只占 1 个。
 - 合并编排只在 `internal/store/merge.go`：`merge_group`（组）+ `merge_item`（组内成员，`ord` 即时间轴顺序）+ `emby_item`（派生）。`CreateMergeGroup` 校验成员至少 2 集、同剧、不重复、不与已有组重叠（违反返回 `ErrInvalid`，不落库）。
 - 时间统一存 UTC 的 RFC3339 文本；展示时区转换在 Web 层做。
 - store 用哨兵错误表达结果：查询/删除无行返回 `ErrNotFound`，唯一/主键约束冲突由 `wrapWriteErr` 统一映射为 `ErrConflict`（均可 `errors.Is` 判断），不向调用方泄漏裸 `*sqlite.Error`。
-- `drama` / `episode` 的写入一律 upsert：`drama` 以 `(provider, provider_id)`、`episode` 以 `(drama_id, ep_no)` 为幂等身份，冲突时只更新可变业务列，身份列与入参 `id` 被忽略，返回行 id。
+- `drama` / `episode` 的写入一律 upsert：`drama` 以 `(provider, provider_id)`、`episode` 以 `(drama_id, ep_no)` 为幂等身份，冲突时只更新可变业务列，身份列与入参 `id` 被忽略，返回行 id。其中 `episode.duration_sec` 只在插件给了非零值时覆盖，否则保留库里已有的值 —— 上游批量拿不到时长（恒 0），首播建索引回填的实测值不能被下一轮刷新清零。
 - 删剧走 `drama → episode` 的 `ON DELETE CASCADE` 连带删集（依赖 `foreign_keys=ON`，由 `Open` 的 DSN 施加），不影响其它剧目；`segment` 经 `episode` 级联一并删除。
 - `segment` 表是「每集的分片索引」，由 `internal/segment` 索引任务整体重建：`ReplaceSegments` 一事务内先删后插（重复索引幂等、失败整体回滚），`ListSegments` 按 `start_sec` 升序（即片内序）；无行返回空切片而非 `ErrNotFound`（「还没索引」是正常状态，由分片端点按 503 处理）。
 - 跨行写入用 `Store.InTx`：同一事务内执行、失败整体回滚。事务内 `Store` 复用同一批读写方法；取数/网络请求必须在事务之外完成（SQLite 单写者，长事务持锁）。
@@ -170,6 +170,13 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }
   503 + `Retry-After: 5`（`httpx.ErrUnavailable`），不出半截时间轴。
 - **幂等与失败**：`ReplaceSegments` 一事务内先删后插；探测失败不写任何行（库里保留
   旧索引或保持为空）。
+- **时长回填**：建索引时 `ffprobe` 已经拿到源时长，因此顺手回填 `episode.duration_sec`
+  （`store.BackfillEpisodeDuration`：只填 0、不覆盖非零值，非正时长视为探测失败），并在
+  同一事务内重建该剧 `emby_item` —— `runtime_sec` 单集取本集时长、合并集取组内之和，
+  只有一个派生实现。`.nfo` 的 `<runtime>` 取 `runtime_sec / 60`，回填后当次即为真实值；
+  没建过索引的集仍是 0，`.nfo` 照常渲染（`<runtime>0</runtime>`，Emby 视为未知）。
+  回填排在写索引之前：若反序，索引写成功而回填失败时下次请求会命中已有索引直接返回，
+  时长就再也补不上。
 
 ### 状态码矩阵
 

@@ -35,8 +35,6 @@ const (
 	KeyStrmPrefix   SettingKey = "strm_prefix"
 	KeyStreamSecret SettingKey = "stream_secret"
 	KeySegTargetSec SettingKey = "seg_target_sec"
-	KeySegPrefetch  SettingKey = "seg_prefetch"
-	KeyPinDays      SettingKey = "pin_days"
 	KeyWebDAVUser   SettingKey = "webdav_user"
 	KeyWebDAVPass   SettingKey = "webdav_pass"
 	KeyCacheDir     SettingKey = "cache_dir"
@@ -126,6 +124,35 @@ func (s *Settings) Set(ctx context.Context, key SettingKey, raw string) error {
 		return fmt.Errorf("写入配置 %s: %w", key, err)
 	}
 	return nil
+}
+
+// SetIfAbsent 校验并在 key 还没有行时写入，返回是否真的写了。
+//
+// 已有的值一律不动，因此可以每次启动都调用（幂等）。校验走 Set 的同一条路径：
+// 非法值返回 ErrInvalidSetting 且不落库。用途是首次启动的 env 引导
+// （cmd/drama-hub 的 DRAMA_HUB_* → settings）：空卷靠它种出必填项，重启不覆盖手改值。
+func (s *Settings) SetIfAbsent(ctx context.Context, key SettingKey, raw string) (bool, error) {
+	value, err := parseSetting(key, raw)
+	if err != nil {
+		return false, err
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return false, fmt.Errorf("编码配置 %s: %w", key, err)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?)
+		 ON CONFLICT(key) DO NOTHING`,
+		string(key), string(encoded), time.Now().UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return false, fmt.Errorf("写入配置 %s: %w", key, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("统计配置 %s 的写入结果: %w", key, err)
+	}
+	return n == 1, nil
 }
 
 // String 读取一个字符串配置项。
@@ -286,10 +313,6 @@ func specFor(key SettingKey) (settingSpec, bool) {
 		return settingSpec{kind: kindSecret, required: true}, true
 	case KeySegTargetSec:
 		return settingSpec{kind: kindInt, def: "10", min: 4, max: 30}, true
-	case KeySegPrefetch:
-		return settingSpec{kind: kindInt, def: "2", min: 0, max: 10}, true
-	case KeyPinDays:
-		return settingSpec{kind: kindInt, def: "7", min: 0, max: 90}, true
 	case KeyWebDAVUser:
 		return settingSpec{kind: kindString, required: true}, true
 	case KeyWebDAVPass:
@@ -375,6 +398,11 @@ func parseSetting(key SettingKey, raw string) (any, error) {
 	}
 	switch spec.kind {
 	case kindURL:
+		// B2：尾 `/` 写入时归一化。URL 类键都是按字符串拼接用的
+		// （`{strm_prefix}/video/…`、`{base_url}{path}`），留着尾斜杠会拼出
+		// `http://h:1//video/…`（MKACG-617 实测）。同一地址的两种写法归一成一种，
+		// 不算「纠正非法值」——非法值仍然报错、不猜。
+		raw = strings.TrimRight(raw, "/")
 		if raw == "" {
 			return "", nil
 		}

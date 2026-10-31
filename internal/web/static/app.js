@@ -332,8 +332,6 @@ function initStatus() {
   const totalsBox = document.getElementById('totals');
   const sourcesBody = document.getElementById('sources');
   const configBody = document.getElementById('config');
-  const cacheBody = document.getElementById('cache');
-  const cacheNote = document.getElementById('cache-note');
 
   function stat(label, value, small) {
     return el('div', {},
@@ -360,9 +358,17 @@ function initStatus() {
       : src.enabled
         ? el('span', { class: 'tag', text: '已启用' })
         : el('span', { class: 'tag warn', text: '已停用' });
-    const note = src.reason !== '' ? src.reason
-      : 'base_url ' + (src.base_url === '' ? '用插件默认地址' : src.base_url) +
-        '，请求超时 ' + src.request_timeout_sec + ' 秒，间隔 ' + src.interval_sec + ' 秒';
+    // base_url / request_timeout_sec 是启动时注入插件的构造期配置：显示正在生效的
+    // 值，并明说 settings 现值是否还要重启才生效。
+    const bootNote = 'base_url 生效值 ' +
+      (src.base_url_effective === '' ? '插件内置默认' : src.base_url_effective) +
+      '，请求超时生效值 ' + src.request_timeout_sec_effective + ' 秒，间隔 ' +
+      src.interval_sec + ' 秒' +
+      (src.restart_required
+        ? '；settings 现值（base_url ' + (src.base_url === '' ? '空' : src.base_url) +
+          ' / 超时 ' + src.request_timeout_sec + ' 秒）重启后生效'
+        : '');
+    const note = src.reason !== '' ? src.reason : bootNote;
     const error = src.last_error === ''
       ? '—'
       : el('span', { class: 'mono', text: src.last_error });
@@ -406,26 +412,17 @@ function initStatus() {
       stat('最近同步', fmtTime(t.last_sync_at), true));
     const c = status.config;
     configBody.replaceChildren(
-      row('strm 前缀', c.strm_prefix === '' ? '空（直连本服务）' : c.strm_prefix,
-        'strm 内 URL 前缀，填缓存代理地址即经代理播放', true),
+      row('strm 前缀', c.strm_prefix === '' ? '空（按请求 Host 推导）' : c.strm_prefix,
+        'strm 内 URL 前缀；空 = 用访问本服务的 Host 拼绝对地址，填了就用填的（不带尾 /）', true),
       row('分片目标时长', c.seg_target_sec + ' 秒', 'seg_target_sec，切点对齐关键帧'),
-      row('预取分片数', c.seg_prefetch + ' 片', 'seg_prefetch'),
-      row('pin 天数', c.pin_days + ' 天', 'pin_days，最近 N 天播过的合并集整集预取'),
+      row('缓存目录', c.cache_dir, 'cache_dir，海报/分片/索引落 <cache_dir>/{cover,seg,index,tmp}', true),
+      row('缓存上限', c.cache_max_mb + ' MB', 'cache_max_mb，0 = 不按大小淘汰'),
+      row('缓存保留', c.cache_lru_days + ' 天', 'cache_lru_days，超过 N 天未命中的条目删除'),
       row('出流签名密钥', flag(c.stream_secret_set), 'stream_secret（ADR-0003）'),
       row('WebDAV 用户', flag(c.webdav_user_set), 'webdav_user'),
       row('WebDAV 密码', flag(c.webdav_pass_set), 'webdav_pass'));
 
     sourcesBody.replaceChildren(...status.sources.map(sourceRow));
-
-    const cache = status.cache;
-    cacheBody.replaceChildren(
-      row('模式', cache.mode === 'proxy' ? '经缓存代理' : '直连（无缓存）',
-        cache.mode === 'proxy' ? '播放字节先到缓存代理' : 'strm_prefix 为空，播放不经过代理'),
-      row('代理前缀', cache.prefix === '' ? '—' : cache.prefix, '缓存代理地址', true),
-      row('建议容量', cache.max_size, '--vfs-cache-max-size 的建议值，不参与本服务运行逻辑'),
-      row('建议保留', cache.max_age, '--vfs-cache-max-age 的建议值，不参与本服务运行逻辑'),
-      row('rclone 参数', cache.flags, '缓存代理启动参数（--vfs-cache-mode full 起）', true));
-    cacheNote.textContent = cache.note;
   }
 
   load().catch(fail);

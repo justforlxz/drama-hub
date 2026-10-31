@@ -22,7 +22,11 @@
 
 - 一行 + 尾换行，与现状一致。
 - `strm_prefix` 仍是 `settings` 的 key（指向本服务自己的对外地址），不新增配置。
-- 空 `strm_prefix` 时退化为相对路径 `/video/{id}.m3u8`（现有 `renderStrm` 的拼接方式不变）。
+- 空 `strm_prefix` 时按**请求的 `Host`** 推导绝对地址
+  （`{scheme}://{Host}/video/{id}.m3u8`，scheme 取 `X-Forwarded-Proto`，没有就按是否 TLS）：
+  相对路径 Emby 与第三方播放器都放不了（MKACG-616 B1 改的契约）。渲染拿不到请求上下文
+  （单测、内部调用）时才退回相对路径。
+- `strm_prefix` 的尾 `/` 写入时归一掉，渲染时再去一次，避免 `//video/`（MKACG-616 B2）。
 - **每一条 `.strm` 都指向 `.m3u8`**，单集与合并集没有区别。这是本次最关键的统一：
   对外不再有「单集是 MP4、合并集是 HLS」两种形态。
 
@@ -110,10 +114,10 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid
 - `Range`：分片是完整不可变对象，支持 `Range` 但不需要分段生成；`HEAD` 返回同样的
   `Content-Length`（硬约束 3）。
 - 并发同一个 `(id, seq)` 只生成一次（single-flight），其余请求等同一个结果。
-- 预取：`seg_prefetch` 片（现有 setting），在返回第 N 片后异步喂 N+1…N+k。
+- 预取：**2.0 不做**（MKACG-603「不在范围」；1.0 的 `seg_prefetch` 占位键已删除，MKACG-616）。
 
 这就是 lxz 说的「本服务负责在播放 m3u8 时提供数据转换和缓冲」：
-**转换** = ffmpeg 切片/转码，**缓冲** = 本地分片缓存 + 预取。
+**转换** = ffmpeg 切片/转码，**缓冲** = 本地分片缓存（2.0 不预取）。
 
 ## 与现有实现的关系（明确哪些留、哪些退）
 

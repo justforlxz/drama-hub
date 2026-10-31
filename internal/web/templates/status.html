@@ -2,7 +2,7 @@
 <section class="block">
   <div class="block-head">
     <h1>同步与缓存</h1>
-    <p class="hint">同步计数来自库内数据；视频缓存由缓存代理负责，本服务只给建议参数（ADR-0004），不实现淘汰。</p>
+    <p class="hint">同步计数来自库内数据；下面只列真正参与运行的配置（缓存落 <code>&lt;cache_dir&gt;</code>，由本服务自己淘汰，ADR-0007）。</p>
   </div>
   <p class="notice" id="notice" role="status" aria-live="polite"></p>
   <dl class="stats" id="totals"></dl>
@@ -20,7 +20,8 @@
   <p class="hint">
     <code>plugin.&lt;源&gt;.enabled</code> 与 <code>refresh_interval_sec</code>（全局，或
     <code>plugin.&lt;源&gt;.refresh_interval_sec</code> 覆盖）热读，改完最多 60 秒按新间隔重算；
-    <code>plugin.&lt;源&gt;.base_url</code> 与 <code>.request_timeout_sec</code> 是构造期配置，改后需重启。
+    <code>plugin.&lt;源&gt;.base_url</code> 与 <code>.request_timeout_sec</code> 是启动时注入插件的
+    构造期配置，只有「生效值」在跑，改了要重启（两者不一致时下面会写出来）。
     「下次计划」= 上次运行 + 现读间隔。
   </p>
 </section>
@@ -34,17 +35,5 @@
       <tbody id="config"></tbody>
     </table>
   </div>
-</section>
-
-<section class="block">
-  <h2>缓存代理</h2>
-  <div class="scroll">
-    <table class="grid">
-      <caption class="sr-only">缓存代理</caption>
-      <thead><tr><th>项</th><th>值</th><th>说明</th></tr></thead>
-      <tbody id="cache"></tbody>
-    </table>
-  </div>
-  <p class="hint" id="cache-note"></p>
 </section>
 {{end}}

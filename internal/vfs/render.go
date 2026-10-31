@@ -4,12 +4,32 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"strings"
 
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
 // xmlHeader 是 NFO 的固定头（standalone 声明由 Emby / Kodi 双方接受）。
 const xmlHeader = `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>` + "\n"
+
+// baseURLKey 是请求上下文中「本服务对外基地址」（`scheme://host`）的键，由 webdav 层
+// 按请求 Host 放进来。strm_prefix 为空时 .strm 用它生成绝对地址（MKACG-616 B1）：
+// Emby 与第三方播放器只认绝对 URL，相对路径 ` /video/…` 根本放不了。
+type baseURLKey struct{}
+
+// WithBaseURL 把一个请求的基地址放进上下文；空串等价于没放（渲染退回相对路径）。
+func WithBaseURL(ctx context.Context, base string) context.Context {
+	if base == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, baseURLKey{}, base)
+}
+
+// baseURLFrom 取上下文里的请求基地址；没有（单测、内部调用）返回空串。
+func baseURLFrom(ctx context.Context) string {
+	base, _ := ctx.Value(baseURLKey{}).(string)
+	return base
+}
 
 // renderStrm 渲染 strm 内容：一行 URL + 尾换行。
 //
@@ -18,6 +38,10 @@ const xmlHeader = `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>` + "
 // `e<episode.id>`、合并集 `m<group.id>`），派生表的 uid 是唯一真值（硬约束 6）。
 // id 由注入的 IDFunc 计算，`/video` 端点本身属 S8。strm_prefix 与 stream_secret
 // 每次现读，改值即时生效（硬约束 5）。缺 stream_secret 时透传 store.ErrSettingMissing。
+//
+// 前缀的优先级：settings 的 strm_prefix → 请求基地址（空 = 按 Host 推导）→ 相对路径
+// （没有请求上下文时，只出现在单测/内部调用）。两个来源都去掉尾 `/`：`{prefix}/video/`
+// 是字符串拼接，留着会产出 `//video/`（MKACG-617 实测）。
 func (t *Tree) renderStrm(ctx context.Context, item store.EmbyItem) ([]byte, error) {
 	prefix, err := t.settings.String(ctx, store.KeyStrmPrefix)
 	if err != nil {
@@ -26,6 +50,10 @@ func (t *Tree) renderStrm(ctx context.Context, item store.EmbyItem) ([]byte, err
 	secret, err := t.settings.String(ctx, store.KeyStreamSecret)
 	if err != nil {
 		return nil, fmt.Errorf("读 stream_secret: %w", err)
+	}
+	prefix = strings.TrimRight(prefix, "/")
+	if prefix == "" {
+		prefix = strings.TrimRight(baseURLFrom(ctx), "/")
 	}
 	return []byte(prefix + "/video/" + t.id(secret, item.UID) + ".m3u8\n"), nil
 }

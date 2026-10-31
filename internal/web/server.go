@@ -23,14 +23,21 @@ type SeriesSyncer interface {
 	SyncSeries(ctx context.Context, st *store.Store, sid string) error
 }
 
-// Source 是一个播放源在状态页上的展示身份。装配根从注册表取名字（= Plugin.Name()），
-// 配一句人看得懂的标签；本包不 import plugin，也不猜有哪些源。
+// Source 是一个播放源在状态页上的展示身份与「启动时生效的构造期配置」。
 //
-// 其余状态（是否启用、生效配置、不可用原因）由本包每请求现读 settings 得出，
-// 因此改配置下一次读即生效（硬约束 5）。
+// 装配根从注册表取名字（= Plugin.Name()），配一句人看得懂的标签；本包不 import
+// plugin，也不猜有哪些源。
+//
+// enabled / refresh_interval_sec 等热读项由本包每请求现读 settings（硬约束 5），
+// 改完下一次读即生效；base_url / request_timeout_sec 是构造期注入的（插件的
+// *http.Client 在启动时定型），本包读不到「正在生效的那个值」，只能由装配根把启动
+// 时注入的值带进来对比 —— 这就是 Boot* 两个字段的用途。
 type Source struct {
 	Name  string // = Plugin.Name()，也是 drama.provider / episode.source 的值
 	Label string // 状态页展示用；空 = 只显示 Name
+
+	BootBaseURL           string // 启动时读到并注入插件的 base_url 原值；"" = 插件内置默认
+	BootRequestTimeoutSec int    // 启动时注入插件的出站超时（秒）
 }
 
 // Server 汇总管理 API 与三页管理界面。它实现 http.Handler，由 cmd 挂到 `/` 上；

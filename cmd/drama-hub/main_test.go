@@ -309,7 +309,9 @@ func TestHandler_WebDAV(t *testing.T) {
 	}
 	uid := "e" + strconv.FormatInt(epID, 10)
 	body := rec.Body.String()
-	if want := "/video/" + stream.ID(secret, uid) + ".m3u8\n"; body != want {
+	// B1：strm_prefix 为空时按请求 Host 推导绝对地址（httptest 的 Host = example.com），
+	// 默认配置下 .strm 就是可直接播放的绝对 URL。
+	if want := "http://example.com/video/" + stream.ID(secret, uid) + ".m3u8\n"; body != want {
 		t.Errorf("strm 内容 = %q, 期望 %q", body, want)
 	}
 	// 契约的 .strm 形态：`^.*/video/[em][0-9]+-[0-9a-f]{12}.m3u8$`（单行 + 尾换行）。
@@ -590,7 +592,7 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 	}
 
 	logger := slog.New(slog.DiscardHandler)
-	reg, err := newPlugins(ctx, settings, logger)
+	reg, boots, err := newPlugins(ctx, settings, logger)
 	if err != nil {
 		t.Fatalf("newPlugins: %v", err)
 	}
@@ -598,7 +600,7 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 	if !ok {
 		t.Fatalf("注册表里没有 %q：装配根必须显式注册内置插件", hongguo.Name)
 	}
-	h := newAssembly(logger, st, settings, sync.New(p, nil), fakeSchedule{}, sourceList(reg), reg)
+	h := newAssembly(logger, st, settings, sync.New(p, nil), fakeSchedule{}, sourceList(reg, boots), reg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/dramas", strings.NewReader(`{"series_id":"7503745441910017049"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -652,22 +654,23 @@ func TestPluginDisabledStillStarts(t *testing.T) {
 
 	// 先验「配置缺失照常启动」：没有任何 plugin.* 行，注册仍然成功。
 	logger := slog.New(slog.DiscardHandler)
-	reg, err := newPlugins(ctx, settings, logger)
+	// 第一次只验「注册成功」；第二次才用得到 boots（状态页的生效值）。
+	firstReg, _, err := newPlugins(ctx, settings, logger)
 	if err != nil {
 		t.Fatalf("配置缺失时 newPlugins 报错：%v", err)
 	}
-	if _, ok := reg.Get(hongguo.Name); !ok {
+	if _, ok := firstReg.Get(hongguo.Name); !ok {
 		t.Fatalf("配置缺失时 %q 未注册", hongguo.Name)
 	}
 
 	if err := settings.Set(ctx, store.PluginSettingKey(hongguo.Name, store.PluginItemEnabled), "false"); err != nil {
 		t.Fatalf("Set enabled: %v", err)
 	}
-	reg, err = newPlugins(ctx, settings, logger)
+	reg, boots, err := newPlugins(ctx, settings, logger)
 	if err != nil {
 		t.Fatalf("停用时 newPlugins 报错：%v", err)
 	}
-	h := newAssembly(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name), nil), fakeSchedule{}, sourceList(reg), reg)
+	h := newAssembly(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name), nil), fakeSchedule{}, sourceList(reg, boots), reg)
 
 	rec := serve(t, h, http.MethodGet, "/api/status")
 	var status struct {

@@ -14,7 +14,17 @@ make build                    # 产出 ./bin/drama-hub
 DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 ```
 
-首次启动自动建库与迁移。
+首次启动自动建库与迁移。`stream_secret` 与 `cache_dir` 由环境变量**只在键缺失时**写入
+一次（2.0 没有 settings 写接口）；WebDAV 账号密码不走 env，由后台配置接口管理
+（MKACG-622）：
+
+```bash
+DRAMA_HUB_STREAM_SECRET=<≥32 字节> DRAMA_HUB_CACHE_DIR=/data/cache ./bin/drama-hub
+```
+
+已有值不会被 env 覆盖，之后改值请直接改 `settings` 表（生效时机见
+`docs/DEV-STANDARDS.md`「配置」）。`strm_prefix` 留空时 `.strm` 里的地址按访问的 `Host`
+推导成绝对 URL，默认安装即可直接播放。
 
 ## HTTP 接口
 
@@ -83,8 +93,8 @@ ffmpeg 失败 → 502 且不写缓存。
 缓存由本服务自己负责（ADR-0007）：海报、分片、关键帧索引落 `<cache_dir>`，按
 `cache_max_mb` / `cache_lru_days` 淘汰，规则见 `docs/CACHE-MODEL.md`；播放字节一律经本
 服务的 `/video/…`，rclone 只剩 WebDAV 只读挂载，不再需要 `--vfs-cache-mode full`。
-（`/api/status` 里那份 rclone 建议参数是 ADR-0004 的遗留字段，已知偏差，
-见 `docs/DEV-STANDARDS.md`「缓存面」。）
+（`/api/status` 原先那份 rclone 建议参数属 ADR-0004 遗留，已在 MKACG-616 删除：
+状态页只展示真正参与运行的配置，缓存目录/上限/保留天数都在「运行配置」里。）
 
 ```bash
 open http://127.0.0.1:8080/            # 剧目

@@ -48,7 +48,13 @@ playlist 是 `segment` 表的**纯函数**（`segment.BuildPlaylist`）：一次
 └── index/<hash 前 2 位>/<hash>.json    # 关键帧索引
 ```
 
-- `<hash> = sha256(<键>)` 的十六进制；前 2 位做一级分桶，避免单目录十万文件。
+- 文件名里的 `<hash>` 按 kind 分两种取法（`internal/cache/keys.go` 的 `cacheHash`），
+  不是一句 `sha256(<键>)` 能覆盖的：
+  - **分片直接用键本身**。分片的键已经是 `sha256(uid | seq | codec_sig)` 的十六进制，
+    落盘名就是它，不再二次哈希（二次哈希会同时与上面布局图和实现不符）。
+  - **海报与索引取 `sha256(<语义键>)` 的十六进制**：它们的键是语义标识（`provider/provider_id`、
+    `uid`），需要先映射成定长十六进制才能做文件名与分桶。
+- 前 2 位做一级分桶，避免单目录十万文件。
 - 键：
   - 分片：`uid + "\x1f" + seq + "\x1f" + codec_sig`
   - 海报：`provider + "/" + provider_id`

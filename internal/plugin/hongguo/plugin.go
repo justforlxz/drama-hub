@@ -40,8 +40,8 @@ const sitemapIndexPath = "/sitemap/hongguoduanju/index.xml"
 // 不做鉴权，但要一个像浏览器的请求」。
 //
 // 这几个值是「浏览器长什么样」的事实，不会有人去调（调了就不再是浏览器），所以
-// 是代码常量而不是 settings 键（AGENTS.md 硬约束 5 的反面，理由同 cmd 的
-// coverTimeout：没有用户会为「UA 长什么样」调参）。
+// 是代码常量而不是 settings 键（AGENTS.md 硬约束 5 的反面：没有用户会为
+// 「UA 长什么样」调参；可调的是「等多久」，那是 settings 的 cover_timeout_sec）。
 const (
 	// outboundUA 是发往上游的 User-Agent：桌面 Chrome/122。
 	outboundUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"

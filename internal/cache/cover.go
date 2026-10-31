@@ -32,8 +32,9 @@ type CoverCache struct {
 	now      func() time.Time // 取当前时间；测试注入固定值（last_used_at 要可断言）
 }
 
-// NewCoverCache 构造海报缓存。client 必须带超时（docs/DEV-STANDARDS.md「错误处理」），
-// 由装配根注入。
+// NewCoverCache 构造海报缓存。client 的超时不由它自己定：每次下载按 settings 的
+// cover_timeout_sec 现读，改完下一次下载即生效（docs/DEV-STANDARDS.md「配置」）。
+// 装配根注入的 client 只承载传输（Transport、测试用的 httptest 连接）。
 func NewCoverCache(st *store.Store, settings *store.Settings, client *http.Client) *CoverCache {
 	return &CoverCache{st: st, settings: settings, client: client, now: time.Now}
 }
@@ -45,7 +46,10 @@ func NewCoverCache(st *store.Store, settings *store.Settings, client *http.Clien
 // 视为无事可做，返回 nil。
 //
 // 失败返回 ErrCoverFetch（下载）或 store / 文件系统错误，都不写索引行：宁可在
-// 下一轮重试，也不留一条指向不存在文件的 artifact 行。
+// 下一轮重试，也不留一条指向不存在文件的 artifact 行。海报是附带资产——「取不回来
+// 算不算同步失败」由调用方决定（internal/sync 记一条 warn 后不上升为失败）。
+//
+// 单次出站超时取 settings 的 cover_timeout_sec（现读），不跟插件超时走。
 func (c *CoverCache) LocalizeCover(ctx context.Context, provider, providerID, url string) error {
 	if url == "" {
 		return nil
@@ -99,7 +103,17 @@ func (c *CoverCache) LocalizeCover(ctx context.Context, provider, providerID, ur
 }
 
 // fetch 取回海报字节并推出文件扩展名（按响应 Content-Type，退化为 URL 后缀）。
+//
+// 超时来自 cover_timeout_sec（现读，每次下载一次）。读不到配置就按 ErrCoverFetch
+// 返回，不猜一个数字代替配置（可调参数只有 settings 一个真值）。
 func (c *CoverCache) fetch(ctx context.Context, url string) (body []byte, ext string, err error) {
+	timeoutSec, err := c.settings.Int(ctx, store.KeyCoverTimeoutSec)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: 读 cover_timeout_sec: %v", ErrCoverFetch, err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %v", ErrCoverFetch, err)

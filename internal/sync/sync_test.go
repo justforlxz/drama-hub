@@ -113,7 +113,7 @@ func newTestSyncer(t *testing.T, srv *httptest.Server, clock *fakeClock) *Syncer
 		HTTPClient: srv.Client(),
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	s := New(p, nil)
+	s := New(p, nil, nil)
 	s.now = clock.now
 	return s
 }
@@ -358,7 +358,7 @@ func TestSyncWithoutEpisodeKeys(t *testing.T) {
 			Episodes: []plugin.Episode{{No: 1}, {No: 2}},
 		},
 	}
-	s := New(p, nil)
+	s := New(p, nil, nil)
 	s.now = (&fakeClock{t: time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)}).now
 
 	if err := s.SyncSeries(context.Background(), st, "w1"); err != nil {
@@ -399,7 +399,7 @@ func TestSyncValidatesEpisodes(t *testing.T) {
 				Work:     plugin.Work{Ref: plugin.WorkRef{Plugin: "fake", ID: "w1"}, Title: "假剧"},
 				Episodes: tc.episodes,
 			}}
-			s := New(p, nil)
+			s := New(p, nil, nil)
 
 			err := s.SyncSeries(context.Background(), st, "w1")
 			if !errors.Is(err, plugin.ErrSchema) {
@@ -462,7 +462,7 @@ func TestSyncSeriesWritesGenreTagsShard(t *testing.T) {
 		},
 		Episodes: []plugin.Episode{{No: 1}},
 	}}
-	s := New(p, nil)
+	s := New(p, nil, nil)
 
 	if err := s.SyncSeries(ctx, st, "w1"); err != nil {
 		t.Fatalf("SyncSeries: %v", err)
@@ -533,7 +533,7 @@ func TestSyncSeriesLocalizesCover(t *testing.T) {
 		},
 		Episodes: []plugin.Episode{{No: 1}, {No: 2}},
 	}}
-	s := New(p, cache.NewCoverCache(st, settings, srv.Client()))
+	s := New(p, cache.NewCoverCache(st, settings, srv.Client()), nil)
 
 	if err := s.SyncSeries(ctx, st, "w1"); err != nil {
 		t.Fatalf("SyncSeries: %v", err)
@@ -568,6 +568,67 @@ func TestSyncSeriesLocalizesCover(t *testing.T) {
 	if _, err := os.Stat(row.Path); err != nil {
 		t.Fatalf("重跑后海报文件不可用: %v", err)
 	}
+}
+
+// AC（MKACG-620）：封面上游不可用（离线 / CDN 域名不可达）时同步仍算成功——
+// 剧与集照常入库，只是 artifact(kind='cover') 缺位，并留一条 warn；不再把
+// 「已入库、缺海报」上升为同步失败（调度器会据此记 last_error）。
+func TestSyncSeriesCoverUnavailableIsNotFailure(t *testing.T) {
+	ctx := context.Background()
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cover-offline.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	if err := settings.Set(ctx, store.KeyCacheDir, cacheDir); err != nil {
+		t.Fatalf("设置 cache_dir: %v", err)
+	}
+
+	// 127.0.0.1:1 上没有监听：连接立刻被拒，等价于「封面域名不可达」。
+	const unreachableCover = "http://127.0.0.1:1/cover.jpg"
+	p := &fakePlugin{name: "fake", detail: plugin.WorkDetail{
+		Work: plugin.Work{
+			Ref: plugin.WorkRef{Plugin: "fake", ID: "w1"}, Title: "剧",
+			CoverURL: unreachableCover,
+		},
+		Episodes: []plugin.Episode{{No: 1}, {No: 2}},
+	}}
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	s := New(p, cache.NewCoverCache(st, settings, &http.Client{}), logger)
+
+	if err := s.SyncSeries(ctx, st, "w1"); err != nil {
+		t.Fatalf("封面不可达时 SyncSeries = %v, 期望 nil（海报是附带资产，不算同步失败）", err)
+	}
+
+	// 库状态：剧与集都在，海报没有索引行、缓存目录里也没有文件。
+	if dramas, episodes := dbCounts(t, st); dramas != 1 || episodes != 2 {
+		t.Fatalf("(剧,集) = (%d,%d), 期望 (1,2)：封面失败不影响入库", dramas, episodes)
+	}
+	if _, err := st.ArtifactByKey(ctx, store.ArtifactKindCover, "fake/w1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("封面不可达后 artifact 行 = %v, 期望 ErrNotFound", err)
+	}
+	// 下载失败发生在落盘之前，缓存目录可能压根没建出来；建了就必须是空的。
+	if _, statErr := os.Stat(cacheDir); statErr == nil {
+		entries, err := os.ReadDir(cacheDir)
+		if err != nil {
+			t.Fatalf("读缓存目录: %v", err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("封面失败后缓存目录留下内容: %v", entries)
+		}
+	}
+
+	// 可见性：失败只能从这条 warn 看到（剧与集不报错）。
+	got := logs.String()
+	if !strings.Contains(got, "海报本地化失败") || !strings.Contains(got, "w1") {
+		t.Fatalf("日志里没有封面的 warn：%q", got)
+	}
+	t.Logf("warn 日志：%s", strings.TrimSpace(got))
 }
 
 // AC：先编排合并组，再触发一次同步 → merge_group / merge_item 一行不变，派生表

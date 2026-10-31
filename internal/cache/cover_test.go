@@ -238,6 +238,47 @@ func TestLocalizeCoverEmptyURL(t *testing.T) {
 	}
 }
 
+// AC（MKACG-620）：单次下载等多久由 settings 的 cover_timeout_sec 现读决定，
+// 不再走代码常量——配 1 s 时，封面域名不回包最多等 1 s 就放弃。
+func TestLocalizeCoverUsesConfiguredTimeout(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		// 只回包不给响应头：客户端等到 ctx 超时。release 让 handler 在客户端放弃后
+		// 也能立刻退出（srv.Close 会等所有 handler 结束）。
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); srv.Close() })
+
+	c, st := newTestCoverCache(t, srv, filepath.Join(t.TempDir(), "cache"))
+	ctx := context.Background()
+	if err := c.settings.Set(ctx, store.KeyCoverTimeoutSec, "1"); err != nil {
+		t.Fatalf("设置 cover_timeout_sec: %v", err)
+	}
+
+	start := time.Now()
+	err := c.LocalizeCover(ctx, testProvider, testProviderID, srv.URL+"/cover.jpg")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrCoverFetch) {
+		t.Fatalf("超时的错误 = %v, 期望 ErrCoverFetch", err)
+	}
+	// 上限：配置值 1 s。用默认值 5 s 或旧常量 15 s 都会超这条。
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("等待 %v, 超过 cover_timeout_sec = 1 s", elapsed)
+	}
+	// 下限：确实按配置值等，而不是立刻失败。
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("等待 %v, 期望接近配置的 1 s", elapsed)
+	}
+	t.Logf("封面下载等待 %v（cover_timeout_sec = 1 s）", elapsed.Round(time.Millisecond))
+	if _, err := st.ArtifactByKey(ctx, store.ArtifactKindCover, testProvider+"/"+testProviderID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("超时后 artifact 行 = %v, 期望 ErrNotFound", err)
+	}
+}
+
 // coverExt 只影响本地文件名：Content-Type 优先，其次 URL 后缀，最后 .img。
 func TestCoverExt(t *testing.T) {
 	cases := []struct{ contentType, url, want string }{

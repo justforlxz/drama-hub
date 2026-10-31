@@ -95,7 +95,7 @@ func TestFullSyncEnumeratesUnionAndWritesAll(t *testing.T) {
 		HTTPClient: srv.Client(),
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	syncer := New(p, nil)
+	syncer := New(p, nil, nil)
 	syncer.now = (&fakeClock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}).now
 
 	// 段 1：枚举（框架从空游标起逐页推进，正是 internal/scheduler 的 enumerate 逻辑）。

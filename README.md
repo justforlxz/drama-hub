@@ -30,7 +30,7 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 | 端点 | 方法 | 状态 | 说明 |
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
-| `/webdav/` 及全部子路径 | 任意 | 207/200/401/404/405 | 只读 WebDAV：PROPFIND 207（带 getcontentlength）、GET strm/nfo 200；树是 `/{分类}/{分片}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401 |
+| `/webdav/` 及全部子路径 | 任意 | 207/200/401/403/404/405/415/500 | 只读 WebDAV：PROPFIND 207（带 getcontentlength）、GET strm/nfo 200；树是 `/{分类}/{分片}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401；写意图被拒的状态码由协议层决定（`PUT` 404、`MOVE`/`COPY` 403、`DELETE`/无 body 的 `MKCOL` 405、带 body 的 `MKCOL` 415、`PROPPATCH` 500，逐格前置条件见 `docs/DEV-STANDARDS.md`「只读」） |
 | `/video/{id}.m3u8` | GET / HEAD | 200/401/404/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
 | `/video/{id}/{seq}.ts` | GET / HEAD | 200/206/401/404/502/503 | MPEG-TS 分片：本地缓存命中即回，未命中现切并落缓存 |
 | `/s/{token}/…`、`/dav/…` | 任意 | 404 | 已退役（不留兼容层） |
@@ -41,7 +41,7 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 | `/api/dramas/{id}/episodes` | GET | 200 | 该剧全部集，供合并编排挑选 |
 | `/api/dramas/{id}/merge-groups` | GET / POST | 200 / 201 | 合并组列表 / 建组（`episode_ids` 顺序即时间轴顺序） |
 | `/api/merge-groups/{id}` | DELETE | 204 | 删组并重建对外集号 |
-| `/api/status` | GET | 200 | 同步计数、运行配置现状、缓存代理建议参数 |
+| `/api/status` | GET | 200 | 同步计数、运行配置现状、各源调度状态（缓存面字段仍是 ADR-0004 的建议参数，见 `docs/DEV-STANDARDS.md`「缓存面」的已知偏差） |
 | 其它未登记路径 | 任意 | 404 | 由 web 的 mux 兜底 |
 
 对外 id 是 HMAC 常量签名（ADR-0003）：`id = uid + "-" + hex(HMAC-SHA256(secret,
@@ -76,11 +76,15 @@ ffmpeg 失败 → 502 且不写缓存。
 |---|---|
 | `/` 剧目 | 粘贴上游剧 id 或 `https://hongguoduanju.com/player/<id>` 链接同步入库；删剧目（连带集、合并组、对外集号） |
 | `/merges` 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即时间轴顺序）→ 删组；已入组的集不可重复选 |
-| `/status` 同步与缓存 | 剧目/集/对外集/合并组计数与最近同步时间、运行配置现状（密钥只显示是否已设置）、缓存代理建议参数 |
+| `/status` 同步与缓存 | 剧目/集/对外集/合并组计数与最近同步时间、运行配置现状（密钥只显示是否已设置）、各源调度状态 |
 
-页面里的每个操作都直接落到上面的 `/api/` 端点，渲染结果与 API 返回一致。缓存面只做
-展示：视频缓存由缓存代理淘汰（ADR-0004），看板给出 `--vfs-cache-max-size 200G
---vfs-cache-max-age 720h` 这份建议值，不参与本服务运行逻辑。
+页面里的每个操作都直接落到上面的 `/api/` 端点，渲染结果与 API 返回一致。
+
+缓存由本服务自己负责（ADR-0007）：海报、分片、关键帧索引落 `<cache_dir>`，按
+`cache_max_mb` / `cache_lru_days` 淘汰，规则见 `docs/CACHE-MODEL.md`；播放字节一律经本
+服务的 `/video/…`，rclone 只剩 WebDAV 只读挂载，不再需要 `--vfs-cache-mode full`。
+（`/api/status` 里那份 rclone 建议参数是 ADR-0004 的遗留字段，已知偏差，
+见 `docs/DEV-STANDARDS.md`「缓存面」。）
 
 ```bash
 open http://127.0.0.1:8080/            # 剧目
@@ -104,7 +108,7 @@ curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8
 ```bash
 rclone config create dramahub webdav url http://127.0.0.1:8080/webdav vendor other \
   user <webdav_user> pass <webdav_pass>
-rclone mount dramahub:/ /mnt/dramahub --vfs-cache-mode full --dir-cache-time 30s
+rclone mount dramahub:/ /mnt/dramahub --dir-cache-time 30s
 rclone lsf --max-depth 5 dramahub:/     # 分类 → 分片 → 剧 → Season 01 → strm/nfo
 ```
 
@@ -120,15 +124,16 @@ Emby 库路径指向 `/mnt/dramahub`（DAV 根即剧集库根），类型选「�
 ```bash
 make env-check                  # 校验容器内 go/ffmpeg 版本与 env.lock 一致
 make e2e-image                  # 构建测试镜像（runtime + Go 工具链）
-make test-e2e                   # 容器内跑集成测试，--network=none
-make run-container              # 容器内起服务，挂 ./data，映射 :8080
+make test                       # 容器内跑全部测试，--network=none
+make run                        # 容器内起服务，挂 ./data，映射 :8080
+./scripts/ci.sh                 # 全量门禁：lint + 容器测试 + 版本锁
 ```
 
-本机 `make build` / `make test` 只用于快速迭代：开发机 ffmpeg 与容器 ffmpeg 版本不同，
-本机结果不能作为验收依据。升级基础镜像 = 改 `Containerfile` 的 digest + `env.lock` + 跑 `make env-check`。
+本机 `make build` / `make lint` 只用于快速迭代：开发机 ffmpeg 与容器 ffmpeg 版本不同，
+本机结果不能作为验收依据（运行与测试只有容器这一条路径）。升级基础镜像 = 改 `Containerfile` 的 digest + `env.lock` + 跑 `make env-check`。
 
 podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限定名 `localhost/drama-hub`，运行命令带 `--pull=never`。
-宿主机 8080 被占用时用 `make run-container PORT=18081`。
+宿主机 8080 被占用时用 `make run PORT=18081`。
 
 ## 文档
 

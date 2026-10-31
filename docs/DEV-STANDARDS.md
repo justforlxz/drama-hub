@@ -90,7 +90,7 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 | key | 默认 | 取值范围 | 作用 |
 |---|---|---|---|
-| `strm_prefix` | `""` | URL 或空 | strm 内 URL 前缀，指向 rclone/openlist 代理 |
+| `strm_prefix` | `""` | URL 或空 | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，不带尾 `/`）；空 = 相对路径 `/video/{id}.m3u8`。不指向 rclone/openlist |
 | `stream_secret` | 必填 | ≥ 32 字节 | 出流 HMAC 签名密钥（见 ADR-0003） |
 | `seg_target_sec` | `10` | 4–30 | 分片目标时长 |
 | `seg_prefetch` | `2` | 0–10 | 预取分片数 |
@@ -208,6 +208,10 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }
 - ffmpeg/ffprobe 一律带硬超时（`timeoutProbe=30s` / `timeoutCut=60s`）；stderr 尾部
   只进日志，不落响应体；日志只记源 host，不落完整直链。并发闸
   `min(4, max(1, NumCPU/2))`，超出的请求排队不丢弃。
+- **`seg_prefetch` / `pin_days` 没有任何实现**（MKACG-610 请求级验收记录，未在本段修）：
+  两个 key 在 `settings` 里注册、有默认值与范围校验，`/api/status` 也原样展示，但
+  `internal/cache` 与 `internal/segment` 不消费它们——没有预取循环、没有按 `pin_days`
+  的整集预热。配置表里给它们写的「作用」目前只是参数占位；真要做预取是代码改动。
 
 ### 合并集
 
@@ -553,14 +557,36 @@ Basic，凭据取 `settings.webdav_user` / `webdav_pass`，**每请求现读**�
 
 ### 只读
 
-`Mkdir` / `RemoveAll` / `Rename` 与任何带写意图的 `OpenFile` 一律失败
-（`PUT`/`DELETE`/`MKCOL` → `405`）。锁定用 `x/net/webdav.MemLS`（协议层要求，不落盘）。
+`Mkdir` / `RemoveAll` / `Rename` 与任何带写意图的 `OpenFile` 四大写入口都返回同一个
+`errReadOnly`（`fs.go`，普通 error，不是 `fs.ErrPermission`），不落盘、不改库。
+
+**状态码由协议层各 handler 各自映射，不是本服务能选的**，所以「写意图 → 405」的说法是错的。
+`x/net/webdav@v0.62.0` 实测矩阵（MKACG-610 验收，17,558 部真库）：
+
+| 方法 | 实测状态码 | 前置条件与映射来源 |
+|---|---|---|
+| `MKCOL` | 无 body（或空 body）`405`；带 body `415` | 带非空 body 时 `handleMkcol` 直接回 `UnsupportedMediaType`（协议层 TODO：不支持 MKCOL 带 body），根本不落到 FS；无 body 时 `Mkdir` 错误 → `MethodNotAllowed`（父目录在不在都一样） |
+| `DELETE` | 路径存在（文件或目录）`405`，不存在 `404` | `handleDelete` 先 `Stat`（落空 → `NotFound`），`RemoveAll` 错误 → `MethodNotAllowed` |
+| `PUT` | `404` | 已存在文件 / 不存在路径 / 根 / 带斜杠目录 / 父目录不存在，五种都 404：`handlePut` 只在 `OpenFile` 返回 not-exist 时给 409，而只读错误不是 not-exist |
+| `MOVE` | `403` | 源存在与否都是 403（`moveFiles`：`Rename` 错误 → `Forbidden`） |
+| `COPY` | 源存在 `403`，源不存在 `404` | `copyFiles` 先 `Stat` 源（落空 → 404），复制阶段失败 → `Forbidden` |
+| `PROPPATCH` | 路径不存在 `404`；路径存在但 body 空/非法 `400`；路径存在 + 合法 `propertyupdate` `500` | `handleProppatch` 依次 `Stat` → `readProppatch` → `patch`；`patch` 的写失败没有状态码分支，直落 500 |
+
+只读语义不靠状态码保证：四个写入口共享一个错误值，协议层怎么映射都改变不了「什么都没发生」。
+因此 `TestReadOnly` 只断言「不是 2xx」（PUT / DELETE / MKCOL 三种），不钉具体码；
+要钉 405 只能钉「无 body 的 `MKCOL`」与「已存在路径的 `DELETE`」。锁定用 `x/net/webdav.MemLS`
+（协议层要求，不落盘）。
 
 ### 已知边界
 
 - 修改时间恒为零值（`entry.ModTime`）：库里没有可靠的 mtime，`sync_at` 是采集时间。
   零值让 ETag 稳定在「内容长度」上，`http.ServeContent` 也不写 `Last-Modified`。
 - 不做封面 `poster.jpg`（属 artifact 缓存，单独任务）。
+- **单目录成本随子项数线性增长，季层不摊薄**：`walkFS` 对一次 `PROPFIND` 的每个子项都要取
+  props，所以一个 1000 集的季（2000 个子项）就是 2000 次渲染 + 一份大 XML。MKACG-610
+  验收在 17,558 部真库上实测：该季 `Season 01` 的 `Depth: 1` = **1.8 MB / 25.9 s**（单请求）。
+  分片摊薄的是分类层（20 万级）；季层只能靠「单季集数量级本身有限」兜住（当前库实测最大单季
+  1000 集，代码里没有任何集数上限常量），没有更强的摊薄手段——再切一层就改变了 Emby 认的季结构。
 
 ### 测试（两层，都不需要外部 rclone）
 
@@ -607,7 +633,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 |---|---|---|
 | `/` | 剧目 | 按上游剧 id 或 `/player/<id>` 链接同步入库；删剧目（级联删集、合并组、对外集号） |
 | `/merges` | 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即 `ord`）→ 删组 |
-| `/status` | 同步与缓存 | 同步计数与最近同步时间、各播放源状态（是否启用、正在刷新、上次运行/上次成功/上次错误/下次计划、生效的 `base_url` 与超时、停用原因）、手动「立即刷新」、运行配置现状（密钥只报「是否已设置」）、缓存代理建议参数 |
+| `/status` | 同步与缓存 | 同步计数与最近同步时间、各播放源状态（是否启用、正在刷新、上次运行/上次成功/上次错误/下次计划、生效的 `base_url` 与超时、停用原因）、手动「立即刷新」、运行配置现状（密钥只报「是否已设置」）、缓存面（`mode` / `prefix` / `max_size` / `max_age` / `flags`）——**这几个字段仍是 ADR-0004 遗留**，与缓存实现相反，见「缓存面」的已知偏差 |
 
 模板 `templates/*.html` 与 `static/app.css`、`static/app.js` 用 `//go:embed` 进二进制：
 界面没有构建步骤、没有 `package.json`（ADR-0002）。页面 JS 只调下面这些 API，渲染结果
@@ -638,12 +664,22 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 - **计数不做 N+1**：`store.ListDramaStats` 一条聚合查询取全库（标量子查询，不用多表
   JOIN，避免行数相乘）。
 
-### 缓存面（ADR-0004）
+### 缓存面（ADR-0007）
 
-视频缓存由缓存代理负责淘汰，本服务不实现淘汰，也不设缓存上限/保留期运行参数。看板只做
-两件事：显示 `strm_prefix` 是否指向代理（空 = 直连，播放字节不经缓存），并给出
-`--vfs-cache-mode full --vfs-cache-max-size 200G --vfs-cache-max-age 720h` 这份建议值
-（取自设计基线 Q5，一次性输出、不参与运行逻辑）。改这两个数字属设计变更，不是配置调整。
+**缓存由本服务自己负责**（`docs/adr/0007-own-hls-and-local-cache.md` 推翻 ADR-0004 的划界）：
+海报、分片、关键帧索引落 `<cache_dir>` 的三个子目录，按 `cache_max_mb` 与
+`cache_lru_days` 淘汰，键、布局、并发与失效规则的真值是 `docs/CACHE-MODEL.md`，参数
+默认值与取值范围见本节「配置」表。淘汰循环在装配根启动（`cache.RunEviction`，启动即
+一轮、之后每 5 分钟一轮），与请求路径无关，间隔是固定值、不做成可调项。
+
+`strm_prefix` 与缓存**无关**：它只是 `/video/{id}.m3u8` 的对外地址前缀。播放字节一律
+由本服务的 `/video/…` 产出并经本服务的缓存，rclone 只剩 WebDAV 只读挂载，**不再需要
+`--vfs-cache-mode full`**（它的缓存以前是给播放用的）。
+
+> 已知偏差（MKACG-610 请求级验收记录，未在本段修）：`/api/status` 的缓存面仍按
+> ADR-0004 输出 rclone 建议参数（`internal/web/api_status.go` 的 `cacheSuggest*` /
+> `newCacheView`，接口字段 `mode` / `max_size` / `max_age` / `flags` / `note`），与本节的
+> 实现相反。改它属代码改动，验收段只记录事实。
 
 ## 提交
 
@@ -651,9 +687,9 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 ## 运行环境（容器，验收依据）
 
-- **验收一律跑容器**：`make test-e2e`（`--network=none`）、`make run-container`。本机 `make test` 只用于快速迭代，不是验收依据 —— 开发机 ffmpeg 与容器 ffmpeg 版本不同，产物会不一致。
+- **验收一律跑容器**：`make test`（`--network=none`）、`make run`；全量门禁是 `./scripts/ci.sh`。本机 `make build` / `make lint` 只用于快速迭代，不是验收依据 —— 开发机 ffmpeg 与容器 ffmpeg 版本不同，产物会不一致。
 - **ffmpeg 版本由镜像决定**：alpine + `apk add ffmpeg` = 6.1.2。改动 `Containerfile` 或 `env.lock` 属于版本变更，必须同时更新 `env.lock` 并跑 `make env-check`。
-- **测试禁止访问外网**：`make test-e2e` 用 `--network=none` 强制。假上游一律用容器内 `httptest`。
+- **测试禁止访问外网**：`make test` / `scripts/ci.sh` 用 `--network=none` 强制。假上游一律用容器内 `httptest`。
 - 新引入的外部进程（rclone 等）必须有**固定 digest 的镜像**，不能依赖本机 PATH。
 - 分片转封装在容器内调用 `ffmpeg`，路径统一解析为 `ffmpeg`（在 PATH），不写死绝对路径。
 - `docs/TEST-STANDARDS.md` 的「禁止真实外网/真实时间」在容器里同样生效，容器不改变测试编写规则。

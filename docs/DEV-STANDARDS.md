@@ -143,6 +143,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 | `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 非空路径 | 即时（每次读写） | 本地缓存根目录：海报 `cover/`、分片 `seg/`、索引 `index/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`）；四个目录在启动时预先建出 |
 | `cache_max_mb` | `8192` | 0–1048576 | ≤5 分钟（下一轮淘汰） | 分片缓存上限（MB）；`0` = 不按大小淘汰 |
 | `cache_lru_days` | `30` | 1–365 | ≤5 分钟（下一轮淘汰） | 超过 N 天未命中的缓存条目（三种 kind 都算）删除 |
+| `cover_timeout_sec` | `5` | 1–60 | 即时（每次海报下载） | 海报（`artifact(kind='cover')`）的单次出站超时。**不跟插件 `base_url` / `request_timeout_sec` 走**：封面 URL 是上游页面里的三方 CDN 绝对地址（实测 `p3-novel.byteimg.com`），`base_url` 改不到它，而页面的 30 s 超时会让一张卡住的图拖住整部剧的同步。取不到只记一条 warn，该剧不算同步失败（MKACG-620） |
 | `plugin.<源>.enabled` | `true` | 布尔 | 即时（每轮调度现读） | 是否参与**刷新调度**（缺失按 `true`）；手动同步（`POST /api/dramas`）与播放（`/video`）不受影响 |
 | `plugin.<源>.base_url` | `""` | URL 或空 | **重启后**（构造期注入） | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
 | `plugin.<源>.request_timeout_sec` | `30` | 5–300 | **重启后**（构造期注入） | 单次出站请求超时 |
@@ -170,6 +171,13 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 缓存淘汰由本服务自己执行（ADR-0007）：`internal/cache` 的淘汰循环每 5 分钟一轮，
 先按 `cache_lru_days` 删过期，再按 `cache_max_mb` 删最久未用的分片（`docs/CACHE-MODEL.md`
 「淘汰」）。淘汰间隔是固定值，不做成可调项。
+
+**海报出站（MKACG-620）**：`internal/cache` 下载封面时按 `cover_timeout_sec` 现读超时
+（默认 5 s，可调 1–60 s），不用插件那份出站超时。理由是地址与语义都不同：插件请求打的是
+`{base_url}/player/{id}`，封面打的是上游页面里写死的三方 CDN 绝对地址，换 `base_url`
+不会改变封面请求的目标；把「页面等 30 s」套到百 KB 的图上又回到「一张图拖住整部剧」。
+封面取不回来（离线、CDN 不可达、超时）时同步照常成功：剧与集入库、`artifact(kind='cover')`
+留空、日志一条 warn，下一轮自然重试。
 ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（见 `internal/segment` 的闸注释）。
 
 新增参数必须同 PR 更新上表，并在 `settings` 里给默认值 + 范围校验。写非法值返回 400，不静默纠正。

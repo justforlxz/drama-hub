@@ -41,6 +41,10 @@ const (
 	KeyCacheDir     SettingKey = "cache_dir"
 	KeyCacheMaxMB   SettingKey = "cache_max_mb"
 	KeyCacheLRUDays SettingKey = "cache_lru_days"
+	// KeyCoverTimeoutSec 是海报下载的单次出站超时（秒）。默认值、范围与理由见
+	// docs/DEV-STANDARDS.md「配置」表：海报是三方 CDN 上的百 KB 级图片，比页面请求
+	// 该更早放弃，因此单独一项，不跟插件超时走（MKACG-620）。
+	KeyCoverTimeoutSec SettingKey = "cover_timeout_sec"
 	// 刷新调度的三项（范围与语义见 docs/SCHEDULER-MODEL.md「配置」）。
 	KeyRefreshIntervalSec SettingKey = "refresh_interval_sec"
 	KeyRefreshBatch       SettingKey = "refresh_batch"
@@ -382,6 +386,9 @@ func specFor(key SettingKey) (settingSpec, bool) {
 	case KeyCacheLRUDays:
 		// 超过 N 天未命中的缓存条目（三种 kind 都算）删除。
 		return settingSpec{kind: kindInt, def: "30", min: 1, max: 365}, true
+	case KeyCoverTimeoutSec:
+		// 海报下载的单次出站超时：百 KB 级图片，离线时不该按插件超时（30 s）等。
+		return settingSpec{kind: kindInt, def: "5", min: 1, max: 60}, true
 	case KeyRefreshIntervalSec:
 		// 全局刷新间隔：所有源共用的默认值（docs/SCHEDULER-MODEL.md「配置」）。
 		return settingSpec{kind: kindInt, def: "3600", min: 300, max: 86400}, true

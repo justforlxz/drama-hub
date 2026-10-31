@@ -36,7 +36,7 @@ func newNoshrinkSyncer(t *testing.T) (*fakePlugin, *Syncer, *fakeClock) {
 	t.Helper()
 	p := &fakePlugin{name: "web", detail: workDetail(5)}
 	clock := &fakeClock{t: time.Date(2026, 10, 30, 10, 0, 0, 0, time.UTC)}
-	s := New(p, nil)
+	s := New(p, nil, nil)
 	s.now = clock.now
 	return p, s, clock
 }

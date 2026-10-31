@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/plugin"
@@ -35,20 +36,26 @@ type CoverLocalizer interface {
 
 // Syncer 是一个插件的写库编排。零值不可用，用 New 构造。
 //
-// 不持有日志器：本包只把错误原样返回，口径由调用方（管理面）记一条，避免同一次
-// 失败在两层各写一行。
+// 数据（剧 / 集）的失败原样返回，口径由调用方（管理面）记一条，避免同一次失败在两层
+// 各写一行。唯一的例外是海报：它是附带资产，本包记一条 warn 后不上升为失败——否则
+// 一部「剧与集都入库了、只是封面域名不可达」的剧会被调度器算作失败并写进 last_error
+// （MKACG-620）。
 type Syncer struct {
 	source plugin.Plugin
 	now    func() time.Time // 取当前时间，测试注入固定值
 	covers CoverLocalizer   // nil = 不做海报本地化
+	logger *slog.Logger     // 只用于海报这一条 warn；nil → slog.Default()
 }
 
 // New 构造 Syncer，时钟用 time.Now。
 //
 // covers 为 nil 表示不本地化海报（不关心海报的测试、无可写缓存目录的调用方）；
-// 生产装配根必须传真实实现，否则海报只会留在上游。
-func New(source plugin.Plugin, covers CoverLocalizer) *Syncer {
-	return &Syncer{source: source, now: time.Now, covers: covers}
+// 生产装配根必须传真实实现，否则海报只会留在上游。logger 为 nil 时用 slog.Default()。
+func New(source plugin.Plugin, covers CoverLocalizer, logger *slog.Logger) *Syncer {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Syncer{source: source, now: time.Now, covers: covers, logger: logger}
 }
 
 // Name 返回底层插件的名字（= 写库用的 drama.provider / episode.source）。
@@ -68,9 +75,10 @@ func (s *Syncer) Name() string { return s.source.Name() }
 // 错误是插件哨兵（ErrUpstream / ErrRejected / ErrSchema / ErrNotFound / ErrNoStream）
 // 或 store 哨兵，原样返回，调用方用 errors.Is 判定。
 //
-// 海报本地化在事务提交之后：它是附带资产，落盘与索引都不参与剧/集写入。失败时返回
-// 带上下文的错误，但剧与集已经入库（各自完整、重跑幂等），因此调用方看到的是
-// 「数据已入库、海报没取到」。已有本地海报时不再回源（源图失效不影响已入库海报）。
+// 海报本地化在事务提交之后：它是附带资产，落盘与索引都不参与剧/集写入。失败只记一条
+// warn（provider / id / 原因），剧与集照常算成功，artifact(kind='cover') 留空等下轮重试
+// —— 离线或封面域名不可达时同步不因此失败、也不写进 last_error（MKACG-620）。
+// 已有本地海报时不再回源（源图失效不影响已入库海报）。
 func (s *Syncer) SyncSeries(ctx context.Context, st *store.Store, id string) error {
 	ref := plugin.WorkRef{Plugin: s.source.Name(), ID: id}
 	detail, keys, err := s.work(ctx, ref)
@@ -129,7 +137,10 @@ func (s *Syncer) SyncSeries(ctx context.Context, st *store.Store, id string) err
 		return nil
 	}
 	if err := s.covers.LocalizeCover(ctx, ref.Plugin, ref.ID, w.CoverURL); err != nil {
-		return fmt.Errorf("海报本地化 %s（剧与集已入库）: %w", ref.ID, err)
+		// 不返回错误：剧与集已在上面提交（各自完整、重跑幂等），海报失败只让这一条
+		// 附带资产缺位。返回错误会让调度器把「已入库」的剧计成失败（MKACG-620）。
+		s.logger.WarnContext(ctx, "海报本地化失败，剧与集已入库",
+			"provider", ref.Plugin, "id", ref.ID, "err", err)
 	}
 	return nil
 }

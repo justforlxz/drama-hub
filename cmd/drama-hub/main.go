@@ -68,7 +68,7 @@ func main() {
 
 	st := store.NewStore(db.DB)
 	sourcePlugins := pluginList(plugins)
-	syncers := newSyncers(sourcePlugins, st, settings)
+	syncers := newSyncers(sourcePlugins, st, settings, logger)
 	syncer := syncers[hongguo.Name]
 	sched := scheduler.New(st, settings, sourcePlugins, syncers, logger)
 
@@ -188,22 +188,22 @@ func pluginList(reg *plugin.Registry) []plugin.Plugin {
 //
 // 海报本地化对每个源共用同一个 cache.CoverCache：落盘布局按 (provider, provider_id)
 // 分文件，不同源不会互相覆盖。
-func newSyncers(sources []plugin.Plugin, st *store.Store, settings *store.Settings) map[string]scheduler.Syncer {
-	covers := cache.NewCoverCache(st, settings, &http.Client{Timeout: coverTimeout})
+//
+// 封面出站的超时不在这里定型：cache 每次下载现读 settings 的 cover_timeout_sec
+// （MKACG-620）。它不跟插件超时走 —— 封面 URL 是上游页面里的三方 CDN 绝对地址
+// （`p3-novel.byteimg.com`），插件 base_url 与 request_timeout_sec 管不到这条出站；
+// client 因此不带 Timeout，超时由每次请求的 ctx 决定（DEV-STANDARDS「错误处理」）。
+func newSyncers(sources []plugin.Plugin, st *store.Store, settings *store.Settings, logger *slog.Logger) map[string]scheduler.Syncer {
+	covers := cache.NewCoverCache(st, settings, &http.Client{})
 	out := make(map[string]scheduler.Syncer, len(sources))
 	for _, p := range sources {
-		out[p.Name()] = sync.New(p, covers)
+		out[p.Name()] = sync.New(p, covers, logger)
 	}
 	return out
 }
 
 // 插件配置的兜底值（契约默认值见 docs/PLUGIN-CONTRACT.md「配置」）。
 const defaultPluginTimeoutSec = 30
-
-// coverTimeout 是海报下载单次出站超时。海报是百 KB 量级的图片、来自 CDN，
-// 用插件超时（30 s）会让一张卡住的图拖住整部剧的同步，因此单独取更短的值。
-// 它是代码常量而非 settings：没有用户会为「下载海报等多久」调参（硬约束 5 的反面）。
-const coverTimeout = 15 * time.Second
 
 // pluginBoot 是一个源在启动时真正注入插件的构造期配置。
 //

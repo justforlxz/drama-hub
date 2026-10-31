@@ -60,6 +60,12 @@ playlist 是 `segment` 表的**纯函数**（`segment.BuildPlaylist`）：一次
   - 海报：`provider + "/" + provider_id`
   - 索引：`uid`
 - 文件**不可变**：内容只由键决定，所以写用「临时文件 + `rename`」，读到半截文件的可能为零。
+- **海报的下载超时与失败口径（MKACG-620）**：单次出站超时按 `cover_timeout_sec`
+  现读（默认 5 s，1–60，见 `docs/DEV-STANDARDS.md`「配置」表），不跟插件的
+  `base_url` / `request_timeout_sec` 走 —— 封面 URL 是上游页面里的三方 CDN 绝对地址。
+  取不回来时该剧仍算同步成功：剧与集已入库、`artifact(kind='cover')` 留空、日志一条 warn，
+  下一轮刷新自然重试（`internal/cache.CoverCache` 只报 `ErrCoverFetch`，是否上升为失败
+  由调用方 `internal/sync` 决定）。
 
 ## 失效
 

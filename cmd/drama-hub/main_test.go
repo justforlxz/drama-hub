@@ -110,7 +110,7 @@ func stubRegistry(t *testing.T, name, directURL string) *plugin.Registry {
 // BaseURL 指向本机 1 端口，即使误触发同步也只会立刻连接失败，不会打到真站。
 func testSyncer() web.SeriesSyncer {
 	logger := slog.New(slog.DiscardHandler)
-	return sync.New(hongguo.New(hongguo.Config{BaseURL: "http://127.0.0.1:1", Logger: logger}), nil)
+	return sync.New(hongguo.New(hongguo.Config{BaseURL: "http://127.0.0.1:1", Logger: logger}), nil, logger)
 }
 
 // fakeSchedule 是管理面的调度依赖替身：cmd 的测试不跑调度器循环，只验证接线。
@@ -762,7 +762,7 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 	if got, want := playbackHeaders(boots), "Referer: "+site.URL+"/"; got[1] != want {
 		t.Fatalf("播放面 Referer = %q, 期望 %q（跟随 pluginBoot.BaseURL）", got[1], want)
 	}
-	h := newAssembly(logger, st, settings, sync.New(p, nil), fakeSchedule{}, sourceList(reg, boots), reg)
+	h := newAssembly(logger, st, settings, sync.New(p, nil, logger), fakeSchedule{}, sourceList(reg, boots), reg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/dramas", strings.NewReader(`{"series_id":"7503745441910017049"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -833,7 +833,7 @@ func TestPluginDisabledStillStarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("停用时 newPlugins 报错：%v", err)
 	}
-	h := newAssembly(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name), nil), fakeSchedule{}, sourceList(reg, boots), reg)
+	h := newAssembly(logger, st, settings, sync.New(mustPlugin(reg, hongguo.Name), nil, logger), fakeSchedule{}, sourceList(reg, boots), reg)
 
 	rec := serve(t, h, http.MethodGet, "/api/status")
 	var status struct {

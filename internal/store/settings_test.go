@@ -739,3 +739,38 @@ func TestSetManyRejectsWholeBatch(t *testing.T) {
 		})
 	}
 }
+
+// 海报下载超时（MKACG-620）：默认 5 秒、范围 1–60，越界不落库。
+// 默认值与范围的真值在 docs/DEV-STANDARDS.md「配置」表。
+func TestCoverTimeoutDefaultAndBounds(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	got, err := s.Int(ctx, KeyCoverTimeoutSec)
+	if err != nil {
+		t.Fatalf("Int(cover_timeout_sec): %v", err)
+	}
+	if got != 5 {
+		t.Fatalf("cover_timeout_sec 默认 = %d, 期望 5", got)
+	}
+
+	for _, raw := range []string{"1", "60"} {
+		if err := s.Set(ctx, KeyCoverTimeoutSec, raw); err != nil {
+			t.Errorf("Set(cover_timeout_sec, %s) = %v, 期望通过（闭区间端点）", raw, err)
+		}
+	}
+	for _, raw := range []string{"0", "61", "-1", "5s"} {
+		if err := s.Set(ctx, KeyCoverTimeoutSec, raw); !errors.Is(err, ErrInvalidSetting) {
+			t.Errorf("Set(cover_timeout_sec, %q) = %v, 期望 ErrInvalidSetting", raw, err)
+		}
+	}
+	// 越界值一个都没落库：库里留着的还是最后一次合法写入的 60。
+	kept, err := s.Int(ctx, KeyCoverTimeoutSec)
+	if err != nil {
+		t.Fatalf("Int(cover_timeout_sec)（越界写入后）: %v", err)
+	}
+	if kept != 60 {
+		t.Fatalf("越界写入后 cover_timeout_sec = %d, 期望仍是 60", kept)
+	}
+}

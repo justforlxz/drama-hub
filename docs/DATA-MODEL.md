@@ -189,10 +189,15 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
 ### 剧集信息
 
 - `episode.ep_no` = `vid_list` 下标 + 1；`episode.vid` = `vid_list[i]`。
-- `episode.title` **恒为空**、`episode.duration_sec` **恒为 0**：
+- `episode.title` **恒为空**、`episode.duration_sec` **入库恒为 0**：
   源侧批量拿不到（每集要 1 请求，2847 万次已否决）。
   → 契约上这是**允许留零值**（`docs/PLUGIN-CONTRACT.md` `Episode` 注释），
   实现上不许为此逐集抓。
+  → 首次播放该集（建关键帧索引）时用 `ffprobe` 实测时长回填 `duration_sec`
+  （`store.BackfillEpisodeDuration`：只填 0、不覆盖非零值），并同事务重建该剧
+  `emby_item`，让 `.nfo` 的 `<runtime>` 当次就变成真实值；没播过的集仍是 0
+  （见 `docs/DEV-STANDARDS.md`「关键帧索引」）。
+  → 刷新（`UpsertEpisode`）携带上游的 0 时不清零已回填的值，上游真给了非零值才覆盖。
   → NFO 的 `<title>` 因此回落到 `第 N 集`（`internal/vfs/tree.go:embyLabel` 已这么写）。
 - `episode.source` = 插件名（`"web"`）。
 - `drama.episode_total` = `episode_cnt`；`drama.sync_at` = 本次刷新时间（UTC RFC3339）。

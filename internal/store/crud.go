@@ -280,6 +280,10 @@ func (s *Store) StaleProviderIDs(ctx context.Context, provider string, limit int
 //
 // 冲突时只更新可变态（title / duration_sec / source / vid），drama_id 与 ep_no 是
 // 身份、不被覆盖。入参 ID 被忽略。唯一/主键约束冲突返回 ErrConflict。
+//
+// duration_sec 只在插件给了非零值时覆盖：插件批量拿不到时长（红果恒为 0），而首播
+// 建索引时回填的是 ffprobe 实测值（BackfillEpisodeDuration）—— 刷新若把它写回 0，
+// 回填就每轮被冲掉一次（`.nfo` 的 `<runtime>` 回到 0）。
 func (s *Store) UpsertEpisode(ctx context.Context, e Episode) (int64, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx,
@@ -287,7 +291,9 @@ func (s *Store) UpsertEpisode(ctx context.Context, e Episode) (int64, error) {
 		 VALUES(?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(drama_id, ep_no) DO UPDATE
 		 SET title = excluded.title,
-		     duration_sec = excluded.duration_sec,
+		     duration_sec = CASE WHEN excluded.duration_sec > 0
+		                         THEN excluded.duration_sec
+		                         ELSE episode.duration_sec END,
 		     source = excluded.source,
 		     vid = excluded.vid
 		 RETURNING id`,
@@ -297,6 +303,48 @@ func (s *Store) UpsertEpisode(ctx context.Context, e Episode) (int64, error) {
 		return 0, wrapWriteErr("写入集", err)
 	}
 	return id, nil
+}
+
+// BackfillEpisodeDuration 用实测时长回填 episode.duration_sec，并在同一事务里重建
+// 该剧的 emby_item 派生表，让 .nfo 的 <runtime> 当次就能取到真实值。
+//
+// 只填库里的 0（首播建索引时 ffprobe 的实测那次）：已有非零值一律不动，重复播放与
+// 索引重建都不覆盖更权威的来源。durationSec <= 0（探测不到时长的异常源）视为没有
+// 实测值，不写库、不重建。返回是否真的写了行。
+//
+// 派生表必须重算，而不是就地改一行：runtime_sec 单集取本集时长、合并集取组内之和，
+// 只有一个派生实现（rebuildEmbyItems），不在这里再抄一份求和（硬约束 6）。
+func (s *Store) BackfillEpisodeDuration(ctx context.Context, episodeID int64, durationSec int) (bool, error) {
+	if durationSec <= 0 {
+		return false, nil
+	}
+	changed := false
+	err := s.InTx(ctx, func(tx *Store) error {
+		res, err := tx.db.ExecContext(ctx,
+			`UPDATE episode SET duration_sec = ? WHERE id = ? AND duration_sec = 0`,
+			durationSec, episodeID)
+		if err != nil {
+			return wrapWriteErr("回填集时长", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("回填集时长 episode_id=%d: %w", episodeID, err)
+		}
+		if n == 0 {
+			return nil // 已有非零值或该集不存在：都不动派生表
+		}
+		var dramaID int64
+		if err := tx.db.QueryRowContext(ctx,
+			`SELECT drama_id FROM episode WHERE id = ?`, episodeID).Scan(&dramaID); err != nil {
+			return fmt.Errorf("查回填集所属剧目 episode_id=%d: %w", episodeID, err)
+		}
+		changed = true
+		return tx.rebuildEmbyItems(ctx, dramaID)
+	})
+	if err != nil {
+		return false, err
+	}
+	return changed, nil
 }
 
 // EpisodeByID 按主键查一集。

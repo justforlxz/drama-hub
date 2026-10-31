@@ -101,6 +101,10 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid
 **禁止批量预建索引**：L1 规模下可播集数量是「每部剧 1 集」，但库里 `episode` 有 2847 万行，
 对全库 ffprobe 是不可完成的任务（`docs/L1-CORPUS-SCOPE.md` 取证 D/E）。
 
+建索引时 `ffprobe` 拿到的源时长会回填 `episode.duration_sec`（只填 0，不覆盖非零值）
+并重建该剧 `emby_item`，`.nfo` 的 `<runtime>` 因此变成真实值；没播过的集仍是 0。
+细节见 `docs/DEV-STANDARDS.md`「关键帧索引」。
+
 ## `GET /video/{id}/{seq}.ts`
 
 返回 MPEG-TS 分片。顺序是：**查本地缓存 → 命中即回文件；未命中 → 生成、落缓存、再回**。

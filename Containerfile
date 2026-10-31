@@ -1,17 +1,19 @@
 # syntax=docker/dockerfile:1
 #
-# 三段式：build / runtime / e2e。
+# 四段式：build（服务二进制）/ testbin（测试二进制）/ runtime / e2e。
 # ffmpeg 只出现在 runtime 段，e2e 段 FROM runtime —— 测试与线上用同一个 ffmpeg
 # 二进制，一致性由镜像结构保证，不靠纪律。
 #
-# 测试二进制在 build 段（自带 gcc）编译好再拷进 e2e，所以 e2e 里不放 Go 工具链：
+# 测试二进制在 testbin 段（自带 gcc）编译好再拷进 e2e，所以 e2e 里不放 Go 工具链：
 # 镜像小、测试不用每次重新编译。ffmpeg 是运行期 exec 调用的，测试二进制里不含它，
-# 因此「编译期工具链」与「运行期 ffmpeg」无关。
+# 因此「编译期工具链」与「运行期 ffmpeg」无关。testbin 独立成段是为了发布：
+# runtime 只依赖 build，另一个架构的发布镜像不必再走 QEMU 编一遍测试二进制。
 #
 # 基础镜像按 digest 固定，见 env.lock。只固定 tag 挡不住上游重推。
-
+# 两个 digest 都必须是**多架构 index** digest：固定到单平台 manifest 时 arm64 构建
+# 不报错，但工具链仍是 amd64，`go build` 产出 amd64 二进制塞进 arm64 镜像（实测）。
 ARG BASE=alpine@sha256:ee16d92f96db08d9d2d07da48555a27f3a69d8f0759021dbc601195ed0d2b5bd
-ARG GOIMG=golang@sha256:bff16a94c0b4b6d9642581e2a3aa81beb3edb940b2f5a3aac1d22c6a68cb7747
+ARG GOIMG=golang@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb
 
 # ---------------------------------------------------------------- build
 FROM ${GOIMG} AS build
@@ -40,6 +42,9 @@ ENV GOFLAGS=-trimpath
 RUN CGO_ENABLED=0 go build \
       -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
       -o /out/drama-hub ./cmd/drama-hub
+
+# ---------------------------------------------------------------- testbin
+FROM build AS testbin
 
 # 每包一个测试二进制（`go test -c` 一次只能编一个包）。带 -race。
 # 二进制按包路径放进镜像里的目录树，runner 才能把 cwd 设回该包目录，
@@ -112,7 +117,7 @@ FROM runtime AS e2e
 
 USER root
 
-COPY --from=build /out/tests /usr/local/bin/tests
+COPY --from=testbin /out/tests /usr/local/bin/tests
 COPY --from=build /src/scripts/run-tests.sh /usr/local/bin/run-tests
 RUN chmod 0755 /usr/local/bin/run-tests \
  && find /usr/local/bin/tests -name pkg.test -exec chmod 0755 {} +

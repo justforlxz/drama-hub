@@ -1,0 +1,83 @@
+name: image
+
+# 镜像构建与发布。`image` job 的 `needs: [lint, test]` 让「ci 全绿才发」成为结构约束，
+# 而不是脚本里的 if 判断：lint 或 test 失败，这条流水线不会推出任何 tag。
+#
+# lint / test 在这里重新定义，是因为跨 workflow 没有 `needs` 可用（ci.yml 的 job 无法被
+# 引用）。两处跑的是同一个入口 `scripts/ci.sh`，检查内容不会分叉。
+# 口径与 tag 矩阵见 docs/adr/0008-image-publish.md，tag 由 scripts/image-tags.sh 决定。
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ENGINE=docker ./scripts/ci.sh --lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ENGINE=docker ./scripts/ci.sh --test
+
+  image:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      # ghcr 只认 GITHUB_TOKEN，不引入额外 secret。
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # tag 口径不写在 YAML 里：scripts/image-tags.sh 是唯一真值，自带 --self-test，
+      # ci.sh --lint 里会跑，避免这里与文档各写一套。
+      - name: 计算 tag 与版本
+        id: ref
+        run: |
+          {
+            echo "tags<<EOF"
+            ./scripts/image-tags.sh "$IMAGE" "$GITHUB_REF" "$GITHUB_SHA"
+            echo "EOF"
+          } >>"$GITHUB_OUTPUT"
+          case "$GITHUB_REF" in
+            refs/tags/v*) echo "version=${GITHUB_REF#refs/tags/}" >>"$GITHUB_OUTPUT" ;;
+            *) echo "version=$(printf '%s' "$GITHUB_SHA" | cut -c1-7)" >>"$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.ref.outputs.tags }}
+          build-args: |
+            VERSION=${{ steps.ref.outputs.version }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -16,6 +16,8 @@ fi
 echo "--- go build ./... ---"
 go build ./... || mark "编译失败"
 ./scripts/check-deps.sh || mark "依赖方向违规"
+# 发布镜像的 tag 口径（scripts/image-tags.sh）自带自测：口径写错不该靠人眼看 YAML。
+./scripts/image-tags.sh --self-test || mark "镜像 tag 口径自测失败"
 
 echo "--- go vet ./... ---"
 go vet ./... || mark "vet 失败"

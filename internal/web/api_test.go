@@ -378,8 +378,9 @@ func TestAPI_Status(t *testing.T) {
 		got.Totals.EmbyItems != 2 || got.Totals.LastSyncAt != "2026-10-30T08:00:00Z" {
 		t.Errorf("totals = %+v", got.Totals)
 	}
-	if got.Config.SegTargetSec != 10 || got.Config.SegPrefetch != 2 || got.Config.PinDays != 7 {
-		t.Errorf("配置默认值 = %+v, 期望 10/2/7", got.Config)
+	if got.Config.SegTargetSec != 10 || got.Config.CacheDir != "./data/cache" ||
+		got.Config.CacheMaxMB != 8192 || got.Config.CacheLRUDays != 30 {
+		t.Errorf("配置默认值 = %+v, 期望 10 / ./data/cache / 8192 / 30", got.Config)
 	}
 	if !got.Config.StreamSecretSet {
 		t.Error("stream_secret_set = false, 期望 true")
@@ -394,21 +395,48 @@ func TestAPI_Status(t *testing.T) {
 		!src.Enabled || src.RequestTimeoutSec != 30 || src.Reason != "" {
 		t.Errorf("source = %+v, 期望 web 默认启用、超时 30 秒、无原因", src)
 	}
-	if got.Cache.Mode != "direct" {
-		t.Errorf("cache.mode = %q, 期望 direct（strm_prefix 为空）", got.Cache.Mode)
+	// 构造期配置：测试里的装配根没带 Boot* 值，现值与生效值不同 → 报「需重启」。
+	// 这是网页上「改了要重启」那一行的数据来源。
+	if src := got.Sources[0]; src.BaseURLEffective != "" ||
+		src.RequestTimeoutSecEffective != 0 || !src.RestartRequired {
+		t.Errorf("source = %+v, 期望 effective 全零且 restart_required", src)
 	}
-	if !strings.Contains(got.Cache.Flags, "--vfs-cache-max-size "+cacheSuggestMaxSize) ||
-		!strings.Contains(got.Cache.Flags, "--vfs-cache-max-age "+cacheSuggestMaxAge) {
-		t.Errorf("cache.flags = %q", got.Cache.Flags)
+	// 状态页只报真正生效的配置：ADR-0004 的 rclone 建议参数（cache.*）已整段删除
+	// （MKACG-616 / 617 结论），响应里不该再有这个键。
+	if strings.Contains(rec.Body.String(), `"cache"`) {
+		t.Errorf("响应体仍出现 cache 段：%s", rec.Body.String())
+	}
+}
+
+// 构造期配置（base_url / request_timeout_sec）不是热读项：状态页要能区分「正在生效
+// 的值」与「settings 现值」，两者不一致时置 restart_required —— 页面上就是「改了要
+// 重启」那一行，避免显示新值却还在跑旧值。
+func TestAPI_StatusRestartRequired(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	ctx := context.Background()
+	key := func(item string) store.SettingKey { return store.PluginSettingKey("web", item) }
+	// 启动时注入的值：base_url 空（插件内置地址）、超时 30 秒。
+	srv.sources = []Source{{Name: "web", Label: "红果官网 SSR", BootRequestTimeoutSec: 30}}
+	got := decode[statusView](t, do(t, srv, http.MethodGet, "/api/status", ""))
+	if src := got.Sources[0]; src.RestartRequired || src.BaseURLEffective != "" ||
+		src.RequestTimeoutSecEffective != 30 {
+		t.Fatalf("source = %+v, 期望与启动值一致、不报需重启", src)
 	}
 
-	// strm_prefix 一旦有值，缓存面就是「经代理」。
-	if err := srv.settings.Set(context.Background(), store.KeyStrmPrefix, "http://127.0.0.1:18080"); err != nil {
-		t.Fatalf("Set strm_prefix: %v", err)
+	// 改现值（等价于手改 settings）：不重启时生效值不动、标出需重启。
+	if err := srv.settings.Set(ctx, key(store.PluginItemBaseURL), "http://127.0.0.1:18080"); err != nil {
+		t.Fatalf("Set base_url: %v", err)
+	}
+	if err := srv.settings.Set(ctx, key(store.PluginItemRequestTimeout), "5"); err != nil {
+		t.Fatalf("Set request_timeout_sec: %v", err)
 	}
 	got = decode[statusView](t, do(t, srv, http.MethodGet, "/api/status", ""))
-	if got.Cache.Mode != "proxy" || got.Cache.Prefix != "http://127.0.0.1:18080" {
-		t.Errorf("cache = %+v, 期望 proxy + 前缀", got.Cache)
+	src := got.Sources[0]
+	if !src.RestartRequired || src.BaseURLEffective != "" || src.RequestTimeoutSecEffective != 30 {
+		t.Fatalf("source = %+v, 期望现值已变、生效值不变、需重启", src)
+	}
+	if src.BaseURL != "http://127.0.0.1:18080" || src.RequestTimeoutSec != 5 {
+		t.Fatalf("source = %+v, 现值应为新值", src)
 	}
 }
 

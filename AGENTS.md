@@ -20,7 +20,7 @@
 2. **合并集只有一种实现：虚拟 HLS 分片聚合。** 禁止物化合并文件、禁止字节拼接多集 MP4（`moov` 只描述首集，拼字节必然时长错、seek 崩）。这条是两个方案对比后定的，不要再试。
 3. **每个虚拟文件必须给出精确 `Content-Length`。** WebDAV 的 `PROPFIND` 少了它，rclone mount 读不到文件、Emby 扫不出集。渲染 → 算长度 → 再返回，一次请求内完成。
 4. **单二进制 + SQLite。** 没有 Node、没有前端构建步骤、没有第二个运行时、没有外部缓存服务。界面用 Go 模板 + 少量原生 JS，模板随二进制嵌入（`embed`）。
-5. **可调参数进 `settings` 表。** strm 前缀、出流签名密钥、分片时长、预取数、pin 天数、缓存目录/上限/LRU 天数运行时可变，改完即时生效。代码里出现这类魔法数字视为缺陷。**缓存由本服务自己负责（ADR-0007）**：海报、分片、关键帧索引落 `<cache_dir>`，按 `cache_max_mb` 与 `cache_lru_days` 淘汰，规则与测试见 `docs/CACHE-MODEL.md`。其中 `seg_prefetch` / `pin_days` 目前只进 settings 与状态页、没有任何预取实现（接线属代码改动，见 `docs/DEV-STANDARDS.md`「分片缓存」）。
+5. **可调参数进 `settings` 表。** strm 前缀、出流签名密钥、分片时长、缓存目录/上限/LRU 天数运行时可变，改完即时生效。代码里出现这类魔法数字视为缺陷。**缓存由本服务自己负责（ADR-0007）**：海报、分片、关键帧索引落 `<cache_dir>`，按 `cache_max_mb` 与 `cache_lru_days` 淘汰，规则与测试见 `docs/CACHE-MODEL.md`。2.0 不做缓存预热：1.0 的 `seg_prefetch` / `pin_days` 占位键已删除（MKACG-616），代码里没有预取实现。
 6. **对外集号只由 `emby_item` 派生表决定。** 合并调整只重建派生表，`drama` / `episode` 原始数据不动。
 7. **出流用字节透传，不用 302。** 302 到签名 CDN 会让缓存键漂移、过期链接命中旧缓存返回错内容。
 8. **出流 token 是 HMAC 常量签名，无过期、无状态、无 token 表**（ADR-0003）。带过期的 token 会破坏缓存键稳定性，与缓存目标直接冲突。

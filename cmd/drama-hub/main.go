@@ -56,7 +56,11 @@ func main() {
 	defer func() { _ = db.Close() }()
 
 	settings := store.NewSettings(db.DB)
-	plugins, err := newPlugins(context.Background(), settings, logger)
+	// 空卷的首次配置入口：env → settings，只在键缺失时写一次（重复启动不覆盖手改值）。
+	bootstrapSettings(context.Background(), settings, logger)
+	// 拼错的 DRAMA_HUB_* 会被静默忽略，这本身就是「配了没生效」；点名报出来。
+	warnUnknownEnv(logger)
+	plugins, boots, err := newPlugins(context.Background(), settings, logger)
 	if err != nil {
 		logger.Error("注册插件失败", "err", err)
 		os.Exit(1)
@@ -71,12 +75,17 @@ func main() {
 	// 本地缓存（海报/分片/索引）与播放面的直链解析都只有一份实例：请求路径与
 	// 淘汰循环共用同一个 *cache.Cache，直链解析共用同一个 *stream.Resolver。
 	caches := cache.New(st, settings, logger)
+	// 空卷首次启动就把 <cache_dir> 的四个目录建出来：cache_dir 配错在启动日志里
+	// 就有一条 warn，不用等第一次播放。失败不挡启动（缓存坏了不影响只读的 WebDAV 面）。
+	if err := caches.EnsureLayout(context.Background()); err != nil {
+		logger.Warn("缓存目录不可用", "err", err)
+	}
 	resolver := stream.NewResolver(st, plugins)
 
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           newHandler(logger, st, settings, syncer, sched, sourceList(plugins), caches, resolver),
+		Handler:           newHandler(logger, st, settings, syncer, sched, sourceList(plugins, boots), caches, resolver),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -186,13 +195,22 @@ const defaultPluginTimeoutSec = 30
 // 它是代码常量而非 settings：没有用户会为「下载海报等多久」调参（硬约束 5 的反面）。
 const coverTimeout = 15 * time.Second
 
+// pluginBoot 是一个源在启动时真正注入插件的构造期配置。
+//
+// 插件契约硬性要求 2：插件只保存构造期配置，`*http.Client` 的 Timeout 在这里定型
+// （docs/PLUGIN-CONTRACT.md）。所以 base_url / request_timeout_sec 不是热读项，
+// 改值要重启才生效；状态页拿它显示「生效值」与 restart_required（api_status.go）。
+type pluginBoot struct {
+	BaseURL    string // settings 原值；"" = 插件内置默认（hongguo.DefaultBaseURL）
+	TimeoutSec int
+}
+
 // newPlugins 显式注册内置插件（ADR-0006 第 5 条：没有 init() 自动注册，装配根逐个
-// Register）。插件配置现读 settings（硬约束 5）：base_url 空 = 用插件内置地址，
-// request_timeout_sec 决定出站 client 的超时。
+// Register）。返回的 map 按源的 Name() 记录「启动时真正注入的配置」，只给状态页用。
 //
 // 配置读不出来（值非法、库被手改）时用插件默认值并 warn：配置错不该让服务起不来，
 // 原因与现状在状态页看得见（plugin.<源>.* 三行）。
-func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logger) (*plugin.Registry, error) {
+func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logger) (*plugin.Registry, map[string]pluginBoot, error) {
 	baseURL, err := settings.String(ctx, store.PluginSettingKey(hongguo.Name, store.PluginItemBaseURL))
 	if err != nil {
 		logger.Warn("读插件 base_url 失败，用插件内置地址", "plugin", hongguo.Name, "err", err)
@@ -209,9 +227,12 @@ func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logg
 		HTTPClient: &http.Client{Timeout: time.Duration(timeoutSec) * time.Second},
 		Logger:     logger,
 	})); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return reg, nil
+	boots := map[string]pluginBoot{
+		hongguo.Name: {BaseURL: baseURL, TimeoutSec: timeoutSec},
+	}
+	return reg, boots, nil
 }
 
 // mustPlugin 取已注册的插件。名字写死在内置清单里，取不到只可能是装配 bug，
@@ -224,12 +245,20 @@ func mustPlugin(reg *plugin.Registry, name string) plugin.Plugin {
 	return p
 }
 
-// sourceList 把注册表里的源翻成状态页要展示的清单（标签是人看的，不放注册表）。
-func sourceList(reg *plugin.Registry) []web.Source {
+// sourceList 把注册表里的源翻成状态页要展示的清单（标签是人看的，不放注册表），
+// 并带上启动时真正注入插件的构造期配置——状态页要拿它和 settings 现值对比，
+// 说明「这个值已经生效」还是「改了要重启」。
+func sourceList(reg *plugin.Registry, boots map[string]pluginBoot) []web.Source {
 	labels := map[string]string{hongguo.Name: "红果官网 SSR"}
 	out := make([]web.Source, 0, len(reg.Names()))
 	for _, name := range reg.Names() {
-		out = append(out, web.Source{Name: name, Label: labels[name]})
+		boot := boots[name]
+		out = append(out, web.Source{
+			Name:                  name,
+			Label:                 labels[name],
+			BootBaseURL:           boot.BaseURL,
+			BootRequestTimeoutSec: boot.TimeoutSec,
+		})
 	}
 	return out
 }

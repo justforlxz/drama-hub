@@ -4,11 +4,13 @@ import (
 	"crypto/subtle"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	xwebdav "golang.org/x/net/webdav"
 
 	"github.com/justforlxz/drama-hub/internal/httpx"
 	"github.com/justforlxz/drama-hub/internal/store"
+	"github.com/justforlxz/drama-hub/internal/vfs"
 )
 
 // MountPath 是挂载点。cmd 用它注册路由，Handler 用它生成 PROPFIND 的 href
@@ -53,7 +55,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnauthorized)
 		return
 	}
-	h.inner.ServeHTTP(w, r.WithContext(withSnapshot(r.Context())))
+	// B1：.strm 在 strm_prefix 为空时要写出绝对地址，基地址只能从请求里来。
+	ctx := vfs.WithBaseURL(r.Context(), requestBaseURL(r))
+	h.inner.ServeHTTP(w, r.WithContext(withSnapshot(ctx)))
 }
 
 // authorized 校验 Basic 凭据。
@@ -77,4 +81,32 @@ func (h *Handler) authorized(r *http.Request) bool {
 	userOK := subtle.ConstantTimeCompare([]byte(gotUser), []byte(user)) == 1
 	passOK := subtle.ConstantTimeCompare([]byte(gotPass), []byte(pass)) == 1
 	return userOK && passOK
+}
+
+// requestBaseURL 由请求推导本服务的对外基地址 `scheme://host`。
+//
+// 反向代理后 Host 是外部域名、真实 scheme 在 X-Forwarded-Proto 里；两者都没有时按
+// 连接是否 TLS 判断。Host 为空（不合法的 HTTP/1.0 请求）返回空串，渲染退回相对路径。
+func requestBaseURL(r *http.Request) string {
+	if r.Host == "" {
+		return ""
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = normalizeProto(proto)
+	}
+	return scheme + "://" + r.Host
+}
+
+// normalizeProto 取 X-Forwarded-Proto 的第一个值（代理链上会是 `https,http`）。
+func normalizeProto(raw string) string {
+	proto, _, _ := strings.Cut(raw, ",")
+	proto = strings.ToLower(strings.TrimSpace(proto))
+	if proto == "" {
+		return "http"
+	}
+	return proto
 }

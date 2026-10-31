@@ -76,43 +76,83 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 > `plugin.<源>.refresh_interval_sec` 随 S4（MKACG-606，范围见
 > `docs/SCHEDULER-MODEL.md`「配置」）。
 >
-> **生效方式分两类**：`plugin.<源>.enabled`、`refresh_interval_sec`（全局与源级覆盖）
-> 与三个缓存项（`cache_dir` / `cache_max_mb` / `cache_lru_days`）热读——调度器每次醒来
-> 重读 settings（改完最多 60 秒按新值算），缓存每次读写现读 `cache_dir`、每轮淘汰现读
-> 上限与天数（淘汰循环每 5 分钟一轮），都不需要重启、也不需要任何通知机制；
-> `plugin.<源>.base_url` 与 `plugin.<源>.request_timeout_sec` 是构造期注入的不可变配置
-> （`*http.Client` 的 Timeout 在这里定型，见 `docs/PLUGIN-CONTRACT.md` 硬性要求 2），
-> 改后需重启。
+> 2.0 明确不做缓存预热（MKACG-603 的「不在范围」表），1.0 预留的 `seg_prefetch` /
+> `pin_days` 两个死键已删除（MKACG-616）：它们从没有消费者，留着只会让人以为改了有用。
+> 库里若还有这两行，`Settings` 会按 `ErrUnknownSetting` 忽略它们，不需要数据迁移。
+
+**生效方式只有两类，配置表逐键标注**：
+
+- **现读**：每次使用都查库（`Settings` 本身不缓存，硬约束 5）——调度器每次醒来重读
+  `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` /
+  `plugin.<源>.enabled` / `plugin.<源>.refresh_interval_sec`（改完最多 60 秒按新值算
+  下一轮），请求路径现读 `strm_prefix` / `stream_secret` / `webdav_user` /
+  `webdav_pass` / `seg_target_sec`，缓存每次读写现读 `cache_dir`、每轮淘汰现读
+  `cache_max_mb` / `cache_lru_days`（淘汰循环每 5 分钟一轮）。都不需要重启。
+- **需重启**：`plugin.<源>.base_url` 与 `plugin.<源>.request_timeout_sec` 是构造期注入的
+  不可变配置（`*http.Client` 的 Timeout 在这里定型，见 `docs/PLUGIN-CONTRACT.md` 硬性
+  要求 2）。状态页对这两项同时给「settings 现值」（`base_url` / `request_timeout_sec`）
+  与「启动时注入、正在生效的值」（`*_effective`），两者不一致时 `restart_required=true`；
+  页面直接写「重启后生效」，不再出现「显示新值、跑的还是旧值」。
 
 运行时配置只有一张表 `settings(key TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT)`。
 
-启动引导只读环境变量三项：`DRAMA_HUB_DB`、`DRAMA_HUB_ADDR`、`DRAMA_HUB_LOG_LEVEL`。其余全部走 settings。
+启动引导只读环境变量三项：`DRAMA_HUB_DB`、`DRAMA_HUB_ADDR`、`DRAMA_HUB_LOG_LEVEL`。
+其余全部走 settings。
 
-| key | 默认 | 取值范围 | 作用 |
-|---|---|---|---|
-| `strm_prefix` | `""` | URL 或空 | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，不带尾 `/`）；空 = 相对路径 `/video/{id}.m3u8`。不指向 rclone/openlist |
-| `stream_secret` | 必填 | ≥ 32 字节 | 出流 HMAC 签名密钥（见 ADR-0003） |
-| `seg_target_sec` | `10` | 4–30 | 分片目标时长 |
-| `seg_prefetch` | `2` | 0–10 | 预取分片数 |
-| `pin_days` | `7` | 0–90 | 最近 N 天播放过的合并集整集预取 |
-| `webdav_user` / `webdav_pass` | 必填 | — | WebDAV Basic 认证 |
-| `cache_dir` | `./data/cache` | 非空路径 | 本地缓存根目录：海报 `cover/`、分片 `seg/`、索引 `index/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`） |
-| `cache_max_mb` | `8192` | 0–1048576 | 分片缓存上限（MB）；`0` = 不按大小淘汰 |
-| `cache_lru_days` | `30` | 1–365 | 超过 N 天未命中的缓存条目（三种 kind 都算）删除 |
-| `plugin.<源>.enabled` | `true` | — | 该源是否参与刷新调度（缺失按 `true`，内置源默认启用） |
-| `plugin.<源>.base_url` | `""` | URL 或空 | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
-| `plugin.<源>.request_timeout_sec` | `30` | 5–300 | 单次出站请求超时 |
-| `refresh_interval_sec` | `3600` | 300–86400 | 全局刷新间隔，一轮到期 = `last_run_at` + 本值 |
-| `plugin.<源>.refresh_interval_sec` | 空 = 继承全局 | 300–86400 | 源级间隔覆盖（用 `Settings.OptionalInt` 读，无行即「继承」） |
-| `refresh_batch` | `1000` | 0–10000 | 每轮存量刷新的部数；`0` = 关闭存量轮转 |
-| `refresh_timeout_sec` | `900` | 60–86400 | 单轮预算（`context.WithTimeout`） |
+**首次启动的 env 引导（MKACG-616）**：下面四个 env 只在 settings 里**还没有该键时**写入
+一次（`Settings.SetIfAbsent`），已有值一律不覆盖 —— 重启不会把手改过的 settings 覆盖回
+env；env 缺省或值非法（secret 不足 32 字节、用户/密码为空）时只记一条 warn、不写坏值、
+不 panic（看板上显示「未设置」就是这条原因）。2.0 没有 `PUT /api/settings`，这是空卷上
+唯一能种出必填项的入口。
+
+| env | settings 键 | 说明 |
+|---|---|---|
+| `DRAMA_HUB_STREAM_SECRET` | `stream_secret` | 空卷没有它 `/video` 恒 500 |
+| `DRAMA_HUB_CACHE_DIR` | `cache_dir` | 镜像里默认 `/data/cache`（`WORKDIR /data`，相对默认值会落成 `/data/data/cache`）；裸机默认仍是 `./data/cache` |
+
+**WebDAV 账号密码不走 env**（lxz 2026-10-31 定）：`webdav_user` / `webdav_pass` 是后台配置项，
+由 MKACG-622 的配置写入接口管理；env 再种一份就会出现两个真值，所以这两个 env 不存在，
+设了也会按「未知变量」报出来。
+
+拼错或已废弃的 `DRAMA_HUB_*` 变量会打一条 warn，连同**支持的键**一起列出（只报变量名、
+不报值）：静默忽略是「配了却没生效」的常见来源，见 `cmd/drama-hub/bootstrap.go` 的
+`warnUnknownEnv`。
+
+**`.strm` 的绝对地址（B1，MKACG-616）**：`strm_prefix` 为空时，`.strm` 里的 URL 由**请求的
+`Host` 推导**成 `{scheme}://{Host}/video/{id}.m3u8`（`scheme` 取 `X-Forwarded-Proto`，没有就按
+连接是否 TLS）。选这条路而不是「列为必填」的理由：验收要求默认安装下 `.strm` 里的 URL
+直接 `curl` 就能 200；必填路径在「没配」时把播放能力整段关掉，而 Host 推导在直连、反代
+（`X-Forwarded-Proto`）、以及 rclone 用任意地址挂载时都成立。配置了 `strm_prefix` 时以它为准
+（对外地址与访问地址不同时用这个）。
+
+| key | 默认 | 取值范围 | 生效时机 | 作用 |
+|---|---|---|---|---|
+| `strm_prefix` | `""` | URL 或空 | 现读（每次渲染 `.strm`） | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，尾 `/` 写入时归一掉）；空 = 按请求 `Host` 推导绝对地址（见上「`.strm` 的绝对地址」）。不指向 rclone/openlist |
+| `stream_secret` | 必填 | ≥ 32 字节 | 现读（每请求） | 出流 HMAC 签名密钥（见 ADR-0003）；换了之后所有旧 URL 失效 |
+| `seg_target_sec` | `10` | 4–30 | 现读（每次建索引） | 分片目标时长；**只对还没建索引的 uid 生效**——已建索引的 uid 不重算，改了要等它下一次重建（`segment` 表被整体替换时） |
+| `webdav_user` / `webdav_pass` | 必填 | — | 现读（每请求） | WebDAV Basic 认证 |
+| `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 非空路径 | 现读（每次读写） | 本地缓存根目录：海报 `cover/`、分片 `seg/`、索引 `index/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`）；四个目录在启动时预先建出 |
+| `cache_max_mb` | `8192` | 0–1048576 | 现读（每轮淘汰） | 分片缓存上限（MB）；`0` = 不按大小淘汰 |
+| `cache_lru_days` | `30` | 1–365 | 现读（每轮淘汰） | 超过 N 天未命中的缓存条目（三种 kind 都算）删除 |
+| `plugin.<源>.enabled` | `true` | — | 现读（每轮调度） | 是否参与**刷新调度**（缺失按 `true`）；手动同步（`POST /api/dramas`）与播放（`/video`）不受影响 |
+| `plugin.<源>.base_url` | `""` | URL 或空 | **需重启**（构造期注入） | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
+| `plugin.<源>.request_timeout_sec` | `30` | 5–300 | **需重启**（构造期注入） | 单次出站请求超时 |
+| `refresh_interval_sec` | `3600` | 300–86400 | 现读（每轮调度） | 全局刷新间隔，一轮到期 = `last_run_at` + 本值 |
+| `plugin.<源>.refresh_interval_sec` | 空 = 继承全局 | 300–86400 | 现读（每轮调度） | 源级间隔覆盖（用 `Settings.OptionalInt` 读，无行即「继承」） |
+| `refresh_batch` | `1000` | 0–10000 | 现读（每轮调度） | 每轮存量刷新的部数；`0` = 关闭存量轮转 |
+| `refresh_timeout_sec` | `900` | 60–86400 | 现读（每轮调度） | 单轮预算（`context.WithTimeout`） |
 
 `<源>` 是 `Plugin.Name()`（红果是 `web`），键的格式与校验在 `internal/store`
 （`PluginSettingKey` + `specFor` 的前缀模式），调用方不自己拼字符串。
 
+`strm_prefix` 的尾 `/`（B2）：`{strm_prefix}/video/…` 是字符串拼接，库里存着
+`http://host/stream/` 会产出 `//video/`（MKACG-617 实测）。**写入时归一化**（`parseSetting`
+对 URL 类键 `TrimRight`，状态页显示的就是归一后的值），**渲染时再去一次**（存量手改的行
+也能拼对）；非法值照旧报错，不猜。
+
 `plugin.<源>.request_timeout_sec` 的 5–300 范围校验已进注册表，但 2.0 没有 settings
-写接口，所以非法值目前只能由代码侧（`Settings.Set`）拒绝，没有 HTTP 400 的入口；
-写接口属后续阶段。
+写接口，所以非法值目前只能由代码侧（`Settings.Set` / `Settings.SetIfAbsent`）拒绝，
+没有 HTTP 400 的入口；写接口属后续阶段。
 
 缓存淘汰由本服务自己执行（ADR-0007）：`internal/cache` 的淘汰循环每 5 分钟一轮，
 先按 `cache_lru_days` 删过期，再按 `cache_max_mb` 删最久未用的分片（`docs/CACHE-MODEL.md`
@@ -215,10 +255,8 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }
 - ffmpeg/ffprobe 一律带硬超时（`timeoutProbe=30s` / `timeoutCut=60s`）；stderr 尾部
   只进日志，不落响应体；日志只记源 host，不落完整直链。并发闸
   `min(4, max(1, NumCPU/2))`，超出的请求排队不丢弃。
-- **`seg_prefetch` / `pin_days` 没有任何实现**（MKACG-610 请求级验收记录，未在本段修）：
-  两个 key 在 `settings` 里注册、有默认值与范围校验，`/api/status` 也原样展示，但
-  `internal/cache` 与 `internal/segment` 不消费它们——没有预取循环、没有按 `pin_days`
-  的整集预热。配置表里给它们写的「作用」目前只是参数占位；真要做预取是代码改动。
+- **没有预取**：2.0 不做缓存预热（MKACG-603「不在范围」），1.0 的两个占位键
+  `seg_prefetch` / `pin_days` 已删除（MKACG-616），代码里没有预取循环、没有整集预热。
 
 ### 合并集
 
@@ -658,7 +696,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | `/api/dramas/{id}/merge-groups` | POST | 建组：`{"label":"…","episode_ids":[…]}`，数组顺序即 `ord`，201 + 整份列表 |
 | `/api/merge-groups/{id}` | DELETE | 删组（同一事务内重建派生表），204 |
 | `/api/refresh` | POST | 手动跑一轮：`{"source":"web"}` → 202 已启动 / 404 无此源或未启用 / 409 该源正在跑（与定时共用单飞锁） |
-| `/api/status` | GET | 同步计数 + 运行配置 + 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`）+ 缓存面 |
+| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `seg_target_sec` / `cache_dir` / `cache_max_mb` / `cache_lru_days` 现读；密钥只报 `*_set`）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」） |
 
 - **「增剧目」的唯一入口是数据源同步**：剧目与集的真值在上游，手工插空剧只会得到一条
   永远没有集的记录。`series_id` 只接受纯数字或 `/player/<id>` 链接 —— 归一后的值会拼进
@@ -683,10 +721,10 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 由本服务的 `/video/…` 产出并经本服务的缓存，rclone 只剩 WebDAV 只读挂载，**不再需要
 `--vfs-cache-mode full`**（它的缓存以前是给播放用的）。
 
-> 已知偏差（MKACG-610 请求级验收记录，未在本段修）：`/api/status` 的缓存面仍按
-> ADR-0004 输出 rclone 建议参数（`internal/web/api_status.go` 的 `cacheSuggest*` /
-> `newCacheView`，接口字段 `mode` / `max_size` / `max_age` / `flags` / `note`），与本节的
-> 实现相反。改它属代码改动，验收段只记录事实。
+`/api/status` 不再有 `cache` 段（MKACG-616 删除）：那份 rclone 建议参数（`mode` /
+`max_size` / `max_age` / `flags` / `note`）不参与本服务任何逻辑，是本节的已知偏差
+（MKACG-610 记录、MKACG-617 复核），留着等于让页面显示不生效的配置。缓存相关配置
+（`cache_dir` / `cache_max_mb` / `cache_lru_days`）在响应的 `config` 段里，都是现读值。
 
 ## 提交
 

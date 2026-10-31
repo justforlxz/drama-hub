@@ -66,8 +66,6 @@ func TestDefaults(t *testing.T) {
 
 	ints := map[SettingKey]int{
 		KeySegTargetSec: 10,
-		KeySegPrefetch:  2,
-		KeyPinDays:      7,
 	}
 	for key, want := range ints {
 		got, err := s.Int(ctx, key)
@@ -166,6 +164,79 @@ func TestSetUpdatesExistingRow(t *testing.T) {
 	}
 	if rows != 1 {
 		t.Fatalf("keys 行数 = %d, 期望 1（UPSERT 不新增行）", rows)
+	}
+}
+
+// SetIfAbsent 只在键缺失时写：首次写入返回 true，第二次不改动已有值（env 引导的幂等）。
+func TestSetIfAbsentWritesOnlyOnce(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	written, err := s.SetIfAbsent(ctx, KeyWebDAVUser, "alice")
+	if err != nil {
+		t.Fatalf("首次 SetIfAbsent: %v", err)
+	}
+	if !written {
+		t.Fatal("首次 SetIfAbsent 未写入")
+	}
+	written, err = s.SetIfAbsent(ctx, KeyWebDAVUser, "bob")
+	if err != nil {
+		t.Fatalf("第二次 SetIfAbsent: %v", err)
+	}
+	if written {
+		t.Error("第二次 SetIfAbsent 报写入，期望跳过")
+	}
+	got, err := s.String(ctx, KeyWebDAVUser)
+	if err != nil {
+		t.Fatalf("String: %v", err)
+	}
+	if got != "alice" {
+		t.Fatalf("读到 %q, 期望已有的 alice（不被覆盖）", got)
+	}
+}
+
+// SetIfAbsent 与 Set 同一条校验：非法值不落库、不覆盖已有值。
+func TestSetIfAbsentValidates(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	written, err := s.SetIfAbsent(ctx, KeyStreamSecret, "太短")
+	if !errors.Is(err, ErrInvalidSetting) {
+		t.Fatalf("短 secret 错误 = %v, 期望 ErrInvalidSetting", err)
+	}
+	if written {
+		t.Error("非法值被写入了")
+	}
+	if hasRow(t, db, KeyStreamSecret) {
+		t.Fatal("非法值在库里留了行")
+	}
+
+	if _, err := s.SetIfAbsent(ctx, KeySegTargetSec, "50"); !errors.Is(err, ErrInvalidSetting) {
+		t.Fatalf("越界值错误 = %v, 期望 ErrInvalidSetting", err)
+	}
+	if hasRow(t, db, KeySegTargetSec) {
+		t.Fatal("越界值在库里留了行")
+	}
+	if _, err := s.SetIfAbsent(ctx, "不存在的键", "x"); !errors.Is(err, ErrUnknownSetting) {
+		t.Fatalf("未知键错误 = %v, 期望 ErrUnknownSetting", err)
+	}
+}
+
+// 2.0 不做缓存预热（MKACG-603 范围表），1.0 预留的两个死键已删除：
+// 它们不再是合法配置项，读与写都按 ErrUnknownSetting 处理。
+func TestRemovedPrefetchKeys(t *testing.T) {
+	s := NewSettings(newTestDB(t))
+	ctx := context.Background()
+
+	for _, key := range []SettingKey{"seg_prefetch", "pin_days"} {
+		if _, err := s.Int(ctx, key); !errors.Is(err, ErrUnknownSetting) {
+			t.Errorf("Int(%s) 错误 = %v, 期望 ErrUnknownSetting", key, err)
+		}
+		if _, err := s.SetIfAbsent(ctx, key, "1"); !errors.Is(err, ErrUnknownSetting) {
+			t.Errorf("SetIfAbsent(%s) 错误 = %v, 期望 ErrUnknownSetting", key, err)
+		}
 	}
 }
 
@@ -283,16 +354,26 @@ func TestStrmPrefixValidation(t *testing.T) {
 		}
 	}
 
-	const good = "http://10.0.0.2:3000/stream/"
-	if err := s.Set(ctx, KeyStrmPrefix, good); err != nil {
-		t.Fatalf("Set(strm_prefix, %q): %v", good, err)
+	// B2：尾 `/` 写入时归一化（`{strm_prefix}/video/…` 是字符串拼接，留着会拼出
+	// `//video/`，MKACG-617 实测）。归一不改语义，非法值照旧报错。
+	const given = "http://10.0.0.2:3000/stream/"
+	const want = "http://10.0.0.2:3000/stream"
+	if err := s.Set(ctx, KeyStrmPrefix, given); err != nil {
+		t.Fatalf("Set(strm_prefix, %q): %v", given, err)
 	}
 	got, err := s.String(ctx, KeyStrmPrefix)
 	if err != nil {
 		t.Fatalf("String: %v", err)
 	}
-	if got != good {
-		t.Fatalf("读回 %q, 期望 %q", got, good)
+	if got != want {
+		t.Fatalf("读回 %q, 期望 %q（尾斜杠已归一）", got, want)
+	}
+	// 只有 `/` 的值归一成空串 = 按请求 Host 推导（不是非法值）。
+	if err := s.Set(ctx, KeyStrmPrefix, "http://h:1///"); err != nil {
+		t.Fatalf("Set(strm_prefix, 多尾斜杠): %v", err)
+	}
+	if got, err := s.String(ctx, KeyStrmPrefix); err != nil || got != "http://h:1" {
+		t.Fatalf("多尾斜杠读回 %q, %v，期望 http://h:1", got, err)
 	}
 }
 
@@ -304,8 +385,6 @@ func TestParseSettingBoundaries(t *testing.T) {
 		max int
 	}{
 		{string(KeySegTargetSec), 4, 30},
-		{string(KeySegPrefetch), 0, 10},
-		{string(KeyPinDays), 0, 90},
 	}
 
 	for _, tt := range tests {

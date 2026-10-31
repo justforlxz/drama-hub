@@ -2,8 +2,11 @@ package webdav
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"strings"
@@ -411,5 +414,38 @@ func TestBaseOfAndNotExist(t *testing.T) {
 	}
 	if !errors.Is(notExist("/x"), fs.ErrNotExist) {
 		t.Errorf("notExist 未包装 fs.ErrNotExist")
+	}
+}
+
+// requestBaseURL 是 .strm 绝对地址的来源（MKACG-616 B1）：按请求 Host 拼 scheme://host，
+// 反代后以 X-Forwarded-Proto 为准。
+func TestRequestBaseURL(t *testing.T) {
+	cases := []struct {
+		name  string
+		host  string
+		tls   bool
+		proto string
+		want  string
+	}{
+		{"http", "drama.example:8080", false, "", "http://drama.example:8080"},
+		{"tls", "drama.example", true, "", "https://drama.example"},
+		{"proxy", "drama.example", false, "https", "https://drama.example"},
+		{"proxy-chain", "drama.example", false, "https,http", "https://drama.example"},
+		{"no-host", "", false, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/webdav/", nil)
+			r.Host = tc.host
+			if tc.tls {
+				r.TLS = &tls.ConnectionState{}
+			}
+			if tc.proto != "" {
+				r.Header.Set("X-Forwarded-Proto", tc.proto)
+			}
+			if got := requestBaseURL(r); got != tc.want {
+				t.Errorf("requestBaseURL = %q, 期望 %q", got, tc.want)
+			}
+		})
 	}
 }

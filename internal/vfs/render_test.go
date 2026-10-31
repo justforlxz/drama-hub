@@ -265,6 +265,31 @@ func TestRenderStrmReadsSettingsLive(t *testing.T) {
 	}
 }
 
+// strm_prefix 带尾 `/` 时不能拼出 `//video/`（MKACG-617 实测）：
+// `http://host/stream/` 与 `http://host/stream` 必须渲染出同一个 URL。
+func TestRenderStrmTrimsTrailingSlash(t *testing.T) {
+	ctx := context.Background()
+	withSlash := seed(t, "http://host.example/stream/")
+	withoutSlash := seed(t, "http://host.example/stream")
+
+	a, err := withSlash.tree.Render(ctx, withSlash.strmPath(withSlash.epA1))
+	if err != nil {
+		t.Fatalf("Render(尾斜杠): %v", err)
+	}
+	b, err := withoutSlash.tree.Render(ctx, withoutSlash.strmPath(withoutSlash.epA1))
+	if err != nil {
+		t.Fatalf("Render(无尾斜杠): %v", err)
+	}
+	uid := uidFor(withSlash.epA1)
+	want := "http://host.example/stream/video/" + stubID(testSecret, uid) + ".m3u8\n"
+	if string(a) != want {
+		t.Errorf("尾斜杠渲染 = %q, 期望 %q", a, want)
+	}
+	if string(a) != string(b) {
+		t.Errorf("两种写法渲染结果不同：\n%s\n%s", a, b)
+	}
+}
+
 // AC3 边界：缺 stream_secret 时透传 store.ErrSettingMissing，不产出脏字节。
 func TestRenderStrmMissingSecret(t *testing.T) {
 	f := seedNoSecret(t)

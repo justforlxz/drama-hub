@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/httpx"
@@ -12,15 +13,10 @@ import (
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
-// 缓存代理的建议参数（ADR-0004）。缓存淘汰由 rclone 负责，本服务只生成建议值：
-// 参数不参与任何运行逻辑，也不进 settings（它们不是本服务的运行配置）。
-// 取值来自设计基线 Q5（缓存 200 GB / 保留 30 天）。
-const (
-	cacheSuggestMaxSize = "200G"
-	cacheSuggestMaxAge  = "720h"
-	cacheSuggestFlags   = "--vfs-cache-mode full --vfs-cache-max-size " + cacheSuggestMaxSize +
-		" --vfs-cache-max-age " + cacheSuggestMaxAge
-)
+// /api/status 只报真正参与运行的配置（MKACG-616）。1.0/ADR-0004 时代的「缓存代理
+// 建议参数」（rclone --vfs-cache-mode / max-size / max-age）不参与本服务任何逻辑、
+// 页面却把它们排在「缓存」标题下，属于「显示的不是生效的」——ADR-0007 之后缓存归本
+// 服务，那组字段已整段删除（对应 MKACG-617 的 cache.* 遗留字段结论）。
 
 // totalsView 是看板顶部要的全局计数。
 type totalsView struct {
@@ -31,42 +27,44 @@ type totalsView struct {
 	LastSyncAt  string `json:"last_sync_at"`
 }
 
-// configView 是运行配置的现状快照。密钥类配置只报「是否已设置」，不回传值。
+// configView 是运行配置的现状快照：全部字段都是真在跑的现读值。密钥类配置只报
+// 「是否已设置」，不回传值。
+//
+// 2.0 明确不做缓存预热（MKACG-603 范围表），1.0 预留的 seg_prefetch / pin_days 两个
+// 死键已删除（MKACG-616）：看板不再展示没有任何消费者的配置项。
 type configView struct {
 	StrmPrefix      string `json:"strm_prefix"`
 	SegTargetSec    int    `json:"seg_target_sec"`
-	SegPrefetch     int    `json:"seg_prefetch"`
-	PinDays         int    `json:"pin_days"`
+	CacheDir        string `json:"cache_dir"`
+	CacheMaxMB      int    `json:"cache_max_mb"`
+	CacheLRUDays    int    `json:"cache_lru_days"`
 	StreamSecretSet bool   `json:"stream_secret_set"`
 	WebDAVUserSet   bool   `json:"webdav_user_set"`
 	WebDAVPassSet   bool   `json:"webdav_pass_set"`
 }
 
-// cacheView 是缓存面的现状：是否走缓存代理（由 strm_prefix 决定）与建议参数。
-type cacheView struct {
-	Mode    string `json:"mode"`     // direct（直连本服务，不经缓存）| proxy（经缓存代理）
-	Prefix  string `json:"prefix"`   // strm_prefix 的值，空表示直连
-	MaxSize string `json:"max_size"` // 建议值，不参与运行逻辑
-	MaxAge  string `json:"max_age"`  // 建议值，不参与运行逻辑
-	Flags   string `json:"flags"`    // rclone 建议参数整串
-	Note    string `json:"note"`
-}
-
 // sourceView 是一个播放源在状态页上的现状。
 //
-// enabled 取 plugin.<源>.enabled（缺失按 true），base_url / request_timeout_sec 取
-// 对应配置项；reason 非空说明这个源当前不可用或不可调度，页面上直接显示。
+// enabled 取 plugin.<源>.enabled（缺失按 true）；reason 非空说明这个源当前不可用或
+// 不可调度，页面上直接显示。
+//
+// base_url / request_timeout_sec 是构造期注入插件的配置（改后需重启），所以这里同时
+// 给两组值：不带后缀的是 settings 现值（改了还没重启），*_effective 是启动时真正注入
+// 的值（正在跑的那个）。restart_required = 两者不一致 → 页面上直说「重启后生效」。
 //
 // 调度字段（running / last_* / interval_sec / next_due_at）来自调度器：上次运行、
 // 上次成功、上次错误都读 source_state，next_due_at 是请求时按 last_run_at + 现读
 // interval 算出来的（库里没有这一列）。空字符串 = 还没发生过。
 type sourceView struct {
-	Name              string `json:"name"`
-	Label             string `json:"label"`
-	Enabled           bool   `json:"enabled"`
-	BaseURL           string `json:"base_url"`
-	RequestTimeoutSec int    `json:"request_timeout_sec"`
-	Reason            string `json:"reason"`
+	Name                       string `json:"name"`
+	Label                      string `json:"label"`
+	Enabled                    bool   `json:"enabled"`
+	BaseURL                    string `json:"base_url"`
+	RequestTimeoutSec          int    `json:"request_timeout_sec"`
+	BaseURLEffective           string `json:"base_url_effective"`
+	RequestTimeoutSecEffective int    `json:"request_timeout_sec_effective"`
+	RestartRequired            bool   `json:"restart_required"`
+	Reason                     string `json:"reason"`
 
 	Running     bool   `json:"running"`
 	LastRunAt   string `json:"last_run_at"`
@@ -81,7 +79,6 @@ type statusView struct {
 	Totals  totalsView   `json:"totals"`
 	Config  configView   `json:"config"`
 	Sources []sourceView `json:"sources"`
-	Cache   cacheView    `json:"cache"`
 }
 
 // handleStatus 处理 GET /api/status：看板只读，不改任何状态。
@@ -124,7 +121,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Totals:  totals,
 		Config:  cfg,
 		Sources: s.readSources(ctx, schedule),
-		Cache:   newCacheView(cfg.StrmPrefix),
 	})
 }
 
@@ -135,23 +131,30 @@ func (s *Server) readConfig(ctx context.Context) (configView, error) {
 	if err != nil {
 		return configView{}, fmt.Errorf("读 strm_prefix: %w", err)
 	}
+	// B2：显示归一化后的值（去尾 `/`）。手改进库的行也照样显示成真正参与拼接的形态。
+	prefix = strings.TrimRight(prefix, "/")
 	target, err := s.settings.Int(ctx, store.KeySegTargetSec)
 	if err != nil {
 		return configView{}, fmt.Errorf("读 seg_target_sec: %w", err)
 	}
-	prefetch, err := s.settings.Int(ctx, store.KeySegPrefetch)
+	cacheDir, err := s.settings.String(ctx, store.KeyCacheDir)
 	if err != nil {
-		return configView{}, fmt.Errorf("读 seg_prefetch: %w", err)
+		return configView{}, fmt.Errorf("读 cache_dir: %w", err)
 	}
-	pinDays, err := s.settings.Int(ctx, store.KeyPinDays)
+	cacheMaxMB, err := s.settings.Int(ctx, store.KeyCacheMaxMB)
 	if err != nil {
-		return configView{}, fmt.Errorf("读 pin_days: %w", err)
+		return configView{}, fmt.Errorf("读 cache_max_mb: %w", err)
+	}
+	cacheLRUDays, err := s.settings.Int(ctx, store.KeyCacheLRUDays)
+	if err != nil {
+		return configView{}, fmt.Errorf("读 cache_lru_days: %w", err)
 	}
 	out := configView{
 		StrmPrefix:   prefix,
 		SegTargetSec: target,
-		SegPrefetch:  prefetch,
-		PinDays:      pinDays,
+		CacheDir:     cacheDir,
+		CacheMaxMB:   cacheMaxMB,
+		CacheLRUDays: cacheLRUDays,
 	}
 	for _, item := range []struct {
 		key store.SettingKey
@@ -220,6 +223,11 @@ func (s *Server) readSource(ctx context.Context, src Source) sourceView {
 	v.Enabled = enabledErr == nil && enabled
 	v.BaseURL = baseURL
 	v.RequestTimeoutSec = timeoutSec
+	// 构造期注入的值来自装配根（启动时读到的就是它们），与现值不一致 = 改了还没重启。
+	v.BaseURLEffective = src.BootBaseURL
+	v.RequestTimeoutSecEffective = src.BootRequestTimeoutSec
+	v.RestartRequired = baseErr == nil && timeoutErr == nil &&
+		(baseURL != src.BootBaseURL || timeoutSec != src.BootRequestTimeoutSec)
 
 	// 三项都读出来再判原因：读失败的那一项会盖掉默认值，必须让人看见。
 	switch {
@@ -230,8 +238,9 @@ func (s *Server) readSource(ctx context.Context, src Source) sourceView {
 	case timeoutErr != nil:
 		v.Reason = settingErrReason(key(store.PluginItemRequestTimeout), timeoutErr)
 	case !v.Enabled:
+		// enabled=false 只管调度：手动同步（POST /api/dramas）与播放（/video）仍然可用。
 		v.Reason = "已在 settings 停用（" + string(key(store.PluginItemEnabled)) +
-			"=false）：不参与刷新调度"
+			"=false）：不参与刷新调度；手动同步与播放仍可用"
 	}
 	return v
 }
@@ -251,22 +260,5 @@ func (s *Server) settingIsSet(ctx context.Context, key store.SettingKey) (bool, 
 		return false, nil
 	default:
 		return false, fmt.Errorf("读 %s: %w", key, err)
-	}
-}
-
-// newCacheView 由 strm_prefix 推出缓存面现状：空 = 直连本服务（没有缓存），
-// 有值 = 播放字节经该前缀（缓存代理）转发。
-func newCacheView(prefix string) cacheView {
-	mode := "proxy"
-	if prefix == "" {
-		mode = "direct"
-	}
-	return cacheView{
-		Mode:    mode,
-		Prefix:  prefix,
-		MaxSize: cacheSuggestMaxSize,
-		MaxAge:  cacheSuggestMaxAge,
-		Flags:   cacheSuggestFlags,
-		Note:    "分片缓存由缓存代理淘汰（ADR-0004）；max_size / max_age 是建议值，不参与本服务运行逻辑。",
 	}
 }

@@ -68,10 +68,15 @@ func main() {
 	syncer := syncers[hongguo.Name]
 	sched := scheduler.New(st, settings, sourcePlugins, syncers, logger)
 
+	// 本地缓存（海报/分片/索引）与播放面的直链解析都只有一份实例：请求路径与
+	// 淘汰循环共用同一个 *cache.Cache，直链解析共用同一个 *stream.Resolver。
+	caches := cache.New(st, settings, logger)
+	resolver := stream.NewResolver(st, plugins)
+
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           newHandler(logger, st, settings, syncer, sched, sourceList(plugins)),
+		Handler:           newHandler(logger, st, settings, syncer, sched, sourceList(plugins), caches, resolver),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -80,7 +85,6 @@ func main() {
 
 	// 缓存淘汰与 HTTP 服务同寿命：启动即跑一轮，之后每 5 分钟一轮，ctx 一取消就停
 	// （docs/CACHE-MODEL.md「淘汰」）。与请求路径无关，失败只记录、下一轮重试。
-	caches := cache.New(st, settings, logger)
 	go caches.RunEviction(ctx)
 
 	// 调度器与 HTTP 服务同寿命：ctx 一取消它就停派新轮，并等手上的轮收尾。
@@ -125,47 +129,25 @@ func main() {
 // newHandler 装配顶层路由。cmd 是唯一的装配根：路由表在这里一眼可见，
 // 领域包只提供自己的 handler，不关心挂载点。
 //
-// /healthz、/webdav/（M4 只读 WebDAV）、/s/（M5 出流 + M6 分片 + M7 合并集）与 `/`
-// （R1 管理面：三页界面 + `/api/` 管理 API）都已接上真实实现。`/s/` 子树按 pattern
-// 具体度分工：分片端点、playlist 端点比 `/s/` 更具体，其余落到 stream.Server 的
-// `/s/` 兜底（单集出流或 501）。领域包之间互不 import（同 rank），跨包的签名/分派
-// 在装配根接上。
+// 播放面（docs/PLAYBACK-CONTRACT.md）只有两个口子：`/video/{id}.m3u8` 与
+// `/video/{id}/{seq}.ts`，单集与合并集同一路径形态，id 自带 HMAC 签名、不要 Basic。
+// `/webdav/` 是只读元数据面。1.0 的 `/dav/` 与 `/s/{token}/*` 已退役，不留兼容层
+// （`.strm` 是按请求渲染的，下一次读取就是新内容）。
 //
 // 管理面挂在 `/` 上：`internal/web` 自己按完整路径分派三页界面与 `/api/` 子树，
-// 未登记路径由它返回 404（「未知路径 → 404」的语义不变，只是兜底者从顶层 mux
-// 换成了 web 的 mux）。/webdav/ 与 /s/ 的 pattern 比 `/` 更具体，不受影响。
+// 未登记路径由它返回 404。/webdav/ 与 /video/ 的 pattern 比 `/` 更具体，不受影响。
 //
-// 请求日志中间件只在装配根挂一次：/healthz、/webdav/、/s/、/ 与未知路径都经它，
-// 每请求恰一条访问日志（token 段掩码，见 internal/httpx）。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source) http.Handler {
-	cutter := segment.NewCutter(st, settings, logger, stream.Verify)
-	streamSrv := stream.NewServer(st, settings, logger)
+// 请求日志中间件只在装配根挂一次：/healthz、/webdav/、/video/、/ 与未知路径都经它，
+// 每请求恰一条访问日志（见 internal/httpx）。
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver) http.Handler {
+	cutter := segment.NewCutter(st, settings, logger, caches, resolver.DirectURL)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.Handle(webdav.MountPath, webdav.NewHandler(vfs.NewTree(st, settings, signID, logger), settings, logger))
-	// 出流首个 URL（DESIGN §5.2）：uid 是合并集句柄时返回自造 m3u8，否则走单集 MP4
-	// 透传。Go 的 pattern 不能在路径段内按前缀分派，所以在这里按 uid 分派（cmd 可
-	// import 全部 internal 包，两个领域包仍互不 import）。
-	mux.HandleFunc("GET /s/{token}/e/{uid}", func(w http.ResponseWriter, r *http.Request) {
-		if segment.IsMergedUID(r.PathValue("uid")) {
-			cutter.ServePlaylist(w, r)
-			return
-		}
-		streamSrv.ServeHTTP(w, r)
-	})
-	// 合并集 playlist 的标准别名（部分客户端会自行追加 /master.m3u8）。
-	mux.HandleFunc(segment.PlaylistRoute, func(w http.ResponseWriter, r *http.Request) {
-		if !segment.IsMergedUID(r.PathValue("uid")) {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		cutter.ServePlaylist(w, r)
-	})
-	// 分片端点：签名校验用 stream.Verify 注入（segment 不能 import 同 rank 的 stream）。
-	mux.Handle(segment.Route, cutter)
-	// `/s/` 兜底：未单独注册的 `/s/` 子路径仍是 501（「已规划未实现」的既有语义）。
-	mux.Handle("/s/", streamSrv)
+	// 播放面两条路由由 internal/segment 自己提供（领域包只提供 handler，挂载点在此）。
+	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
+	mux.HandleFunc(segment.SegmentRoute, cutter.ServeSegment)
 	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, sources, logger))
 	return httpx.RequestLogger(logger, mux)
 }
@@ -258,8 +240,8 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
 }
 
-// signID 把 stream.ID 适配为 vfs.IDFunc：vfs（rank 30）不 import stream（rank 40），
-// 对外播放 id 的算法在装配根接上，见 docs/DEV-STANDARDS.md「虚拟文件树与渲染」。
+// signID 把 stream.ID 适配为 vfs.IDFunc：vfs（rank 30）只声明它需要一个「(secret, uid)
+// → 对外播放 id」的函数，算法在装配根接上（id 的生产方与校验方共用 stream.ID）。
 func signID(secret, uid string) string { return stream.ID(secret, uid) }
 
 func envOr(key, def string) string {

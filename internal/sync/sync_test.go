@@ -148,7 +148,7 @@ func dbCounts(t *testing.T, st *store.Store) (dramas, episodes int) {
 }
 
 // 入库字段与 1.0（internal/provider.SyncSeries）逐字段一致：一次上游请求、
-// 剧目字段映射、集齐全（下标即集号、vid 保留）、play_url 留空。
+// 剧目字段映射、集齐全（下标即集号、vid 保留）、直链不入库。
 func TestSyncSeriesWritesDramaAndEpisodes(t *testing.T) {
 	vids := fixtureVidList(t, "page-series.html")
 	fake, srv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series.html"))
@@ -216,9 +216,6 @@ func TestSyncSeriesWritesDramaAndEpisodes(t *testing.T) {
 		}
 		if ep.Title != "" || ep.DurationSec != 0 {
 			t.Fatalf("eps[%d] 编造了标题/时长：%q / %d", i, ep.Title, ep.DurationSec)
-		}
-		if ep.PlayURL != "" || ep.PlayURLAt != "" {
-			t.Fatalf("eps[%d] 写了 play_url：%q / %q（SSR 只有 10s 预览链，必须留空）", i, ep.PlayURL, ep.PlayURLAt)
 		}
 	}
 }

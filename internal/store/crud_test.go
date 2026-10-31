@@ -55,8 +55,7 @@ func assertDramaEqual(t *testing.T, got, want Drama) {
 func assertEpisodeEqual(t *testing.T, got, want Episode) {
 	t.Helper()
 	if got.DramaID != want.DramaID || got.EpNo != want.EpNo || got.Title != want.Title ||
-		got.DurationSec != want.DurationSec || got.Source != want.Source || got.Vid != want.Vid ||
-		got.PlayURL != want.PlayURL || got.PlayURLAt != want.PlayURLAt {
+		got.DurationSec != want.DurationSec || got.Source != want.Source || got.Vid != want.Vid {
 		t.Errorf("Episode 字段不一致：got %+v, want %+v", got, want)
 	}
 }
@@ -194,7 +193,7 @@ func TestByID(t *testing.T) {
 
 	epID, err := s.UpsertEpisode(ctx, Episode{
 		DramaID: dramaID, EpNo: 1, Title: "第一集", DurationSec: 300,
-		Source: "web", Vid: "v1", PlayURL: "http://s/1", PlayURLAt: "2026-10-01T00:00:00Z",
+		Source: "web", Vid: "v1",
 	})
 	if err != nil {
 		t.Fatalf("UpsertEpisode: %v", err)
@@ -205,7 +204,7 @@ func TestByID(t *testing.T) {
 	}
 	assertEpisodeEqual(t, wantEp, Episode{
 		ID: epID, DramaID: dramaID, EpNo: 1, Title: "第一集", DurationSec: 300,
-		Source: "web", Vid: "v1", PlayURL: "http://s/1", PlayURLAt: "2026-10-01T00:00:00Z",
+		Source: "web", Vid: "v1",
 	})
 
 	if _, err := s.DramaByID(ctx, 99999); !errors.Is(err, ErrNotFound) {
@@ -253,7 +252,7 @@ func TestUpsertEpisodeIdempotent(t *testing.T) {
 
 	first := Episode{
 		DramaID: dramaID, EpNo: 2, Title: "旧标题", DurationSec: 120,
-		Source: "web", Vid: "v1", PlayURL: "http://s/old", PlayURLAt: "2026-10-01T00:00:00Z",
+		Source: "web", Vid: "v1",
 	}
 	id1, err := s.UpsertEpisode(ctx, first)
 	if err != nil {
@@ -263,7 +262,7 @@ func TestUpsertEpisodeIdempotent(t *testing.T) {
 	second := first
 	second.Title = "新标题"
 	second.DurationSec = 125
-	second.PlayURL = "http://s/new"
+	second.Vid = "v2"
 	second.ID = id1 + 999
 	id2, err := s.UpsertEpisode(ctx, second)
 	if err != nil {
@@ -406,7 +405,7 @@ func TestFullFieldRoundtrip(t *testing.T) {
 
 	eID, err := s.UpsertEpisode(ctx, Episode{
 		DramaID: dID, EpNo: 7, Title: "第七集·重逢", DurationSec: 894,
-		Source: "app", Vid: "vid-7", PlayURL: "https://s.example.com/v7", PlayURLAt: "2026-10-29T08:05:00Z",
+		Source: "app", Vid: "vid-7",
 	})
 	if err != nil {
 		t.Fatalf("UpsertEpisode(full): %v", err)
@@ -417,7 +416,7 @@ func TestFullFieldRoundtrip(t *testing.T) {
 	}
 	assertEpisodeEqual(t, gotE, Episode{
 		ID: eID, DramaID: dID, EpNo: 7, Title: "第七集·重逢", DurationSec: 894,
-		Source: "app", Vid: "vid-7", PlayURL: "https://s.example.com/v7", PlayURLAt: "2026-10-29T08:05:00Z",
+		Source: "app", Vid: "vid-7",
 	})
 }
 

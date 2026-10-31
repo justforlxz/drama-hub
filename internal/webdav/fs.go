@@ -207,7 +207,7 @@ func notExist(name string) error {
 
 // entry 是 os.FileInfo 实现：一个目录或一个已渲染的文件。
 //
-// ModTime 是零值：库里没有可靠的修改时间（`sync_at` / `play_url_at` 是采集时间），
+// ModTime 是零值：库里没有可靠的修改时间（`sync_at` 是采集时间），
 // 而零值正是「未知」——http.ServeContent 对零值不写 Last-Modified，比伪造一个时间
 // 诚实。长度只有 size 一个字段，来自 len(渲染字节)。
 type entry struct {

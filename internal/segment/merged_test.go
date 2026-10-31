@@ -4,10 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,107 +15,44 @@ import (
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
-// mergedRig 组装合并集测试台：一部剧 + 两集真视频 + 各集分片索引 + 一个合并组。
+// mergedRig 在基础测试台上再加一个合并组：两集各 indexTarget 秒，成员按 1→2 顺序。
 //
-// 返回 (cutter, store, settings, merged uid, 每集源时长之和)。
-func mergedRig(t *testing.T, segTarget string) (*Cutter, *store.Store, *store.Settings, string, float64) {
+// 返回 (rig, 合并集 uid, 两集源时长之和)。
+func mergedRig(t *testing.T, segTarget string) (*rig, string, float64) {
 	t.Helper()
-	ctx := context.Background()
-	dir := t.TempDir()
-
-	var sourceURLs []string
+	r := newRig(t, segTarget)
 	var sum float64
 	for i := 1; i <= 2; i++ {
-		path := filepath.Join(dir, fmt.Sprintf("ep%d.mp4", i))
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("m%d.mp4", i))
 		makeVideo(t, path, 6)
-		body, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("读取 fixture %d: %v", i, err)
-		}
 		sum += probeDuration(t, path)
-		sourceURLs = append(sourceURLs, newSource(t, body).URL+"/ep.mp4")
+		r.addEpisode(t, i, 6)
 	}
-
-	db := newTestDB(t)
-	st := store.NewStore(db.DB)
-	settings := store.NewSettings(db.DB)
-	if err := settings.Set(ctx, store.KeyStreamSecret, testSecret); err != nil {
-		t.Fatalf("Set stream_secret: %v", err)
-	}
-	if err := settings.Set(ctx, store.KeySegTargetSec, segTarget); err != nil {
-		t.Fatalf("Set seg_target_sec: %v", err)
-	}
-
-	dramaID, err := st.UpsertDrama(ctx, store.Drama{Provider: "web", ProviderID: "mg1", Title: "合并剧", Year: 2026})
+	ids := make([]int64, 0, 2)
+	eps, err := r.st.ListEpisodes(context.Background(), r.dramaID)
 	if err != nil {
-		t.Fatalf("UpsertDrama: %v", err)
+		t.Fatalf("ListEpisodes: %v", err)
 	}
-	ids := make([]int64, 0, len(sourceURLs))
-	for i, u := range sourceURLs {
-		id, err := st.UpsertEpisode(ctx, store.Episode{
-			DramaID: dramaID, EpNo: i + 1, Source: "web", Vid: fmt.Sprintf("v%d", i+1), PlayURL: u,
-		})
-		if err != nil {
-			t.Fatalf("UpsertEpisode %d: %v", i+1, err)
-		}
-		ids = append(ids, id)
+	for _, ep := range eps {
+		ids = append(ids, ep.ID)
 	}
-
-	c := NewCutter(st, settings, slog.New(slog.NewJSONHandler(io.Discard, nil)), realVerify)
-	// 索引两集（合并时间轴依赖每集的 segment 表）。
-	for _, id := range ids {
-		if _, err := c.Index(ctx, id); err != nil {
-			t.Fatalf("Index(%d): %v", id, err)
-		}
-	}
-	gid, err := st.CreateMergeGroup(ctx, dramaID, "第1-2集", ids)
+	gid, err := r.st.CreateMergeGroup(context.Background(), r.dramaID, "第1-2集", ids)
 	if err != nil {
 		t.Fatalf("CreateMergeGroup: %v", err)
 	}
-	uid := "m" + strconv.FormatInt(gid, 10)
-	return c, st, settings, uid, sum
+	return r, "m" + strconv.FormatInt(gid, 10), sum
 }
 
-// playlistServer 起一个只挂分片路由与 playlist 路由的 httptest 服务，返回 playlist URL。
-//
-// 走真实装配形态：与 cmd 相同的两个 pattern（segment.Route + segment.PlaylistRoute）。
-func playlistServer(t *testing.T, c *Cutter, uid string) string {
-	t.Helper()
-	mux := http.NewServeMux()
-	mux.Handle(segmentRouteForTest(), c)
-	mux.Handle(PlaylistRoute, http.HandlerFunc(c.ServePlaylist))
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv.URL + "/s/" + signFor(uid) + "/e/" + uid + "/master.m3u8"
-}
-
-// segmentRouteForTest 复刻 cmd 注册分片端点用的常量（避免测试里再写一遍 pattern）。
-func segmentRouteForTest() string { return Route }
-
-// probeURL 用 ffprobe 量一个 HTTP 资源（playlist）的时长（测试侧独立测量）。
-func probeURL(t *testing.T, url string) float64 {
-	t.Helper()
-	out, err := exec.Command("ffprobe", "-v", "error",
-		"-show_entries", "format=duration", "-of", "csv=p=0", url).Output()
-	if err != nil {
-		t.Fatalf("ffprobe %s: %v", url, err)
-	}
-	v, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
-	if err != nil {
-		t.Fatalf("解析 ffprobe 时长 %q: %v", out, err)
-	}
-	return v
-}
-
-// AC1 + AC2：playlist 的 EXTINF 总时长 = 各集之和，且集边界恰好一个 DISCONTINUITY。
+// TestBuildPlaylist_TimelineAndDiscontinuity 覆盖 playlist 的纯函数形态：
+// EXTINF 总时长 = 时间轴总时长、集边界恰好一个 DISCONTINUITY、URI 指回 /video。
 func TestBuildPlaylist_TimelineAndDiscontinuity(t *testing.T) {
 	tl := NewTimeline([]EpisodeSegments{
 		{EpisodeID: 11, EpNo: 1, Segments: []store.Segment{{StartSec: 0, Dur: 4}, {StartSec: 4, Dur: 4}}},
 		{EpisodeID: 22, EpNo: 2, Segments: []store.Segment{{StartSec: 0, Dur: 5}, {StartSec: 5, Dur: 3}}},
 	})
-	body := string(BuildPlaylist("m7", "TOK", tl.slices))
+	body := string(BuildPlaylist("m7-0123456789ab", tl.slices))
 
-	if !strings.HasPrefix(body, "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n") {
+	if !strings.HasPrefix(body, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD\n") {
 		t.Errorf("playlist 头不对：\n%s", body)
 	}
 	if !strings.HasSuffix(body, "#EXT-X-ENDLIST\n") {
@@ -128,9 +62,9 @@ func TestBuildPlaylist_TimelineAndDiscontinuity(t *testing.T) {
 	if !strings.Contains(body, "#EXT-X-TARGETDURATION:5\n") {
 		t.Errorf("TARGETDURATION 应为最大片长向上取整 5：\n%s", body)
 	}
-	// 每个分片一行 EXTINF + 一行 URI，URI 带 token/uid/seq。
+	// 每个分片一行 EXTINF + 一行 URI，URI 是 /video/{id}/{seq}.ts。
 	for seq := 0; seq < tl.Len(); seq++ {
-		want := "/s/TOK/seg/m7/" + strconv.Itoa(seq) + ".ts\n"
+		want := "/video/m7-0123456789ab/" + strconv.Itoa(seq) + ".ts\n"
 		if !strings.Contains(body, want) {
 			t.Errorf("playlist 缺分片 %q：\n%s", want, body)
 		}
@@ -138,7 +72,7 @@ func TestBuildPlaylist_TimelineAndDiscontinuity(t *testing.T) {
 	if got, want := strings.Count(body, "#EXTINF:"), tl.Len(); got != want {
 		t.Errorf("EXTINF 行数 = %d, 期望 %d", got, want)
 	}
-	// AC2：4 片、两集 → 恰一个集边界 DISCONTINUITY。
+	// 4 片、两集 → 恰一个集边界 DISCONTINUITY。
 	if got := strings.Count(body, "#EXT-X-DISCONTINUITY"); got != 1 {
 		t.Errorf("DISCONTINUITY 数 = %d, 期望 1（集边界）：\n%s", got, body)
 	}
@@ -161,45 +95,40 @@ func TestBuildPlaylist_TimelineAndDiscontinuity(t *testing.T) {
 	one := NewTimeline([]EpisodeSegments{
 		{EpisodeID: 11, EpNo: 1, Segments: []store.Segment{{StartSec: 0, Dur: 4}, {StartSec: 4, Dur: 4}}},
 	})
-	if got := strings.Count(string(BuildPlaylist("e1", "TOK", one.slices)), "#EXT-X-DISCONTINUITY"); got != 0 {
+	if got := strings.Count(string(BuildPlaylist("e1-0123456789ab", one.slices)), "#EXT-X-DISCONTINUITY"); got != 0 {
 		t.Errorf("单集 playlist 出现 %d 个 DISCONTINUITY, 期望 0", got)
 	}
 }
 
-// AC1 + AC3：真 ffprobe 解析自造 playlist，总时长 ≈ 各集之和；真 ffmpeg 全程解码无错。
-//
-// 这是 M7 的核心端到端断言：playlist 与分片 URL 都由真 handler 提供，ffmpeg 逐片回源。
-func TestPlaylist_FFprobeAndDecodeEndToEnd(t *testing.T) {
-	c, _, _, uid, wantDuration := mergedRig(t, "4")
-	url := playlistServer(t, c, uid)
+// TestPlaylist_MergedEndToEnd 是合并集的端到端断言：playlist 与分片都由真 handler
+// 提供，真 ffprobe 量总时长、真 ffmpeg 逐片回源解码无错。
+func TestPlaylist_MergedEndToEnd(t *testing.T) {
+	r, uid, wantDuration := mergedRig(t, "4")
 
-	// AC2 先看内容：两集 → 一个 DISCONTINUITY。
-	resp, err := http.Get(url) //nolint:noctx // 测试内短请求
-	if err != nil {
-		t.Fatalf("GET playlist: %v", err)
+	rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+".m3u8")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
 	}
-	body, _ := readAll(t, resp)
-	if got := strings.Count(string(body), "#EXT-X-DISCONTINUITY"); got != 1 {
+	body := rec.Body.String()
+	if got := strings.Count(body, "#EXT-X-DISCONTINUITY"); got != 1 {
 		t.Fatalf("playlist 的 DISCONTINUITY 数 = %d, 期望 1：\n%s", got, body)
 	}
-	if cl := resp.Header.Get("Content-Length"); cl != strconv.Itoa(len(body)) {
-		t.Errorf("Content-Length = %q, body = %d 字节", cl, len(body))
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != "application/vnd.apple.mpegurl" {
+	if ct := rec.Header().Get("Content-Type"); ct != "application/vnd.apple.mpegurl" {
 		t.Errorf("Content-Type = %q, 期望 application/vnd.apple.mpegurl", ct)
 	}
-
-	// AC1：ffprobe 解析出的总时长 ≈ 各集之和（±一帧）。
-	got := probeURL(t, url)
-	if diff := got - wantDuration; diff > 0.1 || diff < -0.1 {
-		t.Errorf("ffprobe playlist 时长 = %v, 各集之和 = %v（差 %v）", got, wantDuration, diff)
+	if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(rec.Body.Len()) {
+		t.Errorf("Content-Length = %q, body = %d 字节", cl, rec.Body.Len())
 	}
 
-	// AC3：ffmpeg 合流解码返回 0 且无解码错误。
-	//
-	// stderr 里允许出现 "non monotonically increasing dts" 告警：那是 M6 已交付的
-	// `-c copy` 分段在集内相邻片边界重复包含边界关键帧的固有产物（`-ss` 前置 +
-	// `-t` 的行为，exit code 仍为 0，不丢内容）；本模块的绝对时间戳只保证跨集不回退。
+	// 真服务起在本地端口，让 ffprobe/ffmpeg 通过 HTTP 逐片回源。
+	srv := newPlaybackServer(t, r)
+	url := srv + "/video/" + r.id(uid) + ".m3u8"
+	if got := probeURL(t, url); got-wantDuration > 0.1 || got-wantDuration < -0.1 {
+		t.Errorf("ffprobe playlist 时长 = %v, 各集之和 = %v（差 %v）", got, wantDuration, got-wantDuration)
+	}
+
+	// ffmpeg 合流解码返回 0 且无解码错误。stderr 里允许 "non monotonically
+	// increasing dts"：那是 `-c copy` 分段在片边界重复包含边界关键帧的固有产物。
 	cmd := exec.Command("ffmpeg", "-v", "error", "-i", url, "-f", "null", "-")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -214,18 +143,23 @@ func TestPlaylist_FFprobeAndDecodeEndToEnd(t *testing.T) {
 	}
 }
 
-// AC：合并集分片按跨集时间轴解析——seq 属于哪一集、切成哪一段，与 Timeline 逐项一致。
+// TestMergedSlice_CrossEpisode 覆盖跨集分片：seq 属于哪一集、切成哪一段，与 Timeline
+// 逐项一致；越界 seq 与非法合并 uid 都是 404。
 func TestMergedSlice_CrossEpisode(t *testing.T) {
-	c, st, _, uid, _ := mergedRig(t, "4")
+	r, uid, _ := mergedRig(t, "4")
 	ctx := context.Background()
+	// 先请求 playlist：合并组的分片索引由这次请求按需建立。
+	if rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+".m3u8"); rec.Code != http.StatusOK {
+		t.Fatalf("playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
 
-	members, err := st.ListMergeMembers(ctx, 1)
+	members, err := r.st.ListMergeMembers(ctx, 1)
 	if err != nil {
 		t.Fatalf("ListMergeMembers: %v", err)
 	}
 	var eps []EpisodeSegments
 	for _, m := range members {
-		segs, err := st.ListSegments(ctx, m.EpisodeID)
+		segs, err := r.st.ListSegments(ctx, m.EpisodeID)
 		if err != nil {
 			t.Fatalf("ListSegments(%d): %v", m.EpisodeID, err)
 		}
@@ -234,14 +168,13 @@ func TestMergedSlice_CrossEpisode(t *testing.T) {
 	tl := NewTimeline(eps)
 
 	for seq := 0; seq < tl.Len(); seq++ {
-		rec := serveSeg(t, c, http.MethodGet, "/s/"+signFor(uid)+"/seg/"+uid+"/"+strconv.Itoa(seq)+".ts")
+		rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+"/"+strconv.Itoa(seq)+".ts")
 		if rec.Code != http.StatusOK {
 			t.Fatalf("seq=%d 状态码 = %d, 期望 200（body=%s）", seq, rec.Code, rec.Body.String())
 		}
 		if rec.Body.Bytes()[0] != 0x47 {
 			t.Errorf("seq=%d 首字节 = 0x%02x, 期望 0x47（MPEG-TS）", seq, rec.Body.Bytes()[0])
 		}
-		// 切片长度与时间轴上该 seq 的 Dur 相符（±一帧 + TS 起始偏移）。
 		tsPath := filepath.Join(t.TempDir(), fmt.Sprintf("s%d.ts", seq))
 		if err := os.WriteFile(tsPath, rec.Body.Bytes(), 0o644); err != nil {
 			t.Fatalf("写切片: %v", err)
@@ -252,86 +185,72 @@ func TestMergedSlice_CrossEpisode(t *testing.T) {
 		}
 	}
 
-	// 越界 seq → 404；非法合并 uid（m0 / m-1）→ 404。
 	last := tl.Len() - 1
 	for _, bad := range []string{strconv.Itoa(last + 1), "-1"} {
-		if rec := serveSeg(t, c, http.MethodGet, "/s/"+signFor(uid)+"/seg/"+uid+"/"+bad+".ts"); rec.Code != http.StatusNotFound {
+		if rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+"/"+bad+".ts"); rec.Code != http.StatusNotFound {
 			t.Errorf("越界 seq %s 状态码 = %d, 期望 404", bad, rec.Code)
 		}
 	}
-	for _, badUID := range []string{"m0", "m-1"} {
-		if rec := serveSeg(t, c, http.MethodGet, "/s/"+signFor(badUID)+"/seg/"+badUID+"/0.ts"); rec.Code != http.StatusNotFound {
-			t.Errorf("非法合并 uid %q 状态码 = %d, 期望 404", badUID, rec.Code)
+	// `m-1` 不在这里：id 形态是 `<uid>-<签名>`，uid 里带 `-` 时拆出的 uid 就不是 `m-1`，
+	// 按契约落 401（签名不对）而不是 404。真实 uid 永远不含 `-`（`e<id>` / `m<id>`）。
+	for _, badUID := range []string{"m0", "m99999"} {
+		if rec := r.do(t, http.MethodGet, "/video/"+r.id(badUID)+".m3u8"); rec.Code != http.StatusNotFound {
+			t.Errorf("非法/未知合并 uid %q 状态码 = %d, 期望 404", badUID, rec.Code)
 		}
 	}
 }
 
-// AC：组内某一集索引未就绪 → playlist 与分片都 503 + Retry-After（不出半截流）。
-func TestMerged_IndexMissingIs503(t *testing.T) {
-	c, st, _, uid, _ := mergedRig(t, "4")
+// TestMerged_IndexOnDemand 覆盖「索引按需建立」对合并组同样成立：清掉某成员的索引后
+// 再请求，索引被重建而不是 503（禁止批量预建，但不等于不给播）。
+func TestMerged_IndexOnDemand(t *testing.T) {
+	r, uid, _ := mergedRig(t, "4")
 	ctx := context.Background()
+	if rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+".m3u8"); rec.Code != http.StatusOK {
+		t.Fatalf("首次 playlist 状态码 = %d, 期望 200", rec.Code)
+	}
 
-	// 清掉第二集的索引（模拟只索引了一半）。
-	members, err := st.ListMergeMembers(ctx, 1)
+	members, err := r.st.ListMergeMembers(ctx, 1)
 	if err != nil {
 		t.Fatalf("ListMergeMembers: %v", err)
 	}
-	if err := st.ReplaceSegments(ctx, members[1].EpisodeID, nil); err != nil {
-		t.Fatalf("清空第二集索引: %v", err)
+	cleared := members[1].EpisodeID
+	if err := r.st.ReplaceSegments(ctx, cleared, nil); err != nil {
+		t.Fatalf("清空成员索引: %v", err)
 	}
 
-	// playlist：503 + Retry-After。
-	rec := servePlaylist(t, c, uid)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("索引不全时 playlist 状态码 = %d, 期望 503（body=%s）", rec.Code, rec.Body.String())
+	rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+".m3u8")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("成员索引缺失时 playlist 状态码 = %d, 期望 200（按需重建；body=%s）", rec.Code, rec.Body.String())
 	}
-	if ra := rec.Header().Get("Retry-After"); ra == "" {
-		t.Error("503 playlist 应带 Retry-After")
+	segs, err := r.st.ListSegments(ctx, cleared)
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
 	}
-
-	// 分片：同样 503 + Retry-After（不是 404、不是半截流）。
-	rec = serveSeg(t, c, http.MethodGet, "/s/"+signFor(uid)+"/seg/"+uid+"/0.ts")
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("索引不全时分片状态码 = %d, 期望 503", rec.Code)
+	if len(segs) == 0 {
+		t.Error("成员索引没有被按需重建（库里仍是空的）")
 	}
 }
 
-// AC：合并集 playlist 的鉴权与单集一致——坏签名 401，未知组 404。
+// TestPlaylist_AuthAndUnknownGroup 覆盖合并集的鉴权：坏签名 401（签名绑定 uid）。
 func TestPlaylist_AuthAndUnknownGroup(t *testing.T) {
-	c, _, _, uid, _ := mergedRig(t, "4")
+	r, _, _ := mergedRig(t, "4")
 
-	if rec := servePlaylistWithToken(t, c, uid, "bogus"); rec.Code != http.StatusUnauthorized {
+	if rec := r.do(t, http.MethodGet, "/video/bogus-signature.m3u8"); rec.Code != http.StatusUnauthorized {
 		t.Errorf("坏签名 playlist 状态码 = %d, 期望 401", rec.Code)
 	}
-	unknown := "m99999"
-	if rec := servePlaylist(t, c, unknown); rec.Code != http.StatusNotFound {
-		t.Errorf("未知合并组 playlist 状态码 = %d, 期望 404", rec.Code)
+}
+
+// probeURL 用 ffprobe 量一个 HTTP 资源（playlist）的时长（测试侧独立测量）。
+func probeURL(t *testing.T, url string) float64 {
+	t.Helper()
+	out, err := exec.Command("ffprobe", "-v", "error",
+		"-show_entries", "format=duration", "-of", "csv=p=0", url).Output()
+	if err != nil {
+		t.Fatalf("ffprobe %s: %v", url, err)
 	}
-}
-
-// servePlaylist 直接调 ServePlaylist（带正确签名）。
-func servePlaylist(t *testing.T, c *Cutter, uid string) *httptest.ResponseRecorder {
-	t.Helper()
-	return servePlaylistWithToken(t, c, uid, signFor(uid))
-}
-
-// servePlaylistWithToken 用给定 token 请求 playlist（token 由调用方构造）。
-func servePlaylistWithToken(t *testing.T, c *Cutter, uid, token string) *httptest.ResponseRecorder {
-	t.Helper()
-	mux := http.NewServeMux()
-	mux.Handle(PlaylistRoute, http.HandlerFunc(c.ServePlaylist))
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/s/"+token+"/e/"+uid+"/master.m3u8", nil))
-	return rec
-}
-
-// readAll 读完整响应体并关闭。
-func readAll(t *testing.T, resp *http.Response) ([]byte, error) {
-	t.Helper()
-	defer func() { _ = resp.Body.Close() }()
-	buf := &bytes.Buffer{}
-	if _, err := buf.ReadFrom(resp.Body); err != nil {
-		return nil, err
+	v, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		t.Fatalf("解析 ffprobe 时长 %q: %v", out, err)
 	}
-	return buf.Bytes(), nil
+	return v
 }

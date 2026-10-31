@@ -35,9 +35,8 @@ type Drama struct {
 }
 
 // Episode 是 episode 表的一行，对应某部剧的一集。
-//
-// ID 是输出字段：UpsertEpisode 忽略入参 ID。PlayURLAt 是不透明 TEXT（UTC
-// RFC3339），语义同 Drama.SyncAt。
+// ID 是输出字段：UpsertEpisode 忽略入参 ID。直链不落库（0004 已删 play_url /
+// play_url_at），播放时由出流按需向插件解析。
 type Episode struct {
 	ID          int64
 	DramaID     int64
@@ -46,8 +45,6 @@ type Episode struct {
 	DurationSec int
 	Source      string
 	Vid         string
-	PlayURL     string
-	PlayURLAt   string
 }
 
 // dbtx 是 Store 实际使用的 SQL 句柄：*sql.DB（根 Store）与 *sql.Tx（事务内
@@ -99,7 +96,7 @@ func (s *Store) InTx(ctx context.Context, fn func(tx *Store) error) error {
 const dramaColumns = `SELECT id, provider, provider_id, title, year, plot, cover_url, episode_total, sync_at, genre, tags, shard FROM drama`
 
 // episodeColumns 是 episode 表的显式列清单，顺序必须与 scanEpisode 的 Scan 顺序一致。
-const episodeColumns = `SELECT id, drama_id, ep_no, title, duration_sec, source, vid, play_url, play_url_at FROM episode`
+const episodeColumns = `SELECT id, drama_id, ep_no, title, duration_sec, source, vid FROM episode`
 
 // scanDrama 按 dramaColumns 的顺序读出一行；scan 传 *sql.Row.Scan 或 *sql.Rows.Scan。
 func scanDrama(scan func(dest ...any) error) (Drama, error) {
@@ -113,7 +110,7 @@ func scanDrama(scan func(dest ...any) error) (Drama, error) {
 // scanEpisode 按 episodeColumns 的顺序读出一行。
 func scanEpisode(scan func(dest ...any) error) (Episode, error) {
 	var e Episode
-	if err := scan(&e.ID, &e.DramaID, &e.EpNo, &e.Title, &e.DurationSec, &e.Source, &e.Vid, &e.PlayURL, &e.PlayURLAt); err != nil {
+	if err := scan(&e.ID, &e.DramaID, &e.EpNo, &e.Title, &e.DurationSec, &e.Source, &e.Vid); err != nil {
 		return Episode{}, err
 	}
 	return e, nil
@@ -281,23 +278,20 @@ func (s *Store) StaleProviderIDs(ctx context.Context, provider string, limit int
 
 // UpsertEpisode 以 (drama_id, ep_no) 为身份写入或更新一集，返回行 id。
 //
-// 冲突时只更新可变态（title / duration_sec / source / vid / play_url / play_url_at），
-// drama_id 与 ep_no 是身份、不被覆盖。入参 ID 被忽略。唯一/主键约束冲突返回
-// ErrConflict。
+// 冲突时只更新可变态（title / duration_sec / source / vid），drama_id 与 ep_no 是
+// 身份、不被覆盖。入参 ID 被忽略。唯一/主键约束冲突返回 ErrConflict。
 func (s *Store) UpsertEpisode(ctx context.Context, e Episode) (int64, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx,
-		`INSERT INTO episode(drama_id, ep_no, title, duration_sec, source, vid, play_url, play_url_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO episode(drama_id, ep_no, title, duration_sec, source, vid)
+		 VALUES(?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(drama_id, ep_no) DO UPDATE
 		 SET title = excluded.title,
 		     duration_sec = excluded.duration_sec,
 		     source = excluded.source,
-		     vid = excluded.vid,
-		     play_url = excluded.play_url,
-		     play_url_at = excluded.play_url_at
+		     vid = excluded.vid
 		 RETURNING id`,
-		e.DramaID, e.EpNo, e.Title, e.DurationSec, e.Source, e.Vid, e.PlayURL, e.PlayURLAt,
+		e.DramaID, e.EpNo, e.Title, e.DurationSec, e.Source, e.Vid,
 	).Scan(&id)
 	if err != nil {
 		return 0, wrapWriteErr("写入集", err)

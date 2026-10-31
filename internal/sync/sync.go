@@ -59,7 +59,7 @@ func (s *Syncer) Name() string { return s.source.Name() }
 // 入库字段与 1.0（internal/provider.SyncSeries）逐字段一致：provider / source = 插件名、
 // provider_id = 作品 id、year 由上游首见时间推出、episode_total = 集表长度、
 // episode.vid 取插件的源侧集标识；episode.title / duration_sec 留零值（源侧批量拿不到），
-// play_url 不写（同步只保证剧与集齐全，见 docs/DEV-STANDARDS.md「play_url 留空的契约」）。
+// 直链不落库（同步只保证剧与集齐全，见 docs/DEV-STANDARDS.md「直链不落库的契约」）。
 // 2.0 新增三列按 docs/DATA-MODEL.md「类型 / 分类」落：genre = Genres[0]（主类型，
 // 空 = 上游未声明）、tags = 全部标签的 JSON 数组（保真）、shard 由 store 按身份派生。
 //

@@ -27,6 +27,9 @@ type Slice struct {
 	// 切片时传给 ffmpeg 的 -output_ts_offset，保证跨集 DTS 连续、播放器不
 	// 因时间戳回退而丢帧（EXT-X-DISCONTINUITY 之外的第二道保险）。
 	OffsetSec float64
+	// CodecSig 是该分片所属集的编码签名，参与分片缓存键
+	// （cache.SegmentKey：不同编码参数的源不能命中同一个文件）。
+	CodecSig string
 }
 
 // Timeline 是把若干集的分片按给定顺序拼成的合并时间轴。seq 从 0 起连续，
@@ -52,6 +55,7 @@ func NewTimeline(eps []EpisodeSegments) *Timeline {
 				StartSec:  seg.StartSec,
 				Dur:       seg.Dur,
 				OffsetSec: offset,
+				CodecSig:  seg.CodecSig,
 			})
 			offset += seg.Dur
 		}

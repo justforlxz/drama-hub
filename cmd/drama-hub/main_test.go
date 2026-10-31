@@ -53,14 +53,18 @@ func newTestHandler(t *testing.T) http.Handler {
 		testSyncer(), fakeSchedule{}, testSources(), nil)
 }
 
-// newAssembly 按 main 的装配顺序造 handler：缓存实例 + 直链解析器 + 路由表。
-// reg 为 nil 时用一个空注册表（任何 Resolve 都会失败，播放面据此回 502）。
+// newAssembly 按 main 的装配顺序造 handler：缓存实例 + 直链解析器 + 播放面出站身份
+// + 路由表。reg 为 nil 时用一个空注册表（任何 Resolve 都会失败，播放面据此回 502）。
+//
+// 出站身份走与 main 同一个派生函数（playbackHeaders），这里给一份无人使用的 boots：
+// 装配测试不真取直链，但注入链路必须与生产一致，否则这条缝只在真机上才被走过。
 func newAssembly(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, reg *plugin.Registry) http.Handler {
 	if reg == nil {
 		reg = plugin.NewRegistry()
 	}
 	return newHandler(logger, st, settings, syncer, schedule, sources,
-		cache.New(st, settings, logger), stream.NewResolver(st, reg))
+		cache.New(st, settings, logger), stream.NewResolver(st, reg),
+		playbackHeaders(map[string]pluginBoot{}))
 }
 
 // stubSource 是装配测试用的最小插件：Resolve 恒给同一个直链。
@@ -606,6 +610,11 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 	if !ok {
 		t.Fatalf("注册表里没有 %q：装配根必须显式注册内置插件", hongguo.Name)
 	}
+	// 播放面的出站身份取的是同一份 boots：MKACG-616 把 base_url 改成经 pluginBoot
+	// 注入后，这条缝最容易退化成「页面用了配置、ffmpeg 用了默认」。
+	if got, want := playbackHeaders(boots), "Referer: "+site.URL+"/"; got[1] != want {
+		t.Fatalf("播放面 Referer = %q, 期望 %q（跟随 pluginBoot.BaseURL）", got[1], want)
+	}
 	h := newAssembly(logger, st, settings, sync.New(p, nil), fakeSchedule{}, sourceList(reg, boots), reg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/dramas", strings.NewReader(`{"series_id":"7503745441910017049"}`))
@@ -781,7 +790,8 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 
 	logger := slog.New(slog.DiscardHandler)
 	cutter := segment.NewCutter(st, settings, logger, cache.New(st, settings, logger),
-		func(_ context.Context, ep store.Episode) (string, error) { return urls[ep.ID], nil })
+		func(_ context.Context, ep store.Episode) (string, error) { return urls[ep.ID], nil },
+		playbackHeaders(nil))
 	mux := http.NewServeMux()
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
 	tree := vfs.NewTree(st, settings, stream.ID, logger)

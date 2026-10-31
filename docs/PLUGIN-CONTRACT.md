@@ -158,6 +158,13 @@ type Plugin interface {
 6. **`Enumerate` 返回的 `WorkRef.Plugin` MUST 等于 `Name()`。** 框架会校验，
    不等即按 `ErrSchema` 处理（这是插件实现 bug，不是上游问题）。
 7. **`Work` 返回的 `Episodes[i].No` MUST 等于 `i+1`。** 不连续即 `ErrSchema`。
+8. **出站请求 MUST 带源侧要的身份（UA / `Accept` / `Accept-Language` / `Referer`）。**
+   Go 默认 UA（`Go-http-client/1.1`）是明显的非浏览器标识，而源侧风控是既定事实
+   （实测红果跑到约 1 万次 `/player` 后全量回 444，见「错误语义」`ErrRejected` 行）。
+   身份是「浏览器长什么样」的事实，**MUST NOT** 做成 settings 键（没有用户会调它）；
+   红果这一份写在 `internal/plugin/hongguo` 的常量里，播放链路的 `-headers`
+   由装配根从同一份常量生成（`PlaybackHeaderLines`），不另写一份 UA。
+   实测证据与取舍见 MKACG-624。
 
 ## 错误语义
 

@@ -117,6 +117,40 @@ Emby 库路径指向 `/mnt/dramahub`（DAV 根即剧集库根），类型选「�
 库根仍是 `/webdav`，Emby 逐层往下扫。若 Emby 在 DAV 根上把分类当成剧，退一步把具体
 分类目录（`/webdav/爱情` 等）逐个加成媒体文件夹。
 
+## 容器镜像
+
+`main` 与任意分支的每次 push 都会构建镜像，ci 全绿才推到
+`ghcr.io/justforlxz/drama-hub`（口径见 `docs/adr/0008-image-publish.md`）。
+
+```bash
+podman pull ghcr.io/justforlxz/drama-hub:latest
+podman run -d --name drama-hub -p 8080:8080 \
+  --userns=keep-id -v "$PWD/data:/data:Z" \
+  ghcr.io/justforlxz/drama-hub:latest
+curl -s localhost:8080/healthz                        # 200 {"status":"ok"}
+podman logs drama-hub | head -1                        # version / commit 与构建参数一致
+```
+
+| tag | 什么时候更新 |
+|---|---|
+| `sha-<7位>` | 每次 push（`main` 与任意分支）；不可变——同一个 commit 永远同一份字节 |
+| `latest` | **只在 `main`**；分支与 tag 构建不动它 |
+| `vX.Y.Z` | 推 `v*` tag 时 |
+
+- 两个平台在同一个 manifest list 里：`linux/amd64`、`linux/arm64`（`docker manifest inspect` 除这两个平台外还有 buildx 的 provenance 清单，`unknown/unknown`，属正常）。
+- **门禁**：lint 与容器测试都过才发布（`needs: [lint, test]`）；ci 红就是没有任何 tag 被推。
+- 构建参数 `VERSION` / `COMMIT` 经 `-ldflags` 打进二进制，起服务的日志第一行即为实际值。
+- 镜像内 `USER app`（uid 1000）、`VOLUME ["/data"]`、`EXPOSE 8080`，默认
+  `DRAMA_HUB_ADDR=:8080`、`DRAMA_HUB_DB=/data/drama.db`；挂 `/data` 即持久化（含分片缓存）。
+- **绑宿主目录要带 `--userns=keep-id`（与 `make run` 一致）**：rootless podman 会把容器内的
+  uid 1000 映射到 subuid，写不进属主是宿主用户的目录（实测报 `unable to open database file`）。
+  不挂卷时 `podman run -p 8080:8080 <image>` 直接可用，数据落在匿名卷里。
+- 起服务后调度器会立刻按默认间隔抓一次源，日志里有 `上游请求` 属正常。
+- ghcr 包默认私有：拉取前先 `podman login ghcr.io -u <user> -p <带 read:packages 的 PAT>`。
+- 首次配置入口还在 MKACG-616：镜像能起来、能跑，但对外推荐使用要等那一步落地。
+
+自己构建同一份镜像是 `make image`（`ENGINE=podman`，默认只出本机平台）。
+
 ## 开发环境
 
 生产与测试共用同一个镜像，ffmpeg 版本由镜像固定（见 `env.lock`）：
@@ -152,6 +186,7 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
   - `docs/L1-CORPUS-SCOPE.md` — 「获取全部的剧集」口径与红果实测数字
   - `docs/adr/0006-framework-plugin-boundary.md` — 框架 / 插件边界决策
   - `docs/adr/0007-own-hls-and-local-cache.md` — 播放统一走自造 HLS、缓存收回本服务
+  - `docs/adr/0008-image-publish.md` — 镜像发布口径：ghcr、双架构、ci 绿才发、`latest` 跟 main
 
 ## 状态
 

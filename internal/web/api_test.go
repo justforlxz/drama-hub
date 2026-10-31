@@ -91,7 +91,7 @@ func newTestServer(t *testing.T) (*Server, *store.Store, *fakeSyncer) {
 		slog.New(slog.DiscardHandler)), st, syncer
 }
 
-// testAdminToken 是测试里的管理令牌：写操作（POST / DELETE / PATCH）要带它，
+// testAdminToken 是测试里的管理令牌：写操作（非 GET/HEAD/OPTIONS）要带它，
 // 与生产里 DRAMA_HUB_ADMIN_TOKEN 的作用相同。
 const testAdminToken = "test-admin-token"
 

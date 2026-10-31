@@ -85,7 +85,7 @@ type statusView struct {
 	Config  configView   `json:"config"`
 	Sources []sourceView `json:"sources"`
 	// AdminTokenSet 是「后台写操作能不能用」：false = 没配 DRAMA_HUB_ADMIN_TOKEN，
-	// 所有 POST / DELETE / PATCH 都会 401。令牌本身不进任何响应，这里只报有没有。
+	// 所有非读的 /api/ 请求都会 401。令牌本身不进任何响应，这里只报有没有。
 	AdminTokenSet bool `json:"admin_token_set"`
 }
 

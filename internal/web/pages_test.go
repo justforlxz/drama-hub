@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 
 	"golang.org/x/net/html"
@@ -167,4 +168,98 @@ func TestUnknownPaths(t *testing.T) {
 	if rec := do(t, srv, http.MethodPost, "/merges", ""); rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST /merges 状态码 = %d, 期望 405", rec.Code)
 	}
+}
+
+// TestStatusPageSettingsForm 锁定「后台配置」表单与「生效时机」列：页面能改的那几项
+// 与 PATCH /api/settings 的键一一对应，每个字段的标签上写明生效时机（MKACG-617 的
+// 生效性矩阵），顶栏有管理令牌输入框 —— 没有它，页面上的写操作全是 401。
+func TestStatusPageSettingsForm(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	// 顶栏令牌框在三页都有（写操作不止发生在 /status）。
+	for _, path := range []string{"/", "/merges", "/status"} {
+		doc := parseDoc(t, do(t, srv, http.MethodGet, path, "").Body.Bytes())
+		if findNode(doc, func(n *html.Node) bool {
+			return isElement(n, "input") && attrOf(n, "id") == "admin-token"
+		}) == nil {
+			t.Errorf("GET %s 页面没有管理令牌输入框", path)
+		}
+	}
+
+	doc := parseDoc(t, do(t, srv, http.MethodGet, "/status", "").Body.Bytes())
+	form := findNode(doc, func(n *html.Node) bool {
+		return isElement(n, "form") && attrOf(n, "id") == "settings-form"
+	})
+	if form == nil {
+		t.Fatal("/status 没有配置表单")
+	}
+
+	// 表单字段 = PATCH /api/settings 里页面可改的键，每项都标了生效时机。
+	fields := map[string]string{
+		"set-webdav-user":      "即时",
+		"set-webdav-pass":      "即时",
+		"set-strm-prefix":      "即时",
+		"set-cache-max-mb":     "5 分钟",
+		"set-cache-lru-days":   "5 分钟",
+		"set-refresh-interval": "60 秒",
+	}
+	labels := map[string]string{}
+	for label := form.FirstChild; label != nil; label = label.NextSibling {
+		if !isElement(label, "label") {
+			continue
+		}
+		var text string
+		var inputID string
+		for child := label.FirstChild; child != nil; child = child.NextSibling {
+			if child.Type == html.TextNode {
+				text += child.Data
+			}
+			if isElement(child, "span") && child.FirstChild != nil {
+				text += child.FirstChild.Data
+			}
+			if isElement(child, "input") {
+				inputID = attrOf(child, "id")
+			}
+		}
+		if inputID != "" {
+			labels[inputID] = text
+		}
+	}
+	for id, timing := range fields {
+		text, ok := labels[id]
+		if !ok {
+			t.Errorf("表单缺少字段 %s", id)
+			continue
+		}
+		if !strings.Contains(text, timing) {
+			t.Errorf("字段 %s 的标签 = %q, 期望标出生效时机 %q", id, text, timing)
+		}
+	}
+
+	// 「运行配置」表要有生效时机列（阈值取自 617 的生效性矩阵）。
+	headers := map[string]bool{}
+	for n := doc; n != nil; n = nextNode(n) {
+		if isElement(n, "th") && n.FirstChild != nil {
+			headers[n.FirstChild.Data] = true
+		}
+	}
+	for _, want := range []string{"项", "值", "生效时机", "说明"} {
+		if !headers[want] {
+			t.Errorf("配置表缺少表头 %q（现有 %v）", want, headers)
+		}
+	}
+}
+
+// nextNode 深度优先遍历的下一个节点（含子节点），到末尾返回 nil。
+func nextNode(n *html.Node) *html.Node {
+	if n.FirstChild != nil {
+		return n.FirstChild
+	}
+	for n != nil {
+		if n.NextSibling != nil {
+			return n.NextSibling
+		}
+		n = n.Parent
+	}
+	return nil
 }

@@ -7,9 +7,36 @@
 
 // ---- 通用 ----
 
+// ---- 管理令牌 ----
+// 写操作（POST / DELETE / PATCH）要带 X-Admin-Token（env DRAMA_HUB_ADMIN_TOKEN）。
+// 令牌只存在 sessionStorage：关掉标签页就没了 —— 改配置是低频动作，不值得长期留在浏览器。
+const TOKEN_KEY = 'drama-hub-admin-token';
+const TOKEN_HEADER = 'X-Admin-Token';
+
+/** 当前管理令牌：以顶栏输入框为准（刚打完字、还没触发 change 时也拿得到）。 */
+function adminToken() {
+  const input = document.getElementById('admin-token');
+  if (input && input.value.trim() !== '') return input.value.trim();
+  return sessionStorage.getItem(TOKEN_KEY) || '';
+}
+
+/** 顶栏令牌框：回填上次输入，改动即记住（清空 = 忘掉）。 */
+function initAdminToken() {
+  const input = document.getElementById('admin-token');
+  if (!input) return;
+  input.value = sessionStorage.getItem(TOKEN_KEY) || '';
+  input.addEventListener('change', () => {
+    const value = input.value.trim();
+    input.value = value;
+    if (value === '') sessionStorage.removeItem(TOKEN_KEY);
+    else sessionStorage.setItem(TOKEN_KEY, value);
+  });
+}
+
 /** 请求管理 API 并返回解析后的 JSON（204 返回 null）。非 2xx 抛 Error（带服务端 message）。 */
 async function api(method, path, body) {
   const init = { method, headers: { Accept: 'application/json' } };
+  if (method !== 'GET') init.headers[TOKEN_HEADER] = adminToken();
   if (body !== undefined) {
     init.headers['Content-Type'] = 'application/json';
     init.body = JSON.stringify(body);
@@ -332,6 +359,29 @@ function initStatus() {
   const totalsBox = document.getElementById('totals');
   const sourcesBody = document.getElementById('sources');
   const configBody = document.getElementById('config');
+  const form = document.getElementById('settings-form');
+  const saveBtn = document.getElementById('settings-save');
+  const hint = document.getElementById('settings-hint');
+
+  // 表单字段 ↔ settings 键。页面不另写一份校验：值原样交给 PATCH，越界由服务端的
+  // 注册表拒（400），这里只显示服务端给的原因。
+  const fields = {
+    strm_prefix: 'set-strm-prefix',
+    cache_max_mb: 'set-cache-max-mb',
+    cache_lru_days: 'set-cache-lru-days',
+    refresh_interval_sec: 'set-refresh-interval',
+  };
+
+  // WebDAV 凭据只写不读：/api/status 只报「是否已设置」，不回传值（凭据不该被多抄一份
+  // 到浏览器），所以这两项没有基线，留空 = 不改。
+  const credentials = {
+    webdav_user: 'set-webdav-user',
+    webdav_pass: 'set-webdav-pass',
+  };
+
+  let baseline = {}; // 上次读到的值：提交时只发改过的项（清空 strm_prefix 也算改）
+  let prefilled = false; // 表单只在首次加载与保存成功后回填，不冲掉正在打的值
+  let adminWritable = false; // 服务端有没有配 DRAMA_HUB_ADMIN_TOKEN
 
   function stat(label, value, small) {
     return el('div', {},
@@ -339,10 +389,11 @@ function initStatus() {
       el('dd', { class: small ? 'small' : null, text: value }));
   }
 
-  function row(name, value, note, mono) {
+  function row(name, value, timing, note, mono) {
     return el('tr', {},
       el('td', { text: name }),
       el('td', { class: mono ? 'mono' : null }, value instanceof Node ? value : String(value)),
+      el('td', { class: 'hint', text: timing }),
       el('td', { class: 'hint', text: note }));
   }
 
@@ -362,7 +413,7 @@ function initStatus() {
     // 值，并明说 settings 现值是否还要重启才生效。
     const bootNote = 'base_url 生效值 ' +
       (src.base_url_effective === '' ? '插件内置默认' : src.base_url_effective) +
-      '，请求超时生效值 ' + src.request_timeout_sec_effective + ' 秒，间隔 ' +
+      '，请求超时生效值 ' + src.request_timeout_sec_effective + ' 秒（重启后生效），间隔 ' +
       src.interval_sec + ' 秒' +
       (src.restart_required
         ? '；settings 现值（base_url ' + (src.base_url === '' ? '空' : src.base_url) +
@@ -388,7 +439,8 @@ function initStatus() {
   }
 
   // refreshSource 打手动触发端点：202 = 一轮已派出去，409 = 该源正在跑，
-  // 404 = 没有这个源或已停用。结果都回读 /api/status（不猜这一轮的结局）。
+  // 401 = 没带对管理令牌，404 = 没有这个源或已停用。结果都回读 /api/status
+  // （不猜这一轮的结局）。
   async function refreshSource(src, button) {
     button.disabled = true;
     say('已请求刷新 ' + src.name + ' …', 'busy');
@@ -401,6 +453,65 @@ function initStatus() {
     await load();
   }
 
+  // renderConfig 渲染「运行配置」表：每行都带生效时机（MKACG-617 的生效性矩阵）。
+  function renderConfig(c) {
+    configBody.replaceChildren(
+      row('strm 前缀', c.strm_prefix === '' ? '空（按请求 Host 推导）' : c.strm_prefix, '即时',
+        'strm 内 URL 前缀；空 = 用访问本服务的 Host 拼绝对地址，填了就用填的（写入时去掉尾 /）', true),
+      row('分片目标时长', c.seg_target_sec + ' 秒', '即时（仅未建索引的集）',
+        'seg_target_sec，切点对齐关键帧；已建索引的 uid 不重算'),
+      row('缓存目录', c.cache_dir, '即时',
+        'cache_dir，海报/分片/索引落 <cache_dir>/{cover,seg,index,tmp}', true),
+      row('缓存上限', c.cache_max_mb + ' MB', '≤5 分钟',
+        'cache_max_mb，0 = 不按大小淘汰；下一轮淘汰生效'),
+      row('缓存保留', c.cache_lru_days + ' 天', '≤5 分钟',
+        'cache_lru_days，超过 N 天未命中的条目删除'),
+      row('刷新间隔', c.refresh_interval_sec + ' 秒', '≤60 秒',
+        'refresh_interval_sec，一轮到期 = 上次运行 + 本值'),
+      row('每轮存量部数', String(c.refresh_batch), '即时', 'refresh_batch，0 = 关闭存量轮转'),
+      row('单轮预算', c.refresh_timeout_sec + ' 秒', '即时',
+        'refresh_timeout_sec，超时后下一轮按游标续跑'),
+      row('出流签名密钥', flag(c.stream_secret_set), '即时',
+        'stream_secret（ADR-0003）；换了之后所有旧 URL 失效'),
+      row('WebDAV 用户', flag(c.webdav_user_set), '即时', 'webdav_user'),
+      row('WebDAV 密码', flag(c.webdav_pass_set), '即时', 'webdav_pass'));
+  }
+
+  // fillSettings 把库里现在的值填进表单，并记成基线（提交时只发改过的项）。
+  function fillSettings(c) {
+    baseline = {};
+    for (const [key, id] of Object.entries(fields)) {
+      baseline[key] = String(c[key]);
+      document.getElementById(id).value = baseline[key];
+    }
+    setCredentialPlaceholders(c);
+  }
+
+  // setCredentialPlaceholders 把「已设置 / 未设置」写在凭据输入框的占位符里：
+  // 值本身不回显（/api/status 只给 *_set 标志）。
+  function setCredentialPlaceholders(c) {
+    document.getElementById('set-webdav-user').value = '';
+    document.getElementById('set-webdav-user').placeholder =
+      c.webdav_user_set ? '已设置，留空不改' : '未设置（/webdav 恒 401）';
+    document.getElementById('set-webdav-pass').value = '';
+    document.getElementById('set-webdav-pass').placeholder =
+      c.webdav_pass_set ? '已设置，留空不改' : '未设置（/webdav 恒 401）';
+  }
+
+  // syncHint 说明「现在能不能写」：没配 env 令牌就写不了；配了但要先在顶栏填上。
+  function syncHint() {
+    if (!adminWritable) {
+      saveBtn.disabled = true;
+      hint.textContent = '未设置 DRAMA_HUB_ADMIN_TOKEN：后台改配置不可用（所有写操作都会 401）。' +
+        '在服务端加上这个 env 再重启，然后用这个表单改配置。';
+      return;
+    }
+    saveBtn.disabled = adminToken() === '';
+    hint.textContent = adminToken() === ''
+      ? '先在顶栏「管理令牌」里填 DRAMA_HUB_ADMIN_TOKEN，再保存（令牌只存在本标签页）。'
+      : '写 PATCH /api/settings；非法值整批拒绝（400）且库里不动；密码不回显，留空表示不改。';
+  }
+
   async function load() {
     const status = await api('GET', '/api/status');
     const t = status.totals;
@@ -410,26 +521,65 @@ function initStatus() {
       stat('对外集', String(t.emby_items)),
       stat('合并组', String(t.merge_groups)),
       stat('最近同步', fmtTime(t.last_sync_at), true));
-    const c = status.config;
-    configBody.replaceChildren(
-      row('strm 前缀', c.strm_prefix === '' ? '空（按请求 Host 推导）' : c.strm_prefix,
-        'strm 内 URL 前缀；空 = 用访问本服务的 Host 拼绝对地址，填了就用填的（不带尾 /）', true),
-      row('分片目标时长', c.seg_target_sec + ' 秒', 'seg_target_sec，切点对齐关键帧'),
-      row('缓存目录', c.cache_dir, 'cache_dir，海报/分片/索引落 <cache_dir>/{cover,seg,index,tmp}', true),
-      row('缓存上限', c.cache_max_mb + ' MB', 'cache_max_mb，0 = 不按大小淘汰'),
-      row('缓存保留', c.cache_lru_days + ' 天', 'cache_lru_days，超过 N 天未命中的条目删除'),
-      row('出流签名密钥', flag(c.stream_secret_set), 'stream_secret（ADR-0003）'),
-      row('WebDAV 用户', flag(c.webdav_user_set), 'webdav_user'),
-      row('WebDAV 密码', flag(c.webdav_pass_set), 'webdav_pass'));
-
+    renderConfig(status.config);
     sourcesBody.replaceChildren(...status.sources.map(sourceRow));
+    adminWritable = status.admin_token_set === true;
+    if (!prefilled) {
+      prefilled = true;
+      fillSettings(status.config);
+    } else {
+      // 凭据输入框每次回读都清空：值不回显，占位符按最新的「已设置/未设置」更新。
+      setCredentialPlaceholders(status.config);
+    }
+    syncHint();
   }
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const payload = {};
+    for (const [key, id] of Object.entries(fields)) {
+      const value = document.getElementById(id).value.trim();
+      if (value !== baseline[key]) payload[key] = value;
+    }
+    for (const [key, id] of Object.entries(credentials)) {
+      const value = document.getElementById(id).value.trim();
+      if (value !== '') payload[key] = value;
+    }
+    if (Object.keys(payload).length === 0) {
+      say('没有改动', 'ok');
+      return;
+    }
+    saveBtn.disabled = true;
+    say('正在写入配置 …', 'busy');
+    try {
+      const data = await api('PATCH', '/api/settings', { settings: payload });
+      // 回显归一化后的值（例：strm 前缀的尾 `/` 已被去掉），并把基线更新成刚写进去的值。
+      for (const [key, value] of Object.entries(data.settings)) {
+        const id = fields[key];
+        if (!id || value === null) continue;
+        document.getElementById(id).value = String(value);
+        baseline[key] = String(value);
+      }
+      for (const id of Object.values(credentials)) document.getElementById(id).value = '';
+      say('已写入：' + Object.keys(data.settings).join('、') + '（生效时机见「运行配置」）', 'ok');
+      await load();
+    } catch (err) {
+      fail(err);
+    } finally {
+      syncHint();
+    }
+  });
+
+  // 顶栏令牌改动后立刻更新提示与保存按钮状态。
+  const tokenInput = document.getElementById('admin-token');
+  if (tokenInput) tokenInput.addEventListener('input', syncHint);
 
   load().catch(fail);
 }
 
 // ---- 分派 ----
 
+initAdminToken();
 const page = document.body.dataset.page;
 if (page === 'dramas') initDramas();
 else if (page === 'merges') initMerges();

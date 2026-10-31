@@ -9,6 +9,46 @@
 </section>
 
 <section class="block">
+  <div class="block-head">
+    <h2>后台配置</h2>
+    <p class="hint">
+      写 <code>PATCH /api/settings</code>：只发改过的项，留空 = 不改。值原样交给服务端校验，
+      越界 / 未知键整批拒绝（400）且库里不动。每项的操作时机与下表「生效时机」一致。
+    </p>
+  </div>
+  <form class="row-form" id="settings-form">
+    <label class="field">
+      <span>WebDAV 用户 · 即时</span>
+      <input id="set-webdav-user" name="webdav_user" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>WebDAV 密码 · 即时</span>
+      <input id="set-webdav-pass" name="webdav_pass" type="password"
+             autocomplete="new-password" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>strm 前缀 · 即时</span>
+      <input id="set-strm-prefix" name="strm_prefix" autocomplete="off" spellcheck="false"
+             placeholder="空 = 按请求 Host 推导">
+    </label>
+    <label class="field">
+      <span>缓存上限 MB · ≤5 分钟</span>
+      <input id="set-cache-max-mb" name="cache_max_mb" inputmode="numeric" autocomplete="off">
+    </label>
+    <label class="field">
+      <span>缓存保留天数 · ≤5 分钟</span>
+      <input id="set-cache-lru-days" name="cache_lru_days" inputmode="numeric" autocomplete="off">
+    </label>
+    <label class="field">
+      <span>刷新间隔秒 · ≤60 秒</span>
+      <input id="set-refresh-interval" name="refresh_interval_sec" inputmode="numeric" autocomplete="off">
+    </label>
+    <button type="submit" class="btn primary" id="settings-save">保存配置</button>
+  </form>
+  <p class="hint" id="settings-hint"></p>
+</section>
+
+<section class="block">
   <h2>播放源</h2>
   <div class="scroll">
     <table class="grid">
@@ -18,20 +58,27 @@
     </table>
   </div>
   <p class="hint">
-    <code>plugin.&lt;源&gt;.enabled</code> 与 <code>refresh_interval_sec</code>（全局，或
-    <code>plugin.&lt;源&gt;.refresh_interval_sec</code> 覆盖）热读，改完最多 60 秒按新间隔重算；
+    <code>plugin.&lt;源&gt;.enabled</code>（即时）与 <code>refresh_interval_sec</code>（全局，或
+    <code>plugin.&lt;源&gt;.refresh_interval_sec</code> 覆盖；≤60 秒）热读，改完最多 60 秒按新间隔重算；
     <code>plugin.&lt;源&gt;.base_url</code> 与 <code>.request_timeout_sec</code> 是启动时注入插件的
-    构造期配置，只有「生效值」在跑，改了要重启（两者不一致时下面会写出来）。
+    构造期配置（<strong>重启后</strong>），只有「生效值」在跑（两者不一致时下面会写出来）。
     「下次计划」= 上次运行 + 现读间隔。
   </p>
 </section>
 
 <section class="block">
-  <h2>运行配置</h2>
+  <div class="block-head">
+    <h2>运行配置</h2>
+    <p class="hint">
+      「生效时机」逐键标注：<strong>即时</strong> = 下一次使用就读到新值；<strong>≤60 秒</strong> =
+      调度器下一次醒来按新值算下一轮；<strong>≤5 分钟</strong> = 下一轮缓存淘汰（淘汰循环固定 5 分钟一轮）；
+      <strong>重启后</strong> = 构造期注入插件的配置（页面同时给现值与生效值）。
+    </p>
+  </div>
   <div class="scroll">
     <table class="grid">
       <caption class="sr-only">运行配置</caption>
-      <thead><tr><th>项</th><th>值</th><th>说明</th></tr></thead>
+      <thead><tr><th>项</th><th>值</th><th>生效时机</th><th>说明</th></tr></thead>
       <tbody id="config"></tbody>
     </table>
   </div>

@@ -84,15 +84,18 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 > `pin_days` 两个死键已删除（MKACG-616）：它们从没有消费者，留着只会让人以为改了有用。
 > 库里若还有这两行，`Settings` 会按 `ErrUnknownSetting` 忽略它们，不需要数据迁移。
 
-**生效方式只有两类，配置表逐键标注**：
+**生效时机逐键标注在配置表里**，只有四种取值（MKACG-617 的生效性矩阵是实测真值来源）：
 
-- **现读**：每次使用都查库（`Settings` 本身不缓存，硬约束 5）——调度器每次醒来重读
-  `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` /
-  `plugin.<源>.enabled` / `plugin.<源>.refresh_interval_sec`（改完最多 60 秒按新值算
-  下一轮），请求路径现读 `strm_prefix` / `stream_secret` / `webdav_user` /
-  `webdav_pass` / `seg_target_sec`，缓存每次读写现读 `cache_dir`、每轮淘汰现读
-  `cache_max_mb` / `cache_lru_days`（淘汰循环每 5 分钟一轮）。都不需要重启。
-- **需重启**：`plugin.<源>.base_url` 与 `plugin.<源>.request_timeout_sec` 是构造期注入的
+- **即时**：每次使用都查库（`Settings` 本身不缓存，硬约束 5）。请求路径现读
+  `strm_prefix` / `stream_secret` / `webdav_user` / `webdav_pass` / `seg_target_sec`，
+  缓存每次读写现读 `cache_dir`，调度器每轮现读 `plugin.<源>.enabled` /
+  `refresh_batch` / `refresh_timeout_sec`。
+- **≤60 秒**：调度器每 60 秒醒一次，用 `refresh_interval_sec`（或
+  `plugin.<源>.refresh_interval_sec` 覆盖）算下一轮是否到期。改值后状态页立刻按新值算
+  「下次计划」，实际触发最多晚 60 秒。
+- **≤5 分钟**：缓存淘汰循环固定 5 分钟一轮，`cache_max_mb` / `cache_lru_days` 在下一轮
+  淘汰才生效。
+- **重启后**：`plugin.<源>.base_url` 与 `plugin.<源>.request_timeout_sec` 是构造期注入的
   不可变配置（`*http.Client` 的 Timeout 在这里定型，见 `docs/PLUGIN-CONTRACT.md` 硬性
   要求 2）。状态页对这两项同时给「settings 现值」（`base_url` / `request_timeout_sec`）
   与「启动时注入、正在生效的值」（`*_effective`），两者不一致时 `restart_required=true`；
@@ -100,14 +103,16 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 运行时配置只有一张表 `settings(key TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT)`。
 
-启动引导只读环境变量三项：`DRAMA_HUB_DB`、`DRAMA_HUB_ADDR`、`DRAMA_HUB_LOG_LEVEL`。
-其余全部走 settings。
+启动期只读这几个环境变量：`DRAMA_HUB_DB` / `DRAMA_HUB_ADDR` / `DRAMA_HUB_LOG_LEVEL`
+（进程自身），`DRAMA_HUB_STREAM_SECRET` / `DRAMA_HUB_CACHE_DIR`（空卷首次引导，见下），
+`DRAMA_HUB_ADMIN_TOKEN`（后台写操作令牌，见「管理 API」的写操作鉴权）。其余全部走 settings。
 
-**首次启动的 env 引导（MKACG-616）**：下面四个 env 只在 settings 里**还没有该键时**写入
+**首次启动的 env 引导（MKACG-616）**：下面两个 env 只在 settings 里**还没有该键时**写入
 一次（`Settings.SetIfAbsent`），已有值一律不覆盖 —— 重启不会把手改过的 settings 覆盖回
-env；env 缺省或值非法（secret 不足 32 字节、用户/密码为空）时只记一条 warn、不写坏值、
-不 panic（看板上显示「未设置」就是这条原因）。2.0 没有 `PUT /api/settings`，这是空卷上
-唯一能种出必填项的入口。
+env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、不写坏值、不 panic（看板上
+显示「未设置」就是这条原因）。后台改配置走 `PATCH /api/settings`（MKACG-622），但那要
+服务先起来、还要有令牌；空卷上这几项只能靠 env 种下，否则服务起不来（密钥缺了 `/video`
+恒 500），也就没有后台可改。
 
 | env | settings 键 | 说明 |
 |---|---|---|
@@ -115,8 +120,8 @@ env；env 缺省或值非法（secret 不足 32 字节、用户/密码为空）�
 | `DRAMA_HUB_CACHE_DIR` | `cache_dir` | 镜像里默认 `/data/cache`（`WORKDIR /data`，相对默认值会落成 `/data/data/cache`）；裸机默认仍是 `./data/cache` |
 
 **WebDAV 账号密码不走 env**（lxz 2026-10-31 定）：`webdav_user` / `webdav_pass` 是后台配置项，
-由 MKACG-622 的配置写入接口管理；env 再种一份就会出现两个真值，所以这两个 env 不存在，
-设了也会按「未知变量」报出来。
+由 `PATCH /api/settings` 或 `/status` 页的表单写入（MKACG-622）；env 再种一份就会出现两个
+真值，所以这两个 env 不存在，设了也会按「未知变量」报出来。
 
 拼错或已废弃的 `DRAMA_HUB_*` 变量会打一条 warn，连同**支持的键**一起列出（只报变量名、
 不报值）：静默忽略是「配了却没生效」的常见来源，见 `cmd/drama-hub/bootstrap.go` 的
@@ -131,20 +136,20 @@ env；env 缺省或值非法（secret 不足 32 字节、用户/密码为空）�
 
 | key | 默认 | 取值范围 | 生效时机 | 作用 |
 |---|---|---|---|---|
-| `strm_prefix` | `""` | URL 或空 | 现读（每次渲染 `.strm`） | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，尾 `/` 写入时归一掉）；空 = 按请求 `Host` 推导绝对地址（见上「`.strm` 的绝对地址」）。不指向 rclone/openlist |
-| `stream_secret` | 必填 | ≥ 32 字节 | 现读（每请求） | 出流 HMAC 签名密钥（见 ADR-0003）；换了之后所有旧 URL 失效 |
-| `seg_target_sec` | `10` | 4–30 | 现读（每次建索引） | 分片目标时长；**只对还没建索引的 uid 生效**——已建索引的 uid 不重算，改了要等它下一次重建（`segment` 表被整体替换时） |
-| `webdav_user` / `webdav_pass` | 必填 | — | 现读（每请求） | WebDAV Basic 认证 |
-| `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 非空路径 | 现读（每次读写） | 本地缓存根目录：海报 `cover/`、分片 `seg/`、索引 `index/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`）；四个目录在启动时预先建出 |
-| `cache_max_mb` | `8192` | 0–1048576 | 现读（每轮淘汰） | 分片缓存上限（MB）；`0` = 不按大小淘汰 |
-| `cache_lru_days` | `30` | 1–365 | 现读（每轮淘汰） | 超过 N 天未命中的缓存条目（三种 kind 都算）删除 |
-| `plugin.<源>.enabled` | `true` | — | 现读（每轮调度） | 是否参与**刷新调度**（缺失按 `true`）；手动同步（`POST /api/dramas`）与播放（`/video`）不受影响 |
-| `plugin.<源>.base_url` | `""` | URL 或空 | **需重启**（构造期注入） | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
-| `plugin.<源>.request_timeout_sec` | `30` | 5–300 | **需重启**（构造期注入） | 单次出站请求超时 |
-| `refresh_interval_sec` | `3600` | 300–86400 | 现读（每轮调度） | 全局刷新间隔，一轮到期 = `last_run_at` + 本值 |
-| `plugin.<源>.refresh_interval_sec` | 空 = 继承全局 | 300–86400 | 现读（每轮调度） | 源级间隔覆盖（用 `Settings.OptionalInt` 读，无行即「继承」） |
-| `refresh_batch` | `1000` | 0–10000 | 现读（每轮调度） | 每轮存量刷新的部数；`0` = 关闭存量轮转 |
-| `refresh_timeout_sec` | `900` | 60–86400 | 现读（每轮调度） | 单轮预算（`context.WithTimeout`） |
+| `strm_prefix` | `""` | URL 或空 | 即时（每次渲染 `.strm`） | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，尾 `/` 写入时归一掉）；空 = 按请求 `Host` 推导绝对地址（见上「`.strm` 的绝对地址」）。不指向 rclone/openlist |
+| `stream_secret` | 必填 | ≥ 32 字节 | 即时（每请求） | 出流 HMAC 签名密钥（见 ADR-0003）；换了之后所有旧 URL 失效 |
+| `seg_target_sec` | `10` | 4–30 | 即时（仅未建索引的 uid，见下） | 分片目标时长；**只对还没建索引的 uid 生效**——已建索引的 uid 不重算，改了要等它下一次重建（`segment` 表被整体替换时） |
+| `webdav_user` / `webdav_pass` | 必填 | 非空字符串 | 即时（每请求） | WebDAV Basic 认证 |
+| `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 非空路径 | 即时（每次读写） | 本地缓存根目录：海报 `cover/`、分片 `seg/`、索引 `index/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`）；四个目录在启动时预先建出 |
+| `cache_max_mb` | `8192` | 0–1048576 | ≤5 分钟（下一轮淘汰） | 分片缓存上限（MB）；`0` = 不按大小淘汰 |
+| `cache_lru_days` | `30` | 1–365 | ≤5 分钟（下一轮淘汰） | 超过 N 天未命中的缓存条目（三种 kind 都算）删除 |
+| `plugin.<源>.enabled` | `true` | 布尔 | 即时（每轮调度现读） | 是否参与**刷新调度**（缺失按 `true`）；手动同步（`POST /api/dramas`）与播放（`/video`）不受影响 |
+| `plugin.<源>.base_url` | `""` | URL 或空 | **重启后**（构造期注入） | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
+| `plugin.<源>.request_timeout_sec` | `30` | 5–300 | **重启后**（构造期注入） | 单次出站请求超时 |
+| `refresh_interval_sec` | `3600` | 300–86400 | ≤60 秒（调度器醒来） | 全局刷新间隔，一轮到期 = `last_run_at` + 本值 |
+| `plugin.<源>.refresh_interval_sec` | 空 = 继承全局 | 300–86400 | ≤60 秒（调度器醒来） | 源级间隔覆盖（用 `Settings.OptionalInt` 读，无行即「继承」） |
+| `refresh_batch` | `1000` | 0–10000 | 即时（每轮调度现读） | 每轮存量刷新的部数；`0` = 关闭存量轮转 |
+| `refresh_timeout_sec` | `900` | 60–86400 | 即时（每轮调度现读） | 单轮预算（`context.WithTimeout`） |
 
 `<源>` 是 `Plugin.Name()`（红果是 `web`），键的格式与校验在 `internal/store`
 （`PluginSettingKey` + `specFor` 的前缀模式），调用方不自己拼字符串。
@@ -154,9 +159,13 @@ env；env 缺省或值非法（secret 不足 32 字节、用户/密码为空）�
 对 URL 类键 `TrimRight`，状态页显示的就是归一后的值），**渲染时再去一次**（存量手改的行
 也能拼对）；非法值照旧报错，不猜。
 
-`plugin.<源>.request_timeout_sec` 的 5–300 范围校验已进注册表，但 2.0 没有 settings
-写接口，所以非法值目前只能由代码侧（`Settings.Set` / `Settings.SetIfAbsent`）拒绝，
-没有 HTTP 400 的入口；写接口属后续阶段。
+写接口的校验只有一份：`PATCH /api/settings` 走 `Settings.SetMany` → 同一条 `parseSetting`
+（`specFor` 的范围与类型）。越界 / 类型不符 → 400 且整批不落库，错误文本原样带回（页面
+直接显示「必须在 0–1048576 之间」这类原因）。上表的「取值范围」就是接口的边界，页面不
+另写一份校验。
+
+`cache_max_mb` 的下界是 `0`（= 不按大小淘汰），所以 `0` 是合法值、返回 200；能返回 400 的是
+`-1` 与 `1048577`。
 
 缓存淘汰由本服务自己执行（ADR-0007）：`internal/cache` 的淘汰循环每 5 分钟一轮，
 先按 `cache_lru_days` 删过期，再按 `cache_max_mb` 删最久未用的分片（`docs/CACHE-MODEL.md`
@@ -682,7 +691,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 |---|---|---|
 | `/` | 剧目 | 按上游剧 id 或 `/player/<id>` 链接同步入库；删剧目（级联删集、合并组、对外集号） |
 | `/merges` | 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即 `ord`）→ 删组 |
-| `/status` | 同步与缓存 | 同步计数与最近同步时间、各播放源状态（是否启用、正在刷新、上次运行/上次成功/上次错误/下次计划、生效的 `base_url` 与超时、停用原因）、手动「立即刷新」、运行配置现状（密钥只报「是否已设置」）、缓存面（`mode` / `prefix` / `max_size` / `max_age` / `flags`）——**这几个字段仍是 ADR-0004 遗留**，与缓存实现相反，见「缓存面」的已知偏差 |
+| `/status` | 同步与缓存 | 同步计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / `strm_prefix` / 缓存上限与保留期 / 刷新间隔 → `PATCH /api/settings`，每项标签写着生效时机）、各播放源状态（是否启用、正在刷新、上次运行/上次成功/上次错误/下次计划、生效的 `base_url` 与超时、停用原因）、手动「立即刷新」、运行配置现状（密钥只报「是否已设置」，**每行带「生效时机」列**）。缓存面字段（`mode` / `max_size` / …）是 ADR-0004 遗留，已在 MKACG-616 删除 |
 
 模板 `templates/*.html` 与 `static/app.css`、`static/app.js` 用 `//go:embed` 进二进制：
 界面没有构建步骤、没有 `package.json`（ADR-0002）。页面 JS 只调下面这些 API，渲染结果
@@ -700,7 +709,8 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | `/api/dramas/{id}/merge-groups` | POST | 建组：`{"label":"…","episode_ids":[…]}`，数组顺序即 `ord`，201 + 整份列表 |
 | `/api/merge-groups/{id}` | DELETE | 删组（同一事务内重建派生表），204 |
 | `/api/refresh` | POST | 手动跑一轮：`{"source":"web"}` → 202 已启动 / 404 无此源或未启用 / 409 该源正在跑（与定时共用单飞锁） |
-| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `seg_target_sec` / `cache_dir` / `cache_max_mb` / `cache_lru_days` 现读；密钥只报 `*_set`）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」） |
+| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `seg_target_sec` / `cache_dir` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」） |
+| `/api/settings` | PATCH | 按 key 批量写配置：`{"settings":{"<key>":"<原始值>",…}}` → 200 + **归一化后的值**（`strm_prefix` 去尾 `/`；`webdav_pass` / `stream_secret` 回 `null`，不回显）。未知键 / 非法值 → 400 且**整批一行不写**；`{"settings":{}}` → 400。值一律写成字符串（数字/布尔也写成 `"4096"` / `"false"`），校验只有服务端那一份。写操作要令牌，见下「写操作鉴权」 |
 
 - **「增剧目」的唯一入口是数据源同步**：剧目与集的真值在上游，手工插空剧只会得到一条
   永远没有集的记录。`series_id` 只接受纯数字或 `/player/<id>` 链接 —— 归一后的值会拼进
@@ -712,6 +722,22 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
   → 404 的映射。
 - **计数不做 N+1**：`store.ListDramaStats` 一条聚合查询取全库（标量子查询，不用多表
   JOIN，避免行数相乘）。
+
+### 写操作鉴权（MKACG-622）
+
+`/api/` 的**读**操作维持无鉴权（单用户本机管理面；Emby 与页面都靠 GET 浏览），**写**操作
+（`POST` / `DELETE` / `PATCH`）一律要令牌 —— 在此之前 `POST /api/dramas` 能触发同步、
+`DELETE` 能删库，加写配置端点会同时放大这个风险。
+
+| 项 | 口径 |
+|---|---|
+| 令牌来源 | env `DRAMA_HUB_ADMIN_TOKEN`（**不是** settings 键：它保护的就是「改 settings」这个动作，放进 settings 会变成改配置不需要令牌） |
+| 传法 | 请求头 `X-Admin-Token: <token>` |
+| 未设令牌 | 所有写端点 **401（fail closed）**：没配 ≠ 不设防，否则新部署会悄悄裸奔。状态页显示「未设置 `DRAMA_HUB_ADMIN_TOKEN`，后台改配置不可用」并禁用保存；`/api/status` 的 `admin_token_set` 报有没有配（不报值） |
+| 令牌不符 / 缺失 | 401，`message` 说明缺哪个请求头 |
+| 范围 | 按「方法 + `/api/` 前缀」判定（`Server.ServeHTTP` 里的闸门）：新增写端点默认受保护，不需要逐个登记 |
+| 不受影响 | `GET /api/*`、三页界面、`/webdav/`（Basic 认证）、`/video/`（HMAC 签名）各按自己的口径 |
+| 页面怎么带 | 顶栏「管理令牌」输入框 → `sessionStorage`（关掉标签页就没了）；`app.js` 对非 GET 请求自动加这个头。令牌不进任何页面响应、不进日志 |
 
 ### 缓存面（ADR-0007）
 

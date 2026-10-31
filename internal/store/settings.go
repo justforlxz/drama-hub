@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -124,6 +125,61 @@ func (s *Settings) Set(ctx context.Context, key SettingKey, raw string) error {
 		return fmt.Errorf("写入配置 %s: %w", key, err)
 	}
 	return nil
+}
+
+// SetMany 在一个事务里校验并写入多个配置项：全部通过才落库。
+//
+// 与 Set 复用同一条校验路径（parseSetting），所以未知键 / 非法的值分别返回
+// ErrUnknownSetting / ErrInvalidSetting，此时一行都不写 —— 管理面按「整批拒绝」处理，
+// 避免半批生效后没人说得清零不零。返回归一化后的类型化值（string / int / bool），
+// 调用方可以直接回给前端（`strm_prefix` 的尾 `/` 就是在这里去掉的）。
+func (s *Settings) SetMany(ctx context.Context, values map[SettingKey]string) (map[SettingKey]any, error) {
+	// 按 key 排序：同一批写入的报错顺序稳定（先报哪个非法项不随 map 迭代变化）。
+	keys := make([]SettingKey, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	parsed := make(map[SettingKey]any, len(values))
+	encoded := make(map[SettingKey]string, len(values))
+	for _, key := range keys {
+		value, err := parseSetting(key, values[key])
+		if err != nil {
+			return nil, err
+		}
+		buf, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("编码配置 %s: %w", key, err)
+		}
+		parsed[key] = value
+		encoded[key] = string(buf)
+	}
+	if len(keys) == 0 {
+		return parsed, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("开始写配置事务: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// 同一批次共用一个 updated_at：这一批改的配置是同一时刻生效的。
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, key := range keys {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?)
+			 ON CONFLICT(key) DO UPDATE
+			 SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+			string(key), encoded[key], now,
+		); err != nil {
+			return nil, fmt.Errorf("写入配置 %s: %w", key, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("提交配置写入: %w", err)
+	}
+	return parsed, nil
 }
 
 // SetIfAbsent 校验并在 key 还没有行时写入，返回是否真的写了。

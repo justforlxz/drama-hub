@@ -49,7 +49,7 @@ a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset:
   top: 0;
   z-index: 10;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 28px;
   padding: 12px 24px;
   background: var(--paper);
@@ -139,6 +139,7 @@ h2 {
 }
 
 input[type="text"],
+input[type="password"],
 input:not([type]),
 select {
   font: 13px/1.4 var(--sans);
@@ -151,6 +152,11 @@ select {
 }
 
 #series-id { min-width: 30ch; font-family: var(--mono); }
+
+/* 顶栏的管理令牌：靠右、等宽，长度只够看清有没有填。 */
+.token-field { margin-left: auto; }
+.token-field > span { text-align: right; }
+#admin-token { min-width: 24ch; font-family: var(--mono); font-size: 12.5px; }
 
 input::placeholder { color: var(--ink-faint); }
 

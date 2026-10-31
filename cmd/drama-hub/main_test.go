@@ -64,8 +64,12 @@ func newAssembly(logger *slog.Logger, st *store.Store, settings *store.Settings,
 	}
 	return newHandler(logger, st, settings, syncer, schedule, sources,
 		cache.New(st, settings, logger), stream.NewResolver(st, reg),
-		playbackHeaders(map[string]pluginBoot{}))
+		playbackHeaders(map[string]pluginBoot{}), testAdminToken)
 }
+
+// testAdminToken 是装配测试用的管理令牌：生产里来自 DRAMA_HUB_ADMIN_TOKEN。
+// 写操作（POST / DELETE / PATCH）不带它一律 401，所以生产路径上的写请求都要带。
+const testAdminToken = "test-admin-token"
 
 // stubSource 是装配测试用的最小插件：Resolve 恒给同一个直链。
 //
@@ -331,6 +335,149 @@ func TestHandler_WebDAV(t *testing.T) {
 	}
 	if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(rec.Body.Len()) {
 		t.Errorf("Content-Length = %q, body 长度 = %d", cl, rec.Body.Len())
+	}
+}
+
+// TestHandler_SettingsWrite 覆盖「新部署靠接口写 WebDAV 凭据」这条唯一入口：
+// 写操作要管理令牌（没配/带错都 401），写进去的账号密码让 `/webdav/` 下一次请求
+// 立刻用新凭据（不重启），非法值与未知键 400 且库里不动。
+func TestHandler_SettingsWrite(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "patch.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.NewStore(db.DB)
+	settings := store.NewSettings(db.DB)
+	h := newAssembly(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources(), nil)
+
+	patch := func(token, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPatch, "/api/settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set(web.AdminTokenHeader, token)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	propfind := func(user, pass string) int {
+		t.Helper()
+		req := httptest.NewRequest("PROPFIND", "/webdav/", nil)
+		req.SetBasicAuth(user, pass)
+		req.Header.Set("Depth", "1")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// 没带令牌 / 带错令牌 → 401，并且什么都没写。
+	if rec := patch("", `{"settings":{"webdav_user":"alice"}}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("无令牌 PATCH 状态码 = %d, 期望 401（body=%s）", rec.Code, rec.Body.String())
+	}
+	if rec := patch("wrong-token", `{"settings":{"webdav_user":"alice"}}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("错令牌 PATCH 状态码 = %d, 期望 401", rec.Code)
+	}
+	if _, found, err := settings.OptionalInt(ctx, store.KeyRefreshBatch); err != nil || found {
+		t.Fatalf("401 之后库被写了：refresh_batch found=%v err=%v", found, err)
+	}
+
+	// 造一部剧 + 一集，供 `.strm` 断言用（vfs 只认 emby_item 派生表）。
+	dramaID, err := st.UpsertDrama(ctx, store.Drama{Provider: "web", ProviderID: "p1", Title: "测试剧", Year: 2024, Genre: "爱情"})
+	if err != nil {
+		t.Fatalf("UpsertDrama: %v", err)
+	}
+	epID, err := st.UpsertEpisode(ctx, store.Episode{DramaID: dramaID, EpNo: 1, Title: "开局", Source: "web", Vid: "v1"})
+	if err != nil {
+		t.Fatalf("UpsertEpisode: %v", err)
+	}
+	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
+	}
+	const secret = "0123456789abcdef0123456789abcdef"
+
+	// 带对令牌 → 200，凭据立刻生效：新凭据 207，旧凭据 401（不需要重启）。
+	rec := patch(testAdminToken, `{"settings":{"webdav_user":"alice","webdav_pass":"s3cret",`+
+		`"strm_prefix":"http://media.example:9000/","stream_secret":"`+secret+`"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("带令牌 PATCH 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	// 归一化后的值回在响应里：尾 `/` 被去掉，密码不回显。
+	var body struct {
+		Settings map[string]any `json:"settings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	if got := body.Settings["strm_prefix"]; got != "http://media.example:9000" {
+		t.Errorf("strm_prefix 归一化结果 = %v, 期望去尾 /", got)
+	}
+	if _, ok := body.Settings["webdav_pass"]; !ok || body.Settings["webdav_pass"] != nil {
+		t.Errorf("webdav_pass 应回 null（不回显），实际 = %v（存在=%v）", body.Settings["webdav_pass"], ok)
+	}
+	if code := propfind("alice", "s3cret"); code != http.StatusMultiStatus {
+		t.Errorf("新凭据 PROPFIND 状态码 = %d, 期望 207", code)
+	}
+	if code := propfind("bob", "s3cret"); code != http.StatusUnauthorized {
+		t.Errorf("旧凭据 PROPFIND 状态码 = %d, 期望 401", code)
+	}
+
+	// B2 的归一化要落到渲染：写进去的是带尾 `/` 的地址，`.strm` 里不能出现双斜杠。
+	strmPath := "/webdav/" + url.PathEscape("爱情") + "/" + shardOf("p1") + "/" +
+		url.PathEscape("测试剧 (2024)") + "/Season%2001/" +
+		url.PathEscape("测试剧 - S01E01 - 开局") + ".strm"
+	strmReq := httptest.NewRequest(http.MethodGet, strmPath, nil)
+	strmReq.SetBasicAuth("alice", "s3cret")
+	strmRec := httptest.NewRecorder()
+	h.ServeHTTP(strmRec, strmReq)
+	if strmRec.Code != http.StatusOK {
+		t.Fatalf("GET %s 状态码 = %d, 期望 200", strmPath, strmRec.Code)
+	}
+	uid := "e" + strconv.FormatInt(epID, 10)
+	if want := "http://media.example:9000/video/" + stream.ID(secret, uid) + ".m3u8\n"; strmRec.Body.String() != want {
+		t.Errorf(".strm 内容 = %q, 期望 %q（无双斜杠）", strmRec.Body.String(), want)
+	}
+
+	// 未知键 / 越界值 → 400，且整批不落库。
+	if rec := patch(testAdminToken, `{"settings":{"webdav_user":"bob","nope":"1"}}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("未知键 PATCH 状态码 = %d, 期望 400（body=%s）", rec.Code, rec.Body.String())
+	}
+	if got, err := settings.String(ctx, store.KeyWebDAVUser); err != nil || got != "alice" {
+		t.Fatalf("未知键的批次写了一半：webdav_user = %q err=%v", got, err)
+	}
+	for _, bad := range []string{"-1", "1048577", "abc"} {
+		rec := patch(testAdminToken, `{"settings":{"cache_max_mb":"`+bad+`"}}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("cache_max_mb=%s 状态码 = %d, 期望 400（body=%s）", bad, rec.Code, rec.Body.String())
+		}
+	}
+	// 0 在注册表边界内（0 = 不按大小淘汰），因此是 200 —— 见 docs/DEV-STANDARDS.md 的配置表。
+	if rec := patch(testAdminToken, `{"settings":{"cache_max_mb":"0"}}`); rec.Code != http.StatusOK {
+		t.Errorf("cache_max_mb=0 状态码 = %d, 期望 200（注册表下界就是 0）", rec.Code)
+	}
+
+	// 读操作不需要令牌：状态页与 API 照旧可读，并报出「有没有配令牌」。
+	statusRec := serve(t, h, http.MethodGet, "/api/status")
+	if statusRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/status 状态码 = %d, 期望 200（读操作不受令牌影响）", statusRec.Code)
+	}
+	var status struct {
+		AdminTokenSet bool `json:"admin_token_set"`
+		Config        struct {
+			CacheMaxMB int    `json:"cache_max_mb"`
+			StrmPrefix string `json:"strm_prefix"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("解析 /api/status: %v", err)
+	}
+	if !status.AdminTokenSet {
+		t.Error("admin_token_set = false, 期望 true（装配根注入了令牌）")
+	}
+	if status.Config.CacheMaxMB != 0 || status.Config.StrmPrefix != "http://media.example:9000" {
+		t.Errorf("config = %+v, 期望 0 与归一化后的 strm_prefix", status.Config)
 	}
 }
 
@@ -619,6 +766,7 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/dramas", strings.NewReader(`{"series_id":"7503745441910017049"}`))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(web.AdminTokenHeader, testAdminToken)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadGateway {

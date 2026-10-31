@@ -669,3 +669,73 @@ func TestCacheSettingDefaultsAndBounds(t *testing.T) {
 		}
 	}
 }
+
+// SetMany 是管理面「一次改多项」的落点：整批校验通过才写、返回归一化后的类型化值。
+func TestSetManyWritesAllAndNormalizes(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	got, err := s.SetMany(ctx, map[SettingKey]string{
+		KeyStrmPrefix:   "http://media.example:9000/", // 尾 `/` 写入时归一
+		KeyWebDAVUser:   "alice",
+		KeyCacheMaxMB:   "4096",
+		KeyRefreshBatch: "0",
+	})
+	if err != nil {
+		t.Fatalf("SetMany: %v", err)
+	}
+	if got[KeyStrmPrefix] != "http://media.example:9000" {
+		t.Errorf("归一化后的 strm_prefix = %v, 期望去尾 /", got[KeyStrmPrefix])
+	}
+	if got[KeyCacheMaxMB] != 4096 || got[KeyRefreshBatch] != 0 {
+		t.Errorf("整型返回值 = %v / %v, 期望 4096 / 0", got[KeyCacheMaxMB], got[KeyRefreshBatch])
+	}
+
+	// 落库的就是归一化后的值：下一次读直接可用。
+	if prefix, err := s.String(ctx, KeyStrmPrefix); err != nil || prefix != "http://media.example:9000" {
+		t.Errorf("读回 strm_prefix = %q err=%v", prefix, err)
+	}
+	if user, err := s.String(ctx, KeyWebDAVUser); err != nil || user != "alice" {
+		t.Errorf("读回 webdav_user = %q err=%v", user, err)
+	}
+	if n, err := s.Int(ctx, KeyCacheMaxMB); err != nil || n != 4096 {
+		t.Errorf("读回 cache_max_mb = %d err=%v", n, err)
+	}
+}
+
+// 一批里只要有一项未知或非法，整批一行都不写 —— 半批生效比整批失败更难排查。
+func TestSetManyRejectsWholeBatch(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		values map[SettingKey]string
+		want   error
+	}{
+		{
+			name:   "未知键",
+			values: map[SettingKey]string{KeyWebDAVUser: "alice", SettingKey("nope"): "1"},
+			want:   ErrUnknownSetting,
+		},
+		{
+			name:   "越界值",
+			values: map[SettingKey]string{KeyWebDAVUser: "alice", KeyCacheMaxMB: "1048577"},
+			want:   ErrInvalidSetting,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newTestDB(t)
+			s := NewSettings(db)
+			if _, err := s.SetMany(ctx, tc.values); !errors.Is(err, tc.want) {
+				t.Fatalf("SetMany 错误 = %v, 期望 %v", err, tc.want)
+			}
+			if got, err := s.String(ctx, KeyWebDAVUser); !errors.Is(err, ErrSettingMissing) {
+				t.Fatalf("批次被拒后 webdav_user = %q err=%v, 期望仍是「未设置」", got, err)
+			}
+			if hasRow(t, db, KeyCacheMaxMB) {
+				t.Error("批次被拒后 cache_max_mb 仍被写入")
+			}
+		})
+	}
+}

@@ -82,11 +82,17 @@ func main() {
 	}
 	resolver := stream.NewResolver(st, plugins)
 
+	// 后台写操作的令牌（POST / DELETE / PATCH）。没配就 fail closed：写端点一律 401，
+	// 状态页会说明「未设置 DRAMA_HUB_ADMIN_TOKEN，后台改配置不可用」。
+	adminToken := os.Getenv("DRAMA_HUB_ADMIN_TOKEN")
+	if adminToken == "" {
+		logger.Warn("未设置 DRAMA_HUB_ADMIN_TOKEN：后台写操作（同步/删除/改配置）一律 401")
+	}
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
 		Addr: addr,
 		Handler: newHandler(logger, st, settings, syncer, sched, sourceList(plugins, boots), caches, resolver,
-			playbackHeaders(boots)),
+			playbackHeaders(boots), adminToken),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -152,7 +158,7 @@ func main() {
 //
 // playbackHeaders 是播放面取直链时 ffmpeg / ffprobe 要带的出站身份（`名称: 值`
 // 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624）：本函数不认识具体源。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver, playbackHeaders []string) http.Handler {
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver, playbackHeaders []string, adminToken string) http.Handler {
 	cutter := segment.NewCutter(st, settings, logger, caches, resolver.DirectURL, playbackHeaders)
 
 	mux := http.NewServeMux()
@@ -161,7 +167,7 @@ func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, 
 	// 播放面两条路由由 internal/segment 自己提供（领域包只提供 handler，挂载点在此）。
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
 	mux.HandleFunc(segment.SegmentRoute, cutter.ServeSegment)
-	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, sources, logger))
+	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, sources, adminToken, logger))
 	return httpx.RequestLogger(logger, mux)
 }
 

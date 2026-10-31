@@ -41,6 +41,11 @@ type configView struct {
 	StreamSecretSet bool   `json:"stream_secret_set"`
 	WebDAVUserSet   bool   `json:"webdav_user_set"`
 	WebDAVPassSet   bool   `json:"webdav_pass_set"`
+	// 刷新调度的三项：状态页要逐键标「生效时机」，其中 interval 是页面可直接改的
+	// 那一项（≤60 秒后调度器按新值算下一轮）。
+	RefreshIntervalSec int `json:"refresh_interval_sec"`
+	RefreshBatch       int `json:"refresh_batch"`
+	RefreshTimeoutSec  int `json:"refresh_timeout_sec"`
 }
 
 // sourceView 是一个播放源在状态页上的现状。
@@ -79,6 +84,9 @@ type statusView struct {
 	Totals  totalsView   `json:"totals"`
 	Config  configView   `json:"config"`
 	Sources []sourceView `json:"sources"`
+	// AdminTokenSet 是「后台写操作能不能用」：false = 没配 DRAMA_HUB_ADMIN_TOKEN，
+	// 所有 POST / DELETE / PATCH 都会 401。令牌本身不进任何响应，这里只报有没有。
+	AdminTokenSet bool `json:"admin_token_set"`
 }
 
 // handleStatus 处理 GET /api/status：看板只读，不改任何状态。
@@ -118,9 +126,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, statusView{
-		Totals:  totals,
-		Config:  cfg,
-		Sources: s.readSources(ctx, schedule),
+		Totals:        totals,
+		Config:        cfg,
+		Sources:       s.readSources(ctx, schedule),
+		AdminTokenSet: s.adminToken != "",
 	})
 }
 
@@ -149,12 +158,27 @@ func (s *Server) readConfig(ctx context.Context) (configView, error) {
 	if err != nil {
 		return configView{}, fmt.Errorf("读 cache_lru_days: %w", err)
 	}
+	refreshSec, err := s.settings.Int(ctx, store.KeyRefreshIntervalSec)
+	if err != nil {
+		return configView{}, fmt.Errorf("读 refresh_interval_sec: %w", err)
+	}
+	refreshBatch, err := s.settings.Int(ctx, store.KeyRefreshBatch)
+	if err != nil {
+		return configView{}, fmt.Errorf("读 refresh_batch: %w", err)
+	}
+	refreshTimeout, err := s.settings.Int(ctx, store.KeyRefreshTimeoutSec)
+	if err != nil {
+		return configView{}, fmt.Errorf("读 refresh_timeout_sec: %w", err)
+	}
 	out := configView{
-		StrmPrefix:   prefix,
-		SegTargetSec: target,
-		CacheDir:     cacheDir,
-		CacheMaxMB:   cacheMaxMB,
-		CacheLRUDays: cacheLRUDays,
+		StrmPrefix:         prefix,
+		SegTargetSec:       target,
+		CacheDir:           cacheDir,
+		CacheMaxMB:         cacheMaxMB,
+		CacheLRUDays:       cacheLRUDays,
+		RefreshIntervalSec: refreshSec,
+		RefreshBatch:       refreshBatch,
+		RefreshTimeoutSec:  refreshTimeout,
 	}
 	for _, item := range []struct {
 		key store.SettingKey

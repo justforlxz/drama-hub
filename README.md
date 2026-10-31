@@ -15,15 +15,28 @@ DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 ```
 
 首次启动自动建库与迁移。`stream_secret` 与 `cache_dir` 由环境变量**只在键缺失时**写入
-一次（2.0 没有 settings 写接口）；WebDAV 账号密码不走 env，由后台配置接口管理
-（MKACG-622）：
+一次；WebDAV 账号密码不走 env，用后台配置（`PATCH /api/settings` 或 `/status` 页的表单）
+写入：
 
 ```bash
-DRAMA_HUB_STREAM_SECRET=<≥32 字节> DRAMA_HUB_CACHE_DIR=/data/cache ./bin/drama-hub
+DRAMA_HUB_STREAM_SECRET=<≥32 字节> DRAMA_HUB_CACHE_DIR=/data/cache \
+DRAMA_HUB_ADMIN_TOKEN=<自己定一个长随机串> ./bin/drama-hub
 ```
 
-已有值不会被 env 覆盖，之后改值请直接改 `settings` 表（生效时机见
-`docs/DEV-STANDARDS.md`「配置」）。`strm_prefix` 留空时 `.strm` 里的地址按访问的 `Host`
+`DRAMA_HUB_ADMIN_TOKEN` 是**写操作的令牌**：`POST` / `DELETE` / `PATCH` 必须带
+`X-Admin-Token` 请求头，否则一律 401（没设这个 env 时所有写操作都不可用，状态页会直说）。
+读操作（页面、`GET /api/*`、WebDAV、播放）不需要它。新部署的完整路径就是：起容器 →
+用令牌写 WebDAV 账号密码 → 可用：
+
+```bash
+curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"settings":{"webdav_user":"emby","webdav_pass":"<密码>","strm_prefix":"http://192.168.1.10:8080"}}' \
+  http://127.0.0.1:8080/api/settings
+```
+
+已有值不会被 env 覆盖；之后改值都走这条接口（或在 `/status` 页上改，每项标着生效时机，
+见 `docs/DEV-STANDARDS.md`「配置」）。`strm_prefix` 留空时 `.strm` 里的地址按访问的 `Host`
 推导成绝对 URL，默认安装即可直接播放。
 
 ## HTTP 接口
@@ -51,7 +64,8 @@ DRAMA_HUB_STREAM_SECRET=<≥32 字节> DRAMA_HUB_CACHE_DIR=/data/cache ./bin/dra
 | `/api/dramas/{id}/episodes` | GET | 200 | 该剧全部集，供合并编排挑选 |
 | `/api/dramas/{id}/merge-groups` | GET / POST | 200 / 201 | 合并组列表 / 建组（`episode_ids` 顺序即时间轴顺序） |
 | `/api/merge-groups/{id}` | DELETE | 204 | 删组并重建对外集号 |
-| `/api/status` | GET | 200 | 同步计数、运行配置现状、各源调度状态（缓存面字段仍是 ADR-0004 的建议参数，见 `docs/DEV-STANDARDS.md`「缓存面」的已知偏差） |
+| `/api/status` | GET | 200 | 同步计数、运行配置现状（含各键的现读值；密钥只报「是否已设置」）、各源调度状态、`admin_token_set`（写操作能不能用） |
+| `/api/settings` | PATCH | 200 / 400 / 401 | 按 key 批量写配置：`{"settings":{"<key>":"<值>"}}` → 归一化后的值；未知键 / 非法值 400 且整批不落库；写操作要 `X-Admin-Token` |
 | 其它未登记路径 | 任意 | 404 | 由 web 的 mux 兜底 |
 
 对外 id 是 HMAC 常量签名（ADR-0003）：`id = uid + "-" + hex(HMAC-SHA256(secret,
@@ -86,9 +100,11 @@ ffmpeg 失败 → 502 且不写缓存。
 |---|---|
 | `/` 剧目 | 粘贴上游剧 id 或 `https://hongguoduanju.com/player/<id>` 链接同步入库；删剧目（连带集、合并组、对外集号） |
 | `/merges` 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即时间轴顺序）→ 删组；已入组的集不可重复选 |
-| `/status` 同步与缓存 | 剧目/集/对外集/合并组计数与最近同步时间、运行配置现状（密钥只显示是否已设置）、各源调度状态 |
+| `/status` 同步与缓存 | 剧目/集/对外集/合并组计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / strm 前缀 / 缓存上限与保留期 / 刷新间隔，直接写 `PATCH /api/settings`）、运行配置现状（密钥只显示是否已设置，每行标「生效时机」）、各源调度状态 |
 
-页面里的每个操作都直接落到上面的 `/api/` 端点，渲染结果与 API 返回一致。
+页面里的每个操作都直接落到上面的 `/api/` 端点，渲染结果与 API 返回一致。写操作（同步 /
+删除 / 建组 / 改配置）要先用顶栏的「管理令牌」填上 `DRAMA_HUB_ADMIN_TOKEN`，令牌只存在
+本标签页（`sessionStorage`）。
 
 缓存由本服务自己负责（ADR-0007）：海报、分片、关键帧索引落 `<cache_dir>`，按
 `cache_max_mb` / `cache_lru_days` 淘汰，规则见 `docs/CACHE-MODEL.md`；播放字节一律经本
@@ -97,8 +113,9 @@ ffmpeg 失败 → 502 且不写缓存。
 状态页只展示真正参与运行的配置，缓存目录/上限/保留天数都在「运行配置」里。）
 
 ```bash
-open http://127.0.0.1:8080/            # 剧目
+open http://127.0.0.1:8080/            # 剧目（顶栏填管理令牌后才能同步/删除）
 curl -s -X POST -H 'Content-Type: application/json' \
+  -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
   -d '{"series_id":"7503745441910017049"}' http://127.0.0.1:8080/api/dramas
 ```
 
@@ -157,7 +174,9 @@ podman logs drama-hub | head -1                        # version / commit 与构
   不挂卷时 `podman run -p 8080:8080 <image>` 直接可用，数据落在匿名卷里。
 - 起服务后调度器会立刻按默认间隔抓一次源，日志里有 `上游请求` 属正常。
 - ghcr 包默认私有：拉取前先 `podman login ghcr.io -u <user> -p <带 read:packages 的 PAT>`。
-- 首次配置入口还在 MKACG-616：镜像能起来、能跑，但对外推荐使用要等那一步落地。
+- 首次配置入口：`DRAMA_HUB_STREAM_SECRET` / `DRAMA_HUB_CACHE_DIR` 由 env 在键缺失时种下
+  （MKACG-616）；WebDAV 账号密码用 `DRAMA_HUB_ADMIN_TOKEN` 调 `PATCH /api/settings` 写
+  （MKACG-622），见「快速开始」。
 
 自己构建同一份镜像是 `make image`（`ENGINE=podman`，默认只出本机平台）。
 

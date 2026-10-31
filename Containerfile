@@ -107,6 +107,9 @@ EXPOSE 8080
 # cache_dir 必须在这里钉成绝对路径：WORKDIR 是 /data，settings 的默认值 ./data/cache
 # 会落成 /data/data/cache（空卷首次启动由 DRAMA_HUB_CACHE_DIR 引导写入，之后手改的值
 # 不会被覆盖）。
+#
+# DRAMA_HUB_ADMIN_TOKEN 不在这里设：它是写操作（POST/DELETE/PATCH）的令牌，必须由部署
+# 方在 `podman run -e` 时给。没给 = 写操作一律 401，状态页会说明「后台改配置不可用」。
 ENV DRAMA_HUB_ADDR=:8080 \
     DRAMA_HUB_DB=/data/drama.db \
     DRAMA_HUB_LOG_LEVEL=info \

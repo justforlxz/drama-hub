@@ -20,6 +20,11 @@
 4. **playlist 合法性**：自造 m3u8 必须能被 `ffprobe` 解析出预期总时长，且集边界处有 `#EXT-X-DISCONTINUITY`；分片串起来解码无错误（`ffmpeg -v error -i playlist -f null -` 返回 0）。
 5. **出流签名**（ADR-0003）：正确签名放行；篡改或缺失 → `401`。用 `crypto/hmac.Equal` 常数时间比较，**不测过期时间、不测 token 表**——这两样都不存在，写了就是给自己造需求。
 6. **settings**：非法值（越界、非数字）→ `400` 且不写入；合法值生效且下次读回一致。
+   `PATCH /api/settings` 的批量写入（MKACG-622）：整批里有未知键或非法值时**一行都不写**；
+   写进去的值返回归一化后的形态（`strm_prefix` 去尾 `/`）、密码与密钥回 `null` 不回显。
+6b. **写操作令牌**（MKACG-622）：`POST` / `DELETE` / `PATCH /api/*` 无令牌、错令牌都 `401`
+   且不产生副作用（没触发同步、没写库）；没配 `DRAMA_HUB_ADMIN_TOKEN` 时同样 `401`（fail
+   closed）；`GET /api/*` 与三页界面不受影响；令牌本身不出现在任何响应体里。
 7. **env 引导配置**（MKACG-616）：空库 + `DRAMA_HUB_STREAM_SECRET` / `DRAMA_HUB_CACHE_DIR`
    写入 settings；再跑一次不覆盖手改值；env 缺省不写空值；非法值（短 secret）不落库、
    不 panic；WebDAV 两个凭据 env **不写库**，并按未知变量 warn 列出支持的键。

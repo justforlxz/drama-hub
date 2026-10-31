@@ -87,18 +87,29 @@ func newTestServer(t *testing.T) (*Server, *store.Store, *fakeSyncer) {
 	syncer := &fakeSyncer{}
 	// 状态页的播放源清单由装配根给（生产里来自注册表），测试固定一个源。
 	sources := []Source{{Name: "web", Label: "红果官网 SSR"}}
-	return NewServer(st, store.NewSettings(db.DB), syncer, &fakeSchedule{}, sources, slog.New(slog.DiscardHandler)), st, syncer
+	return NewServer(st, store.NewSettings(db.DB), syncer, &fakeSchedule{}, sources, testAdminToken,
+		slog.New(slog.DiscardHandler)), st, syncer
+}
+
+// testAdminToken 是测试里的管理令牌：写操作（POST / DELETE / PATCH）要带它，
+// 与生产里 DRAMA_HUB_ADMIN_TOKEN 的作用相同。
+const testAdminToken = "test-admin-token"
+
+// newRequest 造一个带管理令牌的请求。鉴权用例自己拿它去掉/改坏令牌头。
+func newRequest(method, path, body string) *http.Request {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set(AdminTokenHeader, testAdminToken)
+	return req
 }
 
 // do 发一个真实请求，返回响应。
 func do(t *testing.T, s *Server, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
 	rec := httptest.NewRecorder()
-	s.ServeHTTP(rec, req)
+	s.ServeHTTP(rec, newRequest(method, path, body))
 	return rec
 }
 
@@ -671,7 +682,7 @@ func TestAPI_Refresh_RealScheduler(t *testing.T) {
 		map[string]scheduler.Syncer{"web": syncer},
 		slog.New(slog.DiscardHandler))
 	srv := NewServer(st, settings, syncer, sched, []Source{{Name: "web", Label: "红果官网 SSR"}},
-		slog.New(slog.DiscardHandler))
+		testAdminToken, slog.New(slog.DiscardHandler))
 
 	if rec := do(t, srv, http.MethodPost, "/api/refresh", `{"source":"web"}`); rec.Code != http.StatusAccepted {
 		t.Fatalf("第一次手动触发状态码 = %d, 期望 202（body=%s）", rec.Code, rec.Body.String())

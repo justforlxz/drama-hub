@@ -23,4 +23,6 @@
 //
 // 边界：直链不在本包解析（`ResolveFunc` 由装配根注入 `stream.Resolver`），也不落库
 // ——0004 已删 episode.play_url；合并编排（建组 / 重建派生表）属 internal/store。
+// 出站身份同理：ffmpeg / ffprobe 的 `-headers` 由装配根从插件常量注入（`NewCutter`
+// 的 headers），本包不认识任何源，也不提供默认 UA（MKACG-624）。
 package segment

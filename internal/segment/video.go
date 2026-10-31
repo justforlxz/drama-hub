@@ -125,7 +125,7 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return nil, err
 			}
-			return cut(ctx, playURL, sl.StartSec, sl.Dur, sl.OffsetSec)
+			return cut(ctx, playURL, sl.StartSec, sl.Dur, sl.OffsetSec, c.headerBlock)
 		})
 	if err != nil {
 		c.logger.WarnContext(ctx, "segment slice failed",

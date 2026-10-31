@@ -84,8 +84,9 @@ func main() {
 
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           newHandler(logger, st, settings, syncer, sched, sourceList(plugins, boots), caches, resolver),
+		Addr: addr,
+		Handler: newHandler(logger, st, settings, syncer, sched, sourceList(plugins, boots), caches, resolver,
+			playbackHeaders(boots)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -148,8 +149,11 @@ func main() {
 //
 // 请求日志中间件只在装配根挂一次：/healthz、/webdav/、/video/、/ 与未知路径都经它，
 // 每请求恰一条访问日志（见 internal/httpx）。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver) http.Handler {
-	cutter := segment.NewCutter(st, settings, logger, caches, resolver.DirectURL)
+//
+// playbackHeaders 是播放面取直链时 ffmpeg / ffprobe 要带的出站身份（`名称: 值`
+// 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624）：本函数不认识具体源。
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver, playbackHeaders []string) http.Handler {
+	cutter := segment.NewCutter(st, settings, logger, caches, resolver.DirectURL, playbackHeaders)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
@@ -210,6 +214,9 @@ type pluginBoot struct {
 //
 // 配置读不出来（值非法、库被手改）时用插件默认值并 warn：配置错不该让服务起不来，
 // 原因与现状在状态页看得见（plugin.<源>.* 三行）。
+//
+// 播放面的 ffmpeg `-headers` 也从这里的 `pluginBoot.BaseURL` 派生（MKACG-624）：
+// 身份只有一份（插件里的常量），地址也只有一份（boots），不再多传一个参数。
 func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logger) (*plugin.Registry, map[string]pluginBoot, error) {
 	baseURL, err := settings.String(ctx, store.PluginSettingKey(hongguo.Name, store.PluginItemBaseURL))
 	if err != nil {
@@ -233,6 +240,15 @@ func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logg
 		hongguo.Name: {BaseURL: baseURL, TimeoutSec: timeoutSec},
 	}
 	return reg, boots, nil
+}
+
+// playbackHeaders 把启动时注入给插件的配置翻成播放面的出站身份（MKACG-624）：
+// 身份（UA / Accept / …）的真值在插件里，地址取 boots 里那份 base_url ——
+// 与页面抓取用的是同一个值，不另传一个地址参数，也不在 segment 里写第二份 UA。
+//
+// ffmpeg / ffprobe 不走 http.Client，只能靠 `-headers`（docs/PLAYBACK-CONTRACT.md）。
+func playbackHeaders(boots map[string]pluginBoot) []string {
+	return hongguo.PlaybackHeaderLines(boots[hongguo.Name].BaseURL)
 }
 
 // mustPlugin 取已注册的插件。名字写死在内置清单里，取不到只可能是装配 bug，

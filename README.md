@@ -152,6 +152,8 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
   - `docs/L1-CORPUS-SCOPE.md` — 「获取全部的剧集」口径与红果实测数字
   - `docs/adr/0006-framework-plugin-boundary.md` — 框架 / 插件边界决策
   - `docs/adr/0007-own-hls-and-local-cache.md` — 播放统一走自造 HLS、缓存收回本服务
+  - `docs/MULTI-REPLICA.md` — 多副本部署、状态归属、键设计、故障矩阵、容量推算（下一版本）
+  - `docs/adr/0008-multi-replica-state-sharing.md` — 多副本只共享源级单飞锁，不引入 Redis（下一版本）
 
 ## 状态
 

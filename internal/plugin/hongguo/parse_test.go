@@ -104,6 +104,27 @@ func TestParsePlayerPageSeriesFields(t *testing.T) {
 	}
 }
 
+// protectedPlayback 是「网页通道只给预览」的声明（MKACG-626 / T3 取址顺序的判据）：
+// 受保护剧 fixture 解出 true，未受保护剧解出 false。
+func TestParsePlayerPageProtectedPlayback(t *testing.T) {
+	cases := []struct {
+		fixture string
+		want    bool
+	}{
+		{"page-series-protected.html", true},
+		{"page-series.html", false},
+	}
+	for _, tc := range cases {
+		got, err := parsePlayerPage(readFixture(t, tc.fixture), fixtureSID)
+		if err != nil {
+			t.Fatalf("parsePlayerPage(%s): %v", tc.fixture, err)
+		}
+		if got.protected != tc.want {
+			t.Fatalf("%s 的 protected = %v, 期望 %v", tc.fixture, got.protected, tc.want)
+		}
+	}
+}
+
 // AC5/AC6：身份不符与结构变化都必须报 plugin.ErrSchema，且不与 plugin.ErrUpstream 混淆。
 func TestParsePlayerPageRejects(t *testing.T) {
 	cases := []struct {

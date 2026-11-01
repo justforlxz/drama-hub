@@ -126,9 +126,15 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid
   探测的命令 MUST 在 `-i` **之前**加 `-decryption_key <hex>`，交给 ffmpeg 的 CENC-AES-CTR
   原生解密；本服务不实现解密、不落整集明文。key 只在本次请求的内存里过一手：
   不进日志、不进错误文本、不落库、不进缓存键（`docs/PLUGIN-CONTRACT.md`「加密切片与 Key」）。
-- 出站身份：`ffmpeg` / `ffprobe` 取直链 MUST 带 `-headers`（浏览器 UA + 源站根
-  `Referer`），与同步抓页面是同一份身份；这一份由装配根从插件常量注入
-  （`internal/segment` 不认识任何源），理由见 `docs/PLUGIN-CONTRACT.md` 硬性要求 8。
+- 出站身份**按通道两份**（MKACG-638）：`ffmpeg` / `ffprobe` 取直链 MUST 带 `-headers`，
+  但同一份头不能同时喂给两个通道 —— 网页通道（明文直链 `hongguoduanju.com/video/public/…`）
+  要浏览器 UA + 源站根 `Referer`，与同步抓页面是同一份身份；App 通道**只带 UA、不带
+  `Referer`**，它的媒体 CDN 对带站内 `Referer` 的请求回 `403`（实测二分：仅 `Referer`
+  403，无头 / 仅 UA 都能探出完整集时长）。两条通道各一份、MUST NOT 互相顶掉。
+  挑哪一份的判据与「分片身份带通道段」同一个：本次解析的
+  直链带不带内容密钥（`Stream.Key`）。两份都由装配根从插件常量派生、按通道注入
+  （`internal/segment` 不认识任何源，只按判据挑一份），理由见 `docs/PLUGIN-CONTRACT.md`
+  硬性要求 8。
 - 生成失败：502，**不写缓存**（不许把坏值写进缓存）。
 - `Range`：分片是完整不可变对象，支持 `Range` 但不需要分段生成；`HEAD` 返回同样的
   `Content-Length`（硬约束 3）。

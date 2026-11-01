@@ -30,6 +30,10 @@
   取源站根）。真值只有一份——插件里的常量；`ffmpeg` / `ffprobe` 不走 `http.Client`，
   由装配根用同一份常量拼 `-headers` 注入 `internal/segment`（`Cutter`），不在
   segment 里另写一个 UA。实测与理由见 MKACG-624、`docs/PLUGIN-CONTRACT.md` 硬性要求 8。
+- 播放面的出站身份**按通道两份**（MKACG-638）：`ffmpeg` / `ffprobe` 取 App 通道的直链时
+  **不带 `Referer`**（媒体 CDN 对带站内 `Referer` 的请求回 403，UA 保留无害），网页通道维持
+  UA + 源站根 `Referer`。用哪一份由同一条通道判据挑（本次解析带不带 `Stream.Key`），
+  两份都在装配根派生。写「一份身份全通道通用」的代码就是把一条通道打成 502。
 
 ### HTTP 边界：错误类别与统一响应
 

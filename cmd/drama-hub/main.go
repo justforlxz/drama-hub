@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -167,9 +168,10 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // 请求日志中间件只在装配根挂一次：/healthz、/webdav/、/video/、/ 与未知路径都经它，
 // 每请求恰一条访问日志（见 internal/httpx）。
 //
-// playbackHeaders 是播放面取直链时 ffmpeg / ffprobe 要带的出站身份（`名称: 值`
-// 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624）：本函数不认识具体源。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver, playbackHeaders []string, adminToken string) http.Handler {
+// playbackHeaders 是播放面取直链时 ffmpeg / ffprobe 要带的出站身份，两个通道各一份
+// （`名称: 值` 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624 / MKACG-638）：
+// 本函数不认识具体源。
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver, playbackHeaders segment.Headers, adminToken string) http.Handler {
 	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, playbackHeaders)
 
 	mux := http.NewServeMux()
@@ -259,13 +261,33 @@ func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logg
 	return reg, boots, nil
 }
 
-// playbackHeaders 把启动时注入给插件的配置翻成播放面的出站身份（MKACG-624）：
-// 身份（UA / Accept / …）的真值在插件里，地址取 boots 里那份 base_url ——
-// 与页面抓取用的是同一个值，不另传一个地址参数，也不在 segment 里写第二份 UA。
+// playbackHeaders 把启动时注入给插件的配置翻成播放面的出站身份（MKACG-624），
+// 两个通道各一份（MKACG-638）：身份（UA / Accept / …）的真值在插件里，地址取
+// boots 里那份 base_url —— 与页面抓取用的是同一个值，不另传一个地址参数，也不在
+// segment 里写第二份 UA。
+//
+// 两份不能合成一份：网页通道的直链要浏览器 UA + 源站根 Referer，而 App 通道的媒体
+// CDN 对带站内 Referer 的请求直接 403（实测二分：仅 Referer 403，无头 / 仅 UA 都是
+// 完整集）。差别只在 Referer，UA 保留。哪条通道用哪份由 segment 按同一判据
+// （本次解析带不带内容密钥）挑，这里只给两份材料。
 //
 // ffmpeg / ffprobe 不走 http.Client，只能靠 `-headers`（docs/PLAYBACK-CONTRACT.md）。
-func playbackHeaders(boots map[string]pluginBoot) []string {
-	return hongguo.PlaybackHeaderLines(boots[hongguo.Name].BaseURL)
+func playbackHeaders(boots map[string]pluginBoot) segment.Headers {
+	web := hongguo.PlaybackHeaderLines(boots[hongguo.Name].BaseURL)
+	return segment.Headers{Web: web, App: withoutReferer(web)}
+}
+
+// withoutReferer 去掉 Referer 那一行，其余身份原样保留（返回新切片，不动入参 ——
+// 两份身份长期共存，改一份不能串到另一份）。
+func withoutReferer(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(strings.ToLower(line), "referer:") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 // mustPlugin 取已注册的插件。名字写死在内置清单里，取不到只可能是装配 bug，

@@ -24,5 +24,7 @@
 // 边界：直链不在本包解析（`ResolveFunc` 由装配根注入 `stream.Resolver`），也不落库
 // ——0004 已删 episode.play_url；合并编排（建组 / 重建派生表）属 internal/store。
 // 出站身份同理：ffmpeg / ffprobe 的 `-headers` 由装配根从插件常量注入（`NewCutter`
-// 的 headers），本包不认识任何源，也不提供默认 UA（MKACG-624）。
+// 的 headers），本包不认识任何源，也不提供默认 UA（MKACG-624）。身份按通道两份
+// （`Headers`），用哪一份由本次解析出的直链决定 —— 判据就是本包既有的 `channelOf`
+// （MKACG-638：App 通道的媒体 CDN 拒绝站内 Referer，一份身份喂两个通道必有一边 403）。
 package segment

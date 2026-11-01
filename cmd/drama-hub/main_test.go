@@ -761,8 +761,15 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 	}
 	// 播放面的出站身份取的是同一份 boots：MKACG-616 把 base_url 改成经 pluginBoot
 	// 注入后，这条缝最容易退化成「页面用了配置、ffmpeg 用了默认」。
-	if got, want := playbackHeaders(boots), "Referer: "+site.URL+"/"; got[1] != want {
-		t.Fatalf("播放面 Referer = %q, 期望 %q（跟随 pluginBoot.BaseURL）", got[1], want)
+	// 两个通道各一份身份（MKACG-638）：网页通道 = UA + 站点根 Referer；App 通道 =
+	// 只有 UA —— 它的媒体 CDN 对带站内 Referer 的请求回 403，多带一行就是整集 502。
+	hdr := playbackHeaders(boots)
+	if len(hdr.Web) != 2 || hdr.Web[1] != "Referer: "+site.URL+"/" {
+		t.Fatalf("网页通道身份 = %q, 期望 UA + Referer %q（跟随 pluginBoot.BaseURL）",
+			hdr.Web, "Referer: "+site.URL+"/")
+	}
+	if len(hdr.App) != 1 || !strings.HasPrefix(hdr.App[0], "User-Agent: ") {
+		t.Fatalf("App 通道身份 = %q, 期望只有一份浏览器 UA（不带 Referer）", hdr.App)
 	}
 	h := newAssembly(logger, st, settings, sync.New(p, nil, logger), fakeSchedule{}, sourceList(reg, boots), reg)
 

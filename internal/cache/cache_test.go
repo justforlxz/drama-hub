@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
@@ -48,7 +49,7 @@ func (c *testClock) advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
-// testCache 是一套「真 SQLite + 临时 cache_dir + 可注入时钟」的缓存实例。
+// testCache 是一套「真数据库 + 临时 cache_dir + 可注入时钟」的缓存实例。
 type testCache struct {
 	c        *Cache
 	st       *store.Store
@@ -60,7 +61,7 @@ type testCache struct {
 func newTestCache(t *testing.T) *testCache {
 	t.Helper()
 	ctx := context.Background()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cache.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

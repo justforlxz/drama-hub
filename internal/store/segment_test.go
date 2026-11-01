@@ -124,7 +124,7 @@ func TestReplaceSegments_RollsBackOnFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("非法 mode 应返回错误")
 	}
-	// CHECK 约束失败在驱动里属于 SQLITE_CONSTRAINT(19) 而非唯一/主键子码，
+	// CHECK 约束失败是 SQLSTATE 23514（check_violation），不是 23505（unique_violation），
 	// wrapWriteErr 因此不映射为 ErrConflict —— 这里的断言重点是整体回滚。
 	if !errors.Is(err, ErrConflict) {
 		t.Logf("错误类别 = %v（CHECK 失败不映射 ErrConflict，符合 wrapWriteErr 契约）", err)

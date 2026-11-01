@@ -18,7 +18,7 @@ import (
 // Tree 是本包消费的虚拟文件树能力：List 列出一个目录的直接子项、Render 渲染文件字节。
 //
 // 接口定义在消费方（DEV-STANDARDS「代码组织」），只声明这里用到的两个方法。
-// 生产实现是 *vfs.Tree；单测用 fakeTree，不需要 SQLite 与真实渲染。
+// 生产实现是 *vfs.Tree；单测用 fakeTree，不需要数据库与真实渲染。
 type Tree interface {
 	List(ctx context.Context, dir string) ([]vfs.Node, error)
 	Render(ctx context.Context, path string) ([]byte, error)

@@ -32,6 +32,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # --test 跑两级：unit（--network=none）与 integration。integration 的
+      # postgres:16 服务容器由 scripts/ci.sh 自己起（自定义网络 + healthcheck +
+      # 退出清理），不依赖 workflow 里的 services: 块。
       - run: ENGINE=docker ./scripts/ci.sh --test
 
   image:

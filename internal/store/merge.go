@@ -62,7 +62,7 @@ func scanMergeGroup(scan func(dest ...any) error) (MergeGroup, error) {
 
 // ListMergeGroups 返回某部剧的全部合并组，按 id 升序。
 func (s *Store) ListMergeGroups(ctx context.Context, dramaID int64) ([]MergeGroup, error) {
-	rows, err := s.db.QueryContext(ctx, mergeGroupColumns+` WHERE drama_id = ? ORDER BY id`, dramaID)
+	rows, err := s.db.QueryContext(ctx, mergeGroupColumns+` WHERE drama_id = $1 ORDER BY id`, dramaID)
 	if err != nil {
 		return nil, fmt.Errorf("列合并组 drama_id=%d: %w", dramaID, err)
 	}
@@ -84,7 +84,7 @@ func (s *Store) ListMergeGroups(ctx context.Context, dramaID int64) ([]MergeGrou
 
 // MergeGroupByID 按主键查一个合并组。无行返回 ErrNotFound。
 func (s *Store) MergeGroupByID(ctx context.Context, id int64) (MergeGroup, error) {
-	row := s.db.QueryRowContext(ctx, mergeGroupColumns+` WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, mergeGroupColumns+` WHERE id = $1`, id)
 	g, err := scanMergeGroup(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MergeGroup{}, ErrNotFound
@@ -103,7 +103,7 @@ func (s *Store) ListMergeMembers(ctx context.Context, groupID int64) ([]MergeMem
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT mi.episode_id, mi.ord, e.ep_no
 		 FROM merge_item mi JOIN episode e ON e.id = mi.episode_id
-		 WHERE mi.group_id = ? ORDER BY mi.ord`, groupID)
+		 WHERE mi.group_id = $1 ORDER BY mi.ord`, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("列合并组成员 group_id=%d: %w", groupID, err)
 	}
@@ -139,6 +139,10 @@ func (s *Store) CreateMergeGroup(ctx context.Context, dramaID int64, label strin
 
 	var groupID int64
 	err := s.InTx(ctx, func(tx *Store) error {
+		// 锁序统一从 drama 开始（DEV-STANDARDS「数据库」）：先拿锁，再做归属校验与写入。
+		if err := tx.lockDrama(ctx, dramaID); err != nil {
+			return err
+		}
 		eps, err := tx.ListEpisodes(ctx, dramaID)
 		if err != nil {
 			return err
@@ -176,14 +180,14 @@ func (s *Store) CreateMergeGroup(ctx context.Context, dramaID int64, label strin
 		}
 
 		if err := tx.db.QueryRowContext(ctx,
-			`INSERT INTO merge_group(drama_id, label) VALUES(?, ?) RETURNING id`,
+			`INSERT INTO merge_group(drama_id, label) VALUES($1, $2) RETURNING id`,
 			dramaID, label,
 		).Scan(&groupID); err != nil {
 			return wrapWriteErr("写入合并组", err)
 		}
 		for i, id := range episodeIDs {
 			if _, err := tx.db.ExecContext(ctx,
-				`INSERT INTO merge_item(group_id, episode_id, ord) VALUES(?, ?, ?)`,
+				`INSERT INTO merge_item(group_id, episode_id, ord) VALUES($1, $2, $3)`,
 				groupID, id, i+1,
 			); err != nil {
 				return wrapWriteErr("写入合并组成员", err)
@@ -205,7 +209,11 @@ func (s *Store) DeleteMergeGroup(ctx context.Context, id int64) error {
 		if err != nil {
 			return err
 		}
-		res, err := tx.db.ExecContext(ctx, `DELETE FROM merge_group WHERE id = ?`, id)
+		// 锁序统一从 drama 开始：先锁剧目，再删合并组（与重建、回填、同步同一顺序）。
+		if err := tx.lockDrama(ctx, g.DramaID); err != nil {
+			return err
+		}
+		res, err := tx.db.ExecContext(ctx, `DELETE FROM merge_group WHERE id = $1`, id)
 		if err != nil {
 			return wrapWriteErr("删除合并组", err)
 		}
@@ -263,7 +271,17 @@ type outwardItem struct {
 }
 
 // rebuildEmbyItems 是 RebuildEmbyItems 的事务内实现（只碰 s.db，不开关事务）。
+//
+// 两条约束都在 lockDrama：
+//   - 同一部剧的「先删后插」必须串行。READ COMMITTED 下两个并发重建会各自按自己的
+//     快照删（删不到对方刚插入的行），再各自插入同一批 uid → 唯一约束冲突；
+//   - 这把锁同时是全局锁序（drama → 子表）的入口，锁在调用方的事务结束时释放，
+//     所以所有调用点都必须已经在事务里（CreateMergeGroup / DeleteMergeGroup /
+//     RebuildEmbyItems / BackfillEpisodeDuration）。
 func (s *Store) rebuildEmbyItems(ctx context.Context, dramaID int64) error {
+	if err := s.lockDrama(ctx, dramaID); err != nil {
+		return err
+	}
 	eps, err := s.ListEpisodes(ctx, dramaID)
 	if err != nil {
 		return err
@@ -315,13 +333,13 @@ func (s *Store) rebuildEmbyItems(ctx context.Context, dramaID int64) error {
 	}
 	sort.SliceStable(items, func(i, j int) bool { return items[i].sortKey < items[j].sortKey })
 
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM emby_item WHERE drama_id = ?`, dramaID); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM emby_item WHERE drama_id = $1`, dramaID); err != nil {
 		return wrapWriteErr("清空派生表", err)
 	}
 	for i, it := range items {
 		if _, err := s.db.ExecContext(ctx,
 			`INSERT INTO emby_item(drama_id, season, ep_no, kind, uid, runtime_sec)
-			 VALUES(?, 1, ?, ?, ?, ?)`,
+			 VALUES($1, 1, $2, $3, $4, $5)`,
 			dramaID, i+1, it.kind, it.uid, it.runtime,
 		); err != nil {
 			return wrapWriteErr("写入派生表", err)
@@ -341,7 +359,7 @@ const embyItemColumns = `SELECT id, drama_id, season, ep_no, kind, uid, runtime_
 // 无行返回 ErrNotFound。
 func (s *Store) EmbyItemByUID(ctx context.Context, uid string) (EmbyItem, error) {
 	var it EmbyItem
-	err := s.db.QueryRowContext(ctx, embyItemColumns+` WHERE uid = ?`, uid).
+	err := s.db.QueryRowContext(ctx, embyItemColumns+` WHERE uid = $1`, uid).
 		Scan(&it.ID, &it.DramaID, &it.Season, &it.EpNo, &it.Kind, &it.UID, &it.RuntimeSec)
 	if errors.Is(err, sql.ErrNoRows) {
 		return EmbyItem{}, ErrNotFound
@@ -358,7 +376,7 @@ func (s *Store) EmbyItemByUID(ctx context.Context, uid string) (EmbyItem, error)
 // EpFrom/EpTo（合并集的源集号范围）。vfs 渲染文件名与 NFO 都用它，因此这是
 // 「对外集号只由 emby_item 决定」的唯一入口（硬约束 6）。
 func (s *Store) ListEmbyItems(ctx context.Context, dramaID int64) ([]EmbyItem, error) {
-	rows, err := s.db.QueryContext(ctx, embyItemColumns+` WHERE drama_id = ? ORDER BY ep_no`, dramaID)
+	rows, err := s.db.QueryContext(ctx, embyItemColumns+` WHERE drama_id = $1 ORDER BY ep_no`, dramaID)
 	if err != nil {
 		return nil, fmt.Errorf("列对外剧集 drama_id=%d: %w", dramaID, err)
 	}
@@ -391,7 +409,7 @@ func (s *Store) ListEmbyItems(ctx context.Context, dramaID int64) ([]EmbyItem, e
 		singleIDs = append(singleIDs, id)
 	}
 	if len(singleIDs) > 0 {
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(singleIDs)), ",")
+		placeholders := placeholders(1, len(singleIDs))
 		args := make([]any, len(singleIDs))
 		for i, id := range singleIDs {
 			args[i] = id

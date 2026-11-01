@@ -44,7 +44,7 @@ func scanArtifact(scan func(dest ...any) error) (Artifact, error) {
 //
 // 无行返回 ErrNotFound —— 调用方据此决定「回源还是直接用本地文件」。
 func (s *Store) ArtifactByKey(ctx context.Context, kind, key string) (Artifact, error) {
-	row := s.db.QueryRowContext(ctx, artifactColumns+` WHERE kind = ? AND key = ?`, kind, key)
+	row := s.db.QueryRowContext(ctx, artifactColumns+` WHERE kind = $1 AND key = $2`, kind, key)
 	a, err := scanArtifact(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Artifact{}, ErrNotFound
@@ -62,7 +62,7 @@ func (s *Store) ArtifactByKey(ctx context.Context, kind, key string) (Artifact, 
 func (s *Store) PutArtifact(ctx context.Context, a Artifact) error {
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO artifact(kind, key, path, bytes, sha256, last_used_at)
-		 VALUES(?, ?, ?, ?, ?, ?)
+		 VALUES($1, $2, $3, $4, $5, $6)
 		 ON CONFLICT(kind, key) DO UPDATE
 		 SET path = excluded.path,
 		     bytes = excluded.bytes,
@@ -82,7 +82,7 @@ func (s *Store) PutArtifact(ctx context.Context, a Artifact) error {
 // 丢一次 touch 只让这条更早被淘汰，不影响正确性。
 func (s *Store) TouchArtifact(ctx context.Context, kind, key, at string) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE artifact SET last_used_at = ? WHERE kind = ? AND key = ?`, at, kind, key)
+		`UPDATE artifact SET last_used_at = $1 WHERE kind = $2 AND key = $3`, at, kind, key)
 	if err != nil {
 		return fmt.Errorf("更新缓存资产 %s/%s: %w", kind, key, err)
 	}
@@ -102,7 +102,7 @@ func (s *Store) TouchArtifact(ctx context.Context, kind, key, at string) error {
 // 对调用方是自愈情形，不是异常。
 func (s *Store) DeleteArtifact(ctx context.Context, kind, key string) error {
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM artifact WHERE kind = ? AND key = ?`, kind, key)
+		`DELETE FROM artifact WHERE kind = $1 AND key = $2`, kind, key)
 	if err != nil {
 		return fmt.Errorf("删除缓存资产 %s/%s: %w", kind, key, err)
 	}
@@ -123,7 +123,7 @@ func (s *Store) DeleteArtifact(ctx context.Context, kind, key string) error {
 func (s *Store) SumArtifactBytes(ctx context.Context, kind string) (int64, error) {
 	var total int64
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(bytes), 0) FROM artifact WHERE kind = ?`, kind).Scan(&total); err != nil {
+		`SELECT COALESCE(SUM(bytes), 0) FROM artifact WHERE kind = $1`, kind).Scan(&total); err != nil {
 		return 0, fmt.Errorf("统计缓存资产 %s 的字节数: %w", kind, err)
 	}
 	return total, nil
@@ -135,7 +135,7 @@ func (s *Store) SumArtifactBytes(ctx context.Context, kind string) (int64, error
 // idx_artifact_kind_last_used，取一批删一批，避免长事务。
 func (s *Store) ListArtifactsOldest(ctx context.Context, kind string, limit int) ([]Artifact, error) {
 	rows, err := s.db.QueryContext(ctx,
-		artifactColumns+` WHERE kind = ? ORDER BY last_used_at LIMIT ?`, kind, limit)
+		artifactColumns+` WHERE kind = $1 ORDER BY last_used_at LIMIT $2`, kind, limit)
 	if err != nil {
 		return nil, fmt.Errorf("列出最久未用的缓存资产 %s: %w", kind, err)
 	}
@@ -149,7 +149,7 @@ func (s *Store) ListArtifactsOldest(ctx context.Context, kind string, limit int)
 // 字符串比较即时间比较。
 func (s *Store) ListExpiredArtifacts(ctx context.Context, before string, limit int) ([]Artifact, error) {
 	rows, err := s.db.QueryContext(ctx,
-		artifactColumns+` WHERE last_used_at < ? ORDER BY last_used_at LIMIT ?`, before, limit)
+		artifactColumns+` WHERE last_used_at < $1 ORDER BY last_used_at LIMIT $2`, before, limit)
 	if err != nil {
 		return nil, fmt.Errorf("列出过期的缓存资产: %w", err)
 	}

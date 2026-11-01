@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -18,7 +19,7 @@ import (
 //	DramaByTitleYear      → idx_drama_title
 //
 // 只有 ListGenres（根目录）会扫整条覆盖索引；其余三条都是点查 / 区间查询。
-// 计划由 TestDirectoryQueryPlans 钉住（EXPLAIN QUERY PLAN 断言索引名）。
+// 计划由 TestDirectoryQueryPlans 钉住（EXPLAIN 断言索引名）。
 
 // ListGenres 返回库中出现过的全部分类（genre 原值，含表示「未声明」的空串），
 // 按字节序升序。
@@ -51,14 +52,14 @@ func (s *Store) ListGenres(ctx context.Context) ([]string, error) {
 // 供 vfs 解析「一个分类目录名对应哪些 genre 值」：目录名 → 取值集合是纯映射
 // （`其他` → `{"", "其他"}`，其余就是目录名本身），所以只需要存在性判断。
 //
-// 必须是 `EXISTS (SELECT 1 … WHERE genre = ?)` 这种点查（O(log n)，实测微秒级）：
+// 必须是 `EXISTS (SELECT 1 … WHERE genre = $1)` 这种点查（O(log n)，实测微秒级）：
 // 换成 `SELECT DISTINCT genre FROM drama` 是覆盖索引全扫（60 万行约 74ms），
 // 换成 `SELECT DISTINCT genre WHERE genre IN (…)` 也要扫该分类的全部索引行
 // （183k 行约 44ms）——两者都会让每层列举随库规模增长。
 func (s *Store) GenreExists(ctx context.Context, genre string) (bool, error) {
 	var ok bool
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM drama WHERE genre = ?)`, genre).Scan(&ok); err != nil {
+		`SELECT EXISTS(SELECT 1 FROM drama WHERE genre = $1)`, genre).Scan(&ok); err != nil {
 		return false, fmt.Errorf("查分类是否存在 %q: %w", genre, err)
 	}
 	return ok, nil
@@ -79,7 +80,7 @@ func (s *Store) ListDramasByShard(ctx context.Context, genres []string, shard in
 	args = append(args, shard)
 
 	rows, err := s.db.QueryContext(ctx,
-		dramaColumns+` WHERE genre IN (`+placeholders(len(genres))+`) AND shard = ? ORDER BY title`,
+		dramaColumns+` WHERE genre IN (`+placeholders(1, len(genres))+`) AND shard = $`+strconv.Itoa(len(genres)+1)+` ORDER BY title`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("列分片 %d 的剧目: %w", shard, err)
@@ -107,7 +108,7 @@ func (s *Store) ListDramasByShard(ctx context.Context, genres []string, shard in
 // 则退到分片内查询），因此这里不承诺「返回的就是你要的那部」。
 func (s *Store) DramaByTitleYear(ctx context.Context, title string, year int) (Drama, error) {
 	row := s.db.QueryRowContext(ctx,
-		dramaColumns+` WHERE title = ? AND year = ? ORDER BY id LIMIT 1`, title, year)
+		dramaColumns+` WHERE title = $1 AND year = $2 ORDER BY id LIMIT 1`, title, year)
 	d, err := scanDrama(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Drama{}, ErrNotFound
@@ -118,9 +119,14 @@ func (s *Store) DramaByTitleYear(ctx context.Context, title string, year int) (D
 	return d, nil
 }
 
-// placeholders 返回 n 个逗号分隔的 SQL 占位符，供 IN (…) 拼接。
+// placeholders 返回从 from 起、共 n 个逗号分隔的位置占位符（$from,$from+1,…），
+// 供 IN (…) 拼接。PostgreSQL 的位置占位符带序号，所以起点必须是调用方算好的。
 //
 // 只拼占位符个数，参数一律走绑定（值不进 SQL 文本）。
-func placeholders(n int) string {
-	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+func placeholders(from, n int) string {
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = "$" + strconv.Itoa(from+i)
+	}
+	return strings.Join(parts, ",")
 }

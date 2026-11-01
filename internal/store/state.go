@@ -39,7 +39,7 @@ func scanState(scan func(dest ...any) error) (SourceState, error) {
 // 无行返回 ErrNotFound —— 「这个源还没跑过任何一轮」是调用方要区分的情形
 // （S4 启动时据此插入一行空状态），所以不返回零值冒充成功。
 func (s *Store) LoadState(ctx context.Context, name string) (SourceState, error) {
-	row := s.db.QueryRowContext(ctx, sourceStateColumns+` WHERE name = ?`, name)
+	row := s.db.QueryRowContext(ctx, sourceStateColumns+` WHERE name = $1`, name)
 	st, err := scanState(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SourceState{}, ErrNotFound
@@ -58,7 +58,7 @@ func (s *Store) LoadState(ctx context.Context, name string) (SourceState, error)
 func (s *Store) SaveState(ctx context.Context, st SourceState) error {
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO source_state(name, cursor, last_run_at, last_ok_at, last_error)
-		 VALUES(?, ?, ?, ?, ?)
+		 VALUES($1, $2, $3, $4, $5)
 		 ON CONFLICT(name) DO UPDATE
 		 SET cursor = excluded.cursor,
 		     last_run_at = excluded.last_run_at,

@@ -4,24 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
-	_ "modernc.org/sqlite"
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 )
 
-// newTestDB 建一个临时文件 SQLite 并建表。用真驱动、真文件：
+// newTestDB 用独立 schema 的测试库并建 settings 表。用真驱动、真库：
 // settings 的读回/不落库断言必须看得到实际的库内容。
 func newTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "settings.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("打开临时库: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := pgtest.Open(t)
 	if err := EnsureSettings(context.Background(), db); err != nil {
 		t.Fatalf("EnsureSettings: %v", err)
 	}
@@ -32,7 +26,7 @@ func newTestDB(t *testing.T) *sql.DB {
 func hasRow(t *testing.T, db *sql.DB, key SettingKey) bool {
 	t.Helper()
 	var n int
-	if err := db.QueryRow(`SELECT count(*) FROM settings WHERE key = ?`, string(key)).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM settings WHERE key = $1`, string(key)).Scan(&n); err != nil {
 		t.Fatalf("统计 %s: %v", key, err)
 	}
 	return n > 0
@@ -159,7 +153,7 @@ func TestSetUpdatesExistingRow(t *testing.T) {
 		t.Fatalf("读到 %d, 期望 30", got)
 	}
 	var rows int
-	if err := db.QueryRow(`SELECT count(*) FROM settings WHERE key = ?`, string(KeySegTargetSec)).Scan(&rows); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM settings WHERE key = $1`, string(KeySegTargetSec)).Scan(&rows); err != nil {
 		t.Fatalf("统计行数: %v", err)
 	}
 	if rows != 1 {

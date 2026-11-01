@@ -3,35 +3,49 @@ package store
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"io/fs"
-	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 )
 
-// openRaw 打开一个尚未迁移的 SQLite 临时文件，由测试自己决定跑不跑 migrate。
-func openRaw(t *testing.T, path string) *sql.DB {
+// openRaw 打开一个尚未迁移的测试库（独立 schema，空库），由测试自己决定跑不跑 migrate。
+func openRaw(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("pgx", pgtest.DSN(t))
 	if err != nil {
-		t.Fatalf("打开临时库: %v", err)
+		t.Fatalf("打开测试库: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
-// tableNames 返回库内全部用户表的表名（升序）。
+// openTestDB 走生产路径（Open = 连接 + 迁移）。
+func openTestDB(t *testing.T) *DB {
+	t.Helper()
+	db, err := Open(context.Background(), pgtest.DSN(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// tableNames 返回当前 schema 内全部用户表的表名（升序）。
 func tableNames(t *testing.T, db *sql.DB) []string {
 	t.Helper()
-	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
+	rows, err := db.Query(`SELECT table_name FROM information_schema.tables
+		WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+		ORDER BY table_name`)
 	if err != nil {
-		t.Fatalf("查询 sqlite_master: %v", err)
+		t.Fatalf("查询 information_schema.tables: %v", err)
 	}
 	defer rows.Close()
 
@@ -49,26 +63,31 @@ func tableNames(t *testing.T, db *sql.DB) []string {
 	return names
 }
 
-// userVersion 读 PRAGMA user_version。
+// userVersion 读 schema_migrations 的当前版本（空表为 0）。
 func userVersion(t *testing.T, db *sql.DB) int {
 	t.Helper()
-	var v int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
-		t.Fatalf("读取 user_version: %v", err)
+	v, err := schemaVersion(context.Background(), db)
+	if err != nil {
+		t.Fatalf("读 schema 版本: %v", err)
 	}
 	return v
 }
 
-// AC1：空库迁到最新，applied / user_version / 表集合都符合预期。
-func TestMigrateToLatest(t *testing.T) {
-	db := openRaw(t, filepath.Join(t.TempDir(), "fresh.db"))
-	ctx := context.Background()
-
+// latestVersion 返回迁移文件里的最大版本号。
+func latestVersion(t *testing.T) int {
+	t.Helper()
 	files, err := migrations()
 	if err != nil {
 		t.Fatalf("读取迁移清单: %v", err)
 	}
-	latest := files[len(files)-1].version
+	return files[len(files)-1].version
+}
+
+// AC：空库迁到最新，applied / schema 版本 / 表集合都符合预期。
+func TestMigrateToLatest(t *testing.T) {
+	db := openRaw(t)
+	ctx := context.Background()
+	latest := latestVersion(t)
 
 	applied, err := migrate(ctx, db)
 	if err != nil {
@@ -78,21 +97,21 @@ func TestMigrateToLatest(t *testing.T) {
 		t.Fatalf("applied = %d, 期望 %d（空库应执行全部迁移）", applied, latest)
 	}
 	if got := userVersion(t, db); got != latest {
-		t.Fatalf("user_version = %d, 期望 %d", got, latest)
+		t.Fatalf("schema 版本 = %d, 期望 %d", got, latest)
 	}
 
 	want := []string{
 		"artifact", "drama", "emby_item", "episode",
-		"merge_group", "merge_item", "segment", "settings", "source_state",
+		"merge_group", "merge_item", "schema_migrations", "segment", "settings", "source_state",
 	}
 	if got := tableNames(t, db); !reflect.DeepEqual(got, want) {
 		t.Fatalf("表集合 = %v, 期望 %v", got, want)
 	}
 }
 
-// AC2：幂等。第二次迁移不执行任何文件、不动 user_version、不清数据。
+// AC：幂等。第二次迁移不执行任何文件、不动版本、不清数据。
 func TestMigrateIdempotent(t *testing.T) {
-	db := openRaw(t, filepath.Join(t.TempDir(), "idem.db"))
+	db := openRaw(t)
 	ctx := context.Background()
 
 	if _, err := migrate(ctx, db); err != nil {
@@ -112,7 +131,7 @@ func TestMigrateIdempotent(t *testing.T) {
 		t.Fatalf("第二次 applied = %d, 期望 0", applied)
 	}
 	if got := userVersion(t, db); got != before {
-		t.Fatalf("user_version 从 %d 变为 %d", before, got)
+		t.Fatalf("schema 版本从 %d 变为 %d", before, got)
 	}
 
 	var n int
@@ -124,138 +143,131 @@ func TestMigrateIdempotent(t *testing.T) {
 	}
 }
 
-// AC3a：连接参数在每一条连接上生效（journal_mode / busy_timeout / foreign_keys）。
-func TestOpenPragmas(t *testing.T) {
+// AC：Open 是「连接 + 迁移」，并把本次结果报给调用方（启动日志用它）。
+// 同一 schema 二次 Open：applied=0、版本不变。
+func TestOpenReportsSchemaVersion(t *testing.T) {
+	dsn := pgtest.DSN(t)
+	latest := latestVersion(t)
 	ctx := context.Background()
-	db, err := Open(ctx, filepath.Join(t.TempDir(), "pragma.db"))
+
+	first, err := Open(ctx, dsn)
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		t.Fatalf("首次 Open: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	if first.SchemaVersion != latest || first.Applied != latest {
+		t.Fatalf("首次 Open = (版本 %d, applied %d), 期望 (%d, %d)",
+			first.SchemaVersion, first.Applied, latest, latest)
+	}
+	_ = first.Close()
 
-	var mode string
-	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&mode); err != nil {
-		t.Fatalf("读 journal_mode: %v", err)
+	second, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("二次 Open: %v", err)
 	}
-	if mode != "wal" {
-		t.Fatalf("journal_mode = %q, 期望 wal", mode)
+	t.Cleanup(func() { _ = second.Close() })
+	if second.SchemaVersion != latest {
+		t.Fatalf("二次 Open 版本 = %d, 期望 %d（不变）", second.SchemaVersion, latest)
 	}
+	if second.Applied != 0 {
+		t.Fatalf("二次 Open applied = %d, 期望 0（迁移全部已执行）", second.Applied)
+	}
+}
 
-	// busy_timeout / foreign_keys 是每连接属性：同时持有两条独立连接分别断言，
-	// 证明 DSN 的 _pragma 作用于每条新连接，而不是只有 Ping 的那一条。
-	conns := make([]*sql.Conn, 2)
-	for i := range conns {
-		conn, err := db.Conn(ctx)
+// AC：多实例同时启动只有一个真正执行迁移，另一个等锁后跳过；无重复执行、无报错。
+func TestMigrateConcurrentSingleApplier(t *testing.T) {
+	dsn := pgtest.DSN(t)
+	latest := latestVersion(t)
+	ctx := context.Background()
+
+	pools := make([]*sql.DB, 2)
+	for i := range pools {
+		db, err := sql.Open("pgx", dsn)
 		if err != nil {
-			t.Fatalf("取第 %d 条连接: %v", i+1, err)
+			t.Fatalf("打开第 %d 个连接池: %v", i+1, err)
 		}
-		conns[i] = conn
-		t.Cleanup(func() { _ = conn.Close() })
+		pools[i] = db
+		t.Cleanup(func() { _ = db.Close() })
 	}
-	for i, conn := range conns {
-		var busy, fk int
-		if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busy); err != nil {
-			t.Fatalf("读第 %d 条连接 busy_timeout: %v", i+1, err)
+
+	applied := make([]int, len(pools))
+	errs := make([]error, len(pools))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, db := range pools {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			applied[i], errs[i] = migrate(ctx, db)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	total := 0
+	for i := range pools {
+		if errs[i] != nil {
+			t.Fatalf("第 %d 个实例迁移报错: %v", i+1, errs[i])
 		}
-		if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk); err != nil {
-			t.Fatalf("读第 %d 条连接 foreign_keys: %v", i+1, err)
-		}
-		if busy != 5000 {
-			t.Fatalf("第 %d 条连接 busy_timeout = %d, 期望 5000", i+1, busy)
-		}
-		if fk != 1 {
-			t.Fatalf("第 %d 条连接 foreign_keys = %d, 期望 1", i+1, fk)
+		total += applied[i]
+	}
+	if total != latest {
+		t.Fatalf("两个实例的 applied 合计 = %d, 期望 %d（迁移被重复执行或漏执行）", total, latest)
+	}
+	if applied[0] != 0 && applied[1] != 0 {
+		t.Fatalf("两个实例都执行了迁移（applied = %v），advisory lock 未生效", applied)
+	}
+	for i, db := range pools {
+		if got := userVersion(t, db); got != latest {
+			t.Fatalf("第 %d 个实例看到的版本 = %d, 期望 %d", i+1, got, latest)
 		}
 	}
+	t.Logf("并发启动 applied = %v，合计 %d", applied, total)
 }
 
-// AC3b：外键约束真的生效，且 ON DELETE CASCADE 定义正确。
-func TestForeignKeyEnforced(t *testing.T) {
+// AC：迁移中途失败（坏 SQL）——runner 返回错误、版本停在失败前、错误里带文件名
+// 与失败前版本（启动日志只有这一条依据）。
+func TestMigrateFailureKeepsVersion(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, filepath.Join(t.TempDir(), "fk.db"))
+	files, err := migrations()
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		t.Fatalf("读取迁移清单: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	before := len(files)
 
-	// 引用不存在的 drama 必须失败。
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO episode(drama_id, ep_no, source, vid) VALUES(999, 1, 'web', 'v1')`); err == nil {
-		t.Fatal("引用不存在 drama_id 的 episode 插入未报错")
+	db := openRaw(t)
+	badList := append(append([]migration{}, files...), migration{
+		version: before + 1,
+		name:    "0005_bad_sql.sql",
+		sql:     "THIS IS NOT SQL;",
+	})
+	applied, err := migrateFiles(ctx, db, badList)
+	if err == nil {
+		t.Fatal("坏 SQL 迁移未报错")
 	}
-
-	res, err := db.ExecContext(ctx,
-		`INSERT INTO drama(provider, provider_id, title) VALUES('web', 'p1', 't')`)
-	if err != nil {
-		t.Fatalf("插入 drama: %v", err)
+	if applied != before {
+		t.Fatalf("失败前执行了 %d 个迁移, 期望 %d（坏文件之前的全部成功）", applied, before)
 	}
-	dramaID, err := res.LastInsertId()
-	if err != nil {
-		t.Fatalf("取 drama id: %v", err)
-	}
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO episode(drama_id, ep_no, source, vid) VALUES(?, 1, 'web', 'v1')`, dramaID); err != nil {
-		t.Fatalf("插入合法 episode: %v", err)
-	}
-
-	if _, err := db.ExecContext(ctx, `DELETE FROM drama WHERE id = ?`, dramaID); err != nil {
-		t.Fatalf("删除 drama: %v", err)
-	}
-	var n int
-	if err := db.QueryRowContext(ctx,
-		`SELECT count(*) FROM episode WHERE drama_id = ?`, dramaID).Scan(&n); err != nil {
-		t.Fatalf("统计 episode: %v", err)
-	}
-	if n != 0 {
-		t.Fatalf("删除 drama 后残留 %d 条 episode, 期望 0（ON DELETE CASCADE 未生效）", n)
-	}
-}
-
-// column 是 PRAGMA table_info 中参与双源比对的一行。
-type column struct {
-	name    string
-	typ     string
-	notnull int
-	pk      int
-}
-
-// tableInfo 读 PRAGMA table_info 的 (name, type, notnull, pk)。
-func tableInfo(t *testing.T, db *sql.DB, table string) []column {
-	t.Helper()
-	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
-	if err != nil {
-		t.Fatalf("PRAGMA table_info(%s): %v", table, err)
-	}
-	defer rows.Close()
-
-	var cols []column
-	for rows.Next() {
-		var (
-			cid  int
-			c    column
-			dflt sql.NullString
-		)
-		if err := rows.Scan(&cid, &c.name, &c.typ, &c.notnull, &dflt, &c.pk); err != nil {
-			t.Fatalf("扫描 table_info: %v", err)
+	for _, want := range []string{"0005_bad_sql.sql", "当前 schema 版本 " + strconv.Itoa(before)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误文本缺 %q: %v", want, err)
 		}
-		cols = append(cols, c)
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("遍历 table_info: %v", err)
+	if got := userVersion(t, db); got != before {
+		t.Fatalf("失败后版本 = %d, 期望停在 %d", got, before)
 	}
-	return cols
+	t.Logf("坏 SQL 失败后的可读错误: %v", err)
 }
 
-// AC4：settings 双源（EnsureSettings 与迁移）表结构一致，且两条路径任一顺序共存都不报错。
+// AC：settings 双源（EnsureSettings 与迁移）表结构一致，且两条路径任一顺序共存都不报错。
 func TestSettingsDDLDrift(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
 
-	onlyEnsure := openRaw(t, filepath.Join(dir, "ensure.db"))
+	onlyEnsure := openRaw(t)
 	if err := EnsureSettings(ctx, onlyEnsure); err != nil {
 		t.Fatalf("EnsureSettings: %v", err)
 	}
-	onlyMigrate := openRaw(t, filepath.Join(dir, "migrate.db"))
+	onlyMigrate := openRaw(t)
 	if _, err := migrate(ctx, onlyMigrate); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -266,7 +278,7 @@ func TestSettingsDDLDrift(t *testing.T) {
 		t.Fatalf("settings 表结构漂移:\n  EnsureSettings = %+v\n  migrate        = %+v", ensureCols, migrateCols)
 	}
 
-	ensureFirst := openRaw(t, filepath.Join(dir, "ensure-first.db"))
+	ensureFirst := openRaw(t)
 	if err := EnsureSettings(ctx, ensureFirst); err != nil {
 		t.Fatalf("先 EnsureSettings: %v", err)
 	}
@@ -274,7 +286,7 @@ func TestSettingsDDLDrift(t *testing.T) {
 		t.Fatalf("EnsureSettings 后 migrate: %v", err)
 	}
 
-	migrateFirst := openRaw(t, filepath.Join(dir, "migrate-first.db"))
+	migrateFirst := openRaw(t)
 	if _, err := migrate(ctx, migrateFirst); err != nil {
 		t.Fatalf("先 migrate: %v", err)
 	}
@@ -320,14 +332,58 @@ func TestMigrationFileNaming(t *testing.T) {
 	}
 }
 
-// Open 指向不存在的目录应返回错误而非 panic。
-func TestOpenInvalidPath(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "missing", "sub", "db.sqlite")
-	db, err := Open(context.Background(), path)
-	if err == nil {
-		_ = db.Close()
-		t.Fatal("Open 不存在的目录返回 nil 错误")
+// AC：连不上库 / 参数非法时 Open 返回错误而非 panic（启动路径必须能报错退出）。
+func TestOpenRejectsBadConfig(t *testing.T) {
+	ctx := context.Background()
+
+	if _, err := Open(ctx, ""); err == nil {
+		t.Fatal("Open 空连接串未报错")
 	}
+	if _, err := Open(ctx, "this is not a dsn"); err == nil {
+		t.Fatal("Open 非法连接串未报错")
+	}
+
+	t.Setenv(EnvDBMaxOpenConns, "-1")
+	if _, err := Open(ctx, pgtest.DSN(t)); err == nil {
+		t.Fatal("Open 非法池参数未报错")
+	}
+}
+
+// column 是 information_schema.columns 参与双源比对的一行。
+type column struct {
+	name    string
+	typ     string
+	notnull bool
+}
+
+// tableInfo 读 (column_name, data_type, is_nullable)，按列序返回。
+func tableInfo(t *testing.T, db *sql.DB, table string) []column {
+	t.Helper()
+	rows, err := db.Query(`SELECT column_name, data_type, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = $1
+		ORDER BY ordinal_position`, table)
+	if err != nil {
+		t.Fatalf("information_schema.columns(%s): %v", table, err)
+	}
+	defer rows.Close()
+
+	var cols []column
+	for rows.Next() {
+		var (
+			c        column
+			nullable string
+		)
+		if err := rows.Scan(&c.name, &c.typ, &nullable); err != nil {
+			t.Fatalf("扫描 columns(%s): %v", table, err)
+		}
+		c.notnull = nullable == "NO"
+		cols = append(cols, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 columns(%s): %v", table, err)
+	}
+	return cols
 }
 
 // sortedMapKeys 把 map 的键排成稳定顺序，供 t.Logf 输出。
@@ -350,95 +406,73 @@ func sortedNames(set map[string]bool) []string {
 	return names
 }
 
-// indexNames 返回某张表上的索引名集合（含自动索引）。
+// indexNames 返回某张表上的索引名集合（走 pg_indexes，只看当前 schema）。
 func indexNames(t *testing.T, db *sql.DB, table string) map[string]bool {
 	t.Helper()
-	rows, err := db.Query(fmt.Sprintf(`PRAGMA index_list(%s)`, table))
+	rows, err := db.Query(`SELECT indexname FROM pg_indexes
+		WHERE schemaname = current_schema() AND tablename = $1`, table)
 	if err != nil {
-		t.Fatalf("PRAGMA index_list(%s): %v", table, err)
+		t.Fatalf("pg_indexes(%s): %v", table, err)
 	}
 	defer rows.Close()
 
-	cols, err := rows.Columns()
-	if err != nil {
-		t.Fatalf("读 index_list 列名: %v", err)
-	}
 	names := make(map[string]bool)
 	for rows.Next() {
-		// PRAGMA 的列随 SQLite 版本增减（seq/name/unique/origin/partial），
-		// 只按列名取 name，不依赖位置。
-		raw := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range raw {
-			ptrs[i] = &raw[i]
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("扫描 pg_indexes(%s): %v", table, err)
 		}
-		if err := rows.Scan(ptrs...); err != nil {
-			t.Fatalf("扫描 index_list(%s): %v", table, err)
-		}
-		for i, c := range cols {
-			if strings.EqualFold(c, "name") {
-				if name, ok := raw[i].(string); ok {
-					names[name] = true
-				}
-			}
-		}
+		names[name] = true
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("遍历 index_list(%s): %v", table, err)
+		t.Fatalf("遍历 pg_indexes(%s): %v", table, err)
 	}
 	return names
 }
 
-// columnDefaults 返回 PRAGMA table_info(table) 的 name → dflt_value（NULL 记为 ""）。
+// columnDefaults 返回 information_schema.columns 的 column_name → column_default（NULL 记为 ""）。
 func columnDefaults(t *testing.T, db *sql.DB, table string) map[string]string {
 	t.Helper()
-	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	rows, err := db.Query(`SELECT column_name, column_default
+		FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = $1`, table)
 	if err != nil {
-		t.Fatalf("PRAGMA table_info(%s): %v", table, err)
+		t.Fatalf("information_schema.columns(%s): %v", table, err)
 	}
 	defer rows.Close()
 
 	out := make(map[string]string)
 	for rows.Next() {
-		var (
-			cid  int
-			name string
-			typ  string
-			nn   int
-			dflt sql.NullString
-			pk   int
-		)
-		if err := rows.Scan(&cid, &name, &typ, &nn, &dflt, &pk); err != nil {
-			t.Fatalf("扫描 table_info(%s): %v", table, err)
+		var name string
+		var dflt sql.NullString
+		if err := rows.Scan(&name, &dflt); err != nil {
+			t.Fatalf("扫描 columns(%s): %v", table, err)
 		}
 		out[name] = dflt.String
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("遍历 table_info(%s): %v", table, err)
+		t.Fatalf("遍历 columns(%s): %v", table, err)
 	}
 	return out
 }
 
-// AC：S3 段落 0002（genre/tags/shard + 两索引 + source_state）与 0003（artifact
-// 重建），S8 段再落 0004（删 episode.play_url / play_url_at）。空库 applied=4、
-// user_version=4，且 episode 表里两列真的没了（docs/DATA-MODEL.md 0003 块）。
-func TestMigrateStopsAtS8(t *testing.T) {
-	db := openRaw(t, filepath.Join(t.TempDir(), "s3.db"))
+// AC：4 份迁移全部生效（0002 genre/tags/shard + 两索引 + source_state、
+// 0003 artifact 扩 kind、0004 删 episode.play_url / play_url_at）。
+func TestMigrateAllFiles(t *testing.T) {
+	db := openRaw(t)
 	ctx := context.Background()
 
 	applied, err := migrate(ctx, db)
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	if applied != 4 {
-		t.Fatalf("首次 applied = %d, 期望 4（0001+0002+0003+0004）", applied)
+	latest := latestVersion(t)
+	if applied != latest {
+		t.Fatalf("首次 applied = %d, 期望 %d", applied, latest)
 	}
-	if got := userVersion(t, db); got != 4 {
-		t.Fatalf("user_version = %d, 期望 4", got)
-	}
-	t.Logf("空库首次 applied=%d user_version=%d", applied, userVersion(t, db))
+	t.Logf("空库首次 applied=%d 版本=%d", applied, userVersion(t, db))
 
-	// 0004：直链两列必须消失（PRAGMA table_info 是唯一真值，不看迁移文本）。
+	// 0004：直链两列必须消失（information_schema 是唯一真值，不看迁移文本）。
 	episodeCols := columnDefaults(t, db, "episode")
 	for _, gone := range []string{"play_url", "play_url_at"} {
 		if _, ok := episodeCols[gone]; ok {
@@ -459,32 +493,22 @@ func TestMigrateStopsAtS8(t *testing.T) {
 	if applied != 0 {
 		t.Fatalf("第二次 applied = %d, 期望 0", applied)
 	}
-	if got := userVersion(t, db); got != 4 {
-		t.Fatalf("第二次 user_version = %d, 期望 4", got)
-	}
-	t.Logf("二次执行 applied=%d user_version=%d", applied, userVersion(t, db))
+	t.Logf("二次执行 applied=%d 版本=%d", applied, userVersion(t, db))
 }
 
-// AC：drama 三列就位且默认值正确（插入只给必填列时它们是 ” / '[]' / 0）。
+// AC：drama 三列就位——只给必填列插入时取 schema 默认值（” / '[]' / 0），
+// 两条目录索引与淘汰索引必须就位（索引名是 docs/DATA-MODEL.md 的契约）。
 func TestDramaGenreTagsShardColumns(t *testing.T) {
-	db := openRaw(t, filepath.Join(t.TempDir(), "genre.db"))
+	db := openRaw(t)
 	ctx := context.Background()
 	if _, err := migrate(ctx, db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 
 	defaults := columnDefaults(t, db, "drama")
-	for _, tc := range []struct{ col, want string }{
-		{"genre", "''"},
-		{"tags", "'[]'"},
-		{"shard", "0"},
-	} {
-		got, ok := defaults[tc.col]
-		if !ok {
-			t.Fatalf("drama 缺列 %s", tc.col)
-		}
-		if got != tc.want {
-			t.Errorf("drama.%s 默认值 = %q, 期望 %q", tc.col, got, tc.want)
+	for _, col := range []string{"genre", "tags", "shard"} {
+		if _, ok := defaults[col]; !ok {
+			t.Fatalf("drama 缺列 %s", col)
 		}
 	}
 
@@ -503,7 +527,6 @@ func TestDramaGenreTagsShardColumns(t *testing.T) {
 		t.Fatalf("默认值 = (%q, %q, %d), 期望 (\"\", \"[]\", 0)", genre, tags, shard)
 	}
 
-	// 两条目录索引 + 淘汰索引必须就位（索引名是 docs/DATA-MODEL.md 的契约）。
 	dramaIdx := indexNames(t, db, "drama")
 	for _, name := range []string{"idx_drama_genre_shard_title", "idx_drama_title"} {
 		if !dramaIdx[name] {
@@ -519,17 +542,20 @@ func TestDramaGenreTagsShardColumns(t *testing.T) {
 	t.Logf("drama 默认值: genre=%s tags=%s shard=%s", defaults["genre"], defaults["tags"], defaults["shard"])
 }
 
-// AC：artifact 重建只扩 kind，重建前的 cover/index 两行逐字段保留；三类 kind 可写，
+// AC：artifact 扩 kind 只加一类，已有 cover/index 两行逐字段保留；三类 kind 可写，
 // CHECK 拒绝未知 kind。
 func TestArtifactRebuildKeepsRows(t *testing.T) {
-	db := openRaw(t, filepath.Join(t.TempDir(), "artifact.db"))
+	db := openRaw(t)
 	ctx := context.Background()
 
 	files, err := migrations()
 	if err != nil {
 		t.Fatalf("读取迁移清单: %v", err)
 	}
-	// 先只跑到 0002，制造「重建前」的 artifact（旧 CHECK 只有 cover/index）。
+	// 手工跑到 0002，制造「扩 kind 前」的 artifact（旧 CHECK 只有 cover/index）。
+	if _, err := db.ExecContext(ctx, createSchemaMigrations); err != nil {
+		t.Fatalf("建 schema_migrations: %v", err)
+	}
 	for _, m := range files {
 		if m.version > 2 {
 			break
@@ -556,23 +582,21 @@ func TestArtifactRebuildKeepsRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	if applied != 2 {
-		t.Fatalf("重建段 applied = %d, 期望 2（只剩 0003 + 0004）", applied)
+	if want := len(files) - 2; applied != want {
+		t.Fatalf("扩 kind 段 applied = %d, 期望 %d", applied, want)
 	}
 
 	for _, want := range before {
 		got, err := s.ArtifactByKey(ctx, want.Kind, want.Key)
 		if err != nil {
-			t.Fatalf("重建后读 %s/%s: %v", want.Kind, want.Key, err)
+			t.Fatalf("扩 kind 后读 %s/%s: %v", want.Kind, want.Key, err)
 		}
 		if got != want {
-			t.Errorf("重建后 %s/%s = %+v, 期望逐字段 %+v", want.Kind, want.Key, got, want)
+			t.Errorf("扩 kind 后 %s/%s = %+v, 期望逐字段 %+v", want.Kind, want.Key, got, want)
 		}
 	}
 	if n := countRows(t, db, "artifact"); n != len(before) {
-		t.Fatalf("重建后 artifact 行数 = %d, 期望 %d", n, len(before))
-	} else {
-		t.Logf("重建后 artifact 行数 = %d，cover/index 两行逐字段保留", n)
+		t.Fatalf("扩 kind 后 artifact 行数 = %d, 期望 %d", n, len(before))
 	}
 
 	// 三类 kind 都能写：cover/index 已在，补 segment。
@@ -591,5 +615,39 @@ func TestArtifactRebuildKeepsRows(t *testing.T) {
 	}
 	if n := countRows(t, db, "artifact"); n != len(before)+1 {
 		t.Fatalf("拒绝未知 kind 后行数 = %d, 期望 %d", n, len(before)+1)
+	}
+}
+
+// AC：外键约束真的生效，且 ON DELETE CASCADE 定义正确。
+func TestForeignKeyEnforced(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// 引用不存在的 drama 必须失败。
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO episode(drama_id, ep_no, source, vid) VALUES(999, 1, 'web', 'v1')`); err == nil {
+		t.Fatal("引用不存在 drama_id 的 episode 插入未报错")
+	}
+
+	var dramaID int64
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO drama(provider, provider_id, title) VALUES('web', 'p1', 't') RETURNING id`).Scan(&dramaID); err != nil {
+		t.Fatalf("插入 drama: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO episode(drama_id, ep_no, source, vid) VALUES($1, 1, 'web', 'v1')`, dramaID); err != nil {
+		t.Fatalf("插入合法 episode: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `DELETE FROM drama WHERE id = $1`, dramaID); err != nil {
+		t.Fatalf("删除 drama: %v", err)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM episode WHERE drama_id = $1`, dramaID).Scan(&n); err != nil {
+		t.Fatalf("统计 episode: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("删除 drama 后残留 %d 条 episode, 期望 0（ON DELETE CASCADE 未生效）", n)
 	}
 }

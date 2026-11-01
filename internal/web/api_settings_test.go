@@ -6,10 +6,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
@@ -63,7 +63,7 @@ func TestAPI_WriteEndpointsRequireToken(t *testing.T) {
 
 	t.Run("没配令牌时 fail closed", func(t *testing.T) {
 		// 装配根没给令牌（env 没设）：所有写操作仍然 401，而不是「没配 = 不设防」。
-		db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "no-token.db"))
+		db, err := store.Open(context.Background(), pgtest.DSN(t))
 		if err != nil {
 			t.Fatalf("store.Open: %v", err)
 		}

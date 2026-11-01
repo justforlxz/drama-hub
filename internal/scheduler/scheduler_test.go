@@ -7,12 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
@@ -171,7 +171,7 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// harness 是一套真实依赖：临时 SQLite（真迁移、真 settings）+ 假上游 + 假写库编排。
+// harness 是一套真实依赖：临时数据库（真迁移、真 settings）+ 假上游 + 假写库编排。
 type harness struct {
 	t        *testing.T
 	db       *store.DB
@@ -190,7 +190,7 @@ var testNow = time.Date(2026, 10, 30, 9, 0, 0, 0, time.UTC)
 func newHarness(t *testing.T, sources ...*fakeSource) *harness {
 	t.Helper()
 	ctx := context.Background()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "scheduler.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -610,25 +610,23 @@ func TestStatus_NextDueRestartAndNoColumn(t *testing.T) {
 	}
 
 	// 库里没有 next_due 列：五列就是全部（S3 QA 留下的对端确认结论）。
-	rows, err := h.db.Query(`PRAGMA table_info(source_state)`)
+	rows, err := h.db.Query(`SELECT column_name FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'source_state'
+		ORDER BY ordinal_position`)
 	if err != nil {
-		t.Fatalf("PRAGMA table_info: %v", err)
+		t.Fatalf("读 source_state 列: %v", err)
 	}
 	defer rows.Close()
 	var columns []string
 	for rows.Next() {
-		var (
-			cid     int
-			name    string
-			ctype   string
-			notNull int
-			dflt    any
-			pk      int
-		)
-		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
-			t.Fatalf("读 table_info 行: %v", err)
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("读 source_state 列行: %v", err)
 		}
 		columns = append(columns, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 source_state 列: %v", err)
 	}
 	want := []string{"name", "cursor", "last_run_at", "last_ok_at", "last_error"}
 	if strings.Join(columns, ",") != strings.Join(want, ",") {

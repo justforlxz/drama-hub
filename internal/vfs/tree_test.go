@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
@@ -77,7 +77,7 @@ func seedTree(t *testing.T, strmPrefix string, withSecret bool) fixture {
 	t.Helper()
 	ctx := context.Background()
 
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "vfs.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

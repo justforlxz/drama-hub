@@ -8,14 +8,14 @@
 |---|---|---|
 | Go | `go 1.27`（开发机 go1.27.2） | 与 CI 一致 |
 | 模块 | `github.com/justforlxz/drama-hub` | |
-| 数据库 | `modernc.org/sqlite`（纯 Go） | 免 cgo，交叉编译单二进制 |
+| 数据库 | PostgreSQL 16；驱动 `github.com/jackc/pgx/v5` 的 stdlib 适配层 | 单后端、多写者，ADR-0009 |
 | WebDAV | `golang.org/x/net/webdav` | 只需要 FileSystem 接口 |
 | HTTP | 标准库 `net/http` + 1.22 路由模式 | 不引框架 |
 | 日志 | `log/slog`（JSON handler） | |
 | 模板/前端 | `html/template` + 原生 JS，`embed` 进二进制 | 无构建步骤 |
 | 进程 | `ffmpeg` / `ffprobe` 外部依赖 | 不内嵌二进制 |
 
-**不引入**：ORM、Web 框架、依赖注入容器、前端框架、第二个 SQLite 驱动、任何需要 cgo 的库。
+**不引入**：ORM、Web 框架、依赖注入容器、前端框架、第二个数据库驱动、任何需要 cgo 的库。
 
 新增任何第三方依赖，先在 `docs/adr/` 写一条 ADR 说明「为什么标准库不够」，否则打回。
 
@@ -60,17 +60,19 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 ## 数据库
 
-- 迁移文件 `internal/store/migrations/NNNN_<verb>_<subject>.sql`，只向前，不改历史文件。启动时自动执行到最新。
-- 所有 SQL 只在 `internal/store` 出现；其它包通过方法访问。SQL 字符串拼接一律用参数占位。
-- 连接参数固定：`journal_mode=WAL`、`busy_timeout=5000`、`foreign_keys=ON`。
+- 迁移文件 `internal/store/migrations/NNNN_<verb>_<subject>.sql`，只向前，不改历史文件。启动时自动执行到最新；版本真值在 `schema_migrations`（不是数据库的 user_version），并发保护用会话级 `pg_advisory_lock`（锁与迁移共用一条连接，多副本同时启动只有一个真正执行）。迁移失败即返回错误，`main` 记日志后退出——不提供半迁移服务。
+- 所有 SQL 只在 `internal/store` 出现；其它包通过方法访问。占位符是 PostgreSQL 的 `$n`（`IN (…)` 的序号由 `placeholders(from, n)` 算偏移），值一律走绑定，不拼进 SQL 文本。
+- 连接串是必填项 `DRAMA_HUB_DB_URL`；连接池参数走 env（`DRAMA_HUB_DB_MAX_OPEN_CONNS` / `DRAMA_HUB_DB_MAX_IDLE_CONNS` / `DRAMA_HUB_DB_CONN_MAX_LIFETIME_SEC`），非法值启动即报错，不静默退回默认。
 - 派生的 `emby_item` 表由 `store.RebuildEmbyItems(dramaID)` 幂等重建，调用点只有同步完成（`internal/sync` 的 `Syncer.SyncSeries`）、合并变更（`CreateMergeGroup` / `DeleteMergeGroup`）与首播回填时长（`store.BackfillEpisodeDuration`，事务内直接调 `rebuildEmbyItems`）三处。重建是「整体替换」：先删该剧全部行再按源集号顺序插入，对外集号从 1 起连续；单集占 1 个集号、合并组也只占 1 个。
 - 合并编排只在 `internal/store/merge.go`：`merge_group`（组）+ `merge_item`（组内成员，`ord` 即时间轴顺序）+ `emby_item`（派生）。`CreateMergeGroup` 校验成员至少 2 集、同剧、不重复、不与已有组重叠（违反返回 `ErrInvalid`，不落库）。
-- 时间统一存 UTC 的 RFC3339 文本；展示时区转换在 Web 层做。
-- store 用哨兵错误表达结果：查询/删除无行返回 `ErrNotFound`，唯一/主键约束冲突由 `wrapWriteErr` 统一映射为 `ErrConflict`（均可 `errors.Is` 判断），不向调用方泄漏裸 `*sqlite.Error`。
+- 时间统一存 UTC 的 RFC3339 文本（列类型是不透明 `TEXT`，`空串 = 还没发生过`）；展示时区转换在 Web 层做。只有 `schema_migrations.applied_at` 是 `TIMESTAMPTZ`（runner 自己的时间）。
+- store 用哨兵错误表达结果：查询/删除无行返回 `ErrNotFound`，唯一/主键约束冲突（SQLSTATE `23505`）由 `wrapWriteErr` 统一映射为 `ErrConflict`（均可 `errors.Is` 判断），不向调用方泄漏裸 `*pgconn.PgError`。
 - `drama` / `episode` 的写入一律 upsert：`drama` 以 `(provider, provider_id)`、`episode` 以 `(drama_id, ep_no)` 为幂等身份，冲突时只更新可变业务列，身份列与入参 `id` 被忽略，返回行 id。其中 `episode.duration_sec` 只在插件给了非零值时覆盖，否则保留库里已有的值 —— 上游批量拿不到时长（恒 0），首播建索引回填的实测值不能被下一轮刷新清零。
-- 删剧走 `drama → episode` 的 `ON DELETE CASCADE` 连带删集（依赖 `foreign_keys=ON`，由 `Open` 的 DSN 施加），不影响其它剧目；`segment` 经 `episode` 级联一并删除。
+- 删剧走 `drama → episode` 的 `ON DELETE CASCADE` 连带删集（PostgreSQL 外键默认强制，不需要连接参数），不影响其它剧目；`segment` 经 `episode` 级联一并删除。
 - `segment` 表是「每集的分片索引」，由 `internal/segment` 索引任务整体重建：`ReplaceSegments` 一事务内先删后插（重复索引幂等、失败整体回滚），`ListSegments` 按 `start_sec` 升序（即片内序）；无行返回空切片而非 `ErrNotFound`（「还没索引」是正常状态，由分片端点按 503 处理）。
-- 跨行写入用 `Store.InTx`：同一事务内执行、失败整体回滚。事务内 `Store` 复用同一批读写方法；取数/网络请求必须在事务之外完成（SQLite 单写者，长事务持锁）。
+- 跨行写入用 `Store.InTx`：同一事务内执行、失败整体回滚。事务内 `Store` 复用同一批读写方法；取数/网络请求必须在事务之外完成（长事务持行锁，会挡住同剧的其它写者）。
+- **写事务的锁序固定为「drama → 子表」**：任何按剧写入子表的事务，第一条写语句之前先 `lockDrama`（`SELECT … FOR UPDATE`，`internal/store/lock.go`），再动 `episode` / `merge_*` / `emby_item`。两条事务以相反顺序请求同两行即 40P01 死锁（一方被中止）：同步事务先锁 `drama`（`UpsertDrama`）再逐集锁 `episode`，所以首播回填必须先锁 `drama` 再 `UPDATE episode`，合并编排必须先锁 `drama` 再写/删 `merge_*`。新增按剧写入的入口必须遵守，并用「外部持锁 + `FOR UPDATE NOWAIT` 探针」的测试钉住（`internal/store/crud_test.go` 的 `TestBackfillLocksDramaBeforeEpisode`）。
+- 派生表重建（`rebuildEmbyItems`）同一部剧的「先删后插」必须串行：READ COMMITTED 下两个并发重建会各自按自己的快照删、再各自插入同一批行，撞唯一约束。串行化同样由 `lockDrama` 提供，不另设锁。
 
 ## 配置
 
@@ -103,7 +105,7 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 
 运行时配置只有一张表 `settings(key TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT)`。
 
-启动期只读这几个环境变量：`DRAMA_HUB_DB` / `DRAMA_HUB_ADDR` / `DRAMA_HUB_LOG_LEVEL`
+启动期只读这几个环境变量：`DRAMA_HUB_DB_URL` / `DRAMA_HUB_DB_MAX_OPEN_CONNS` / `DRAMA_HUB_DB_MAX_IDLE_CONNS` / `DRAMA_HUB_DB_CONN_MAX_LIFETIME_SEC` / `DRAMA_HUB_ADDR` / `DRAMA_HUB_LOG_LEVEL`
 （进程自身），`DRAMA_HUB_STREAM_SECRET` / `DRAMA_HUB_CACHE_DIR`（空卷首次引导，见下），
 `DRAMA_HUB_ADMIN_TOKEN`（后台写操作令牌，见「管理 API」的写操作鉴权）。其余全部走 settings。
 
@@ -669,13 +671,13 @@ Basic，凭据取 `settings.webdav_user` / `webdav_pass`，**每请求现读**�
 
 ### 测试（两层，都不需要外部 rclone）
 
-**单元**（`fs_unit_test.go`）：`fakeTree` 按目录给出子项与渲染字节，**不碰 SQLite、不起
+**单元**（`fs_unit_test.go`）：`fakeTree` 按目录给出子项与渲染字节，**不碰数据库、不起
 HTTP**。覆盖：DAV 根 = vfs 根、长度只来自 `len(渲染字节)`、`os.IsNotExist` 认得的
 `*fs.PathError` 包装、目录打开惰性（`OpenFile` 不查子项、`Readdir` 才查）、`Readdir`
 直接子项且只查该目录、只读语义、请求内快照（同目录只 `List` 一次、同路径只渲染一次、
 不跨请求复用）、列举/渲染错误透传。
 
-**集成**（`webdav_test.go`）：真 SQLite + 真 handler（`httptest`），验证协议契约。
+**集成**（`webdav_test.go`）：真 PostgreSQL（独立 schema）+ 真 handler（`httptest`），验证协议契约。
 客户端游览（等同 `rclone lsf --max-depth 5`、Emby 扫库的请求序列）由进程内的递归
 PROPFIND 客户端完成，不依赖外部二进制、不起守护进程、不落盘：
 

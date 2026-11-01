@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 )
 
 // seedMergeDrama 建一部有 n 集、每集时长 100+ep_no 秒的剧，返回 (剧 id, 集 id 列表)。
@@ -285,4 +287,76 @@ func TestDeleteDrama_CascadesMergeTables(t *testing.T) {
 			t.Errorf("删剧后 %s 残留 %d 行, 期望 0", table, n)
 		}
 	}
+}
+
+// AC：同剧并发 upsert 与 RebuildEmbyItems 并发——无死锁、无重复行。
+//
+// 刷新（UpsertEpisode）与派生表重建（RebuildEmbyItems）是两条会同时发生的写路径：
+// 前者写 episode、后者先删后插 emby_item。这里让它们并发多轮，任何死锁（40P01）
+// 或唯一约束冲突都会让测试失败；结束后派生表必须仍是「每集一条、集号唯一」。
+func TestConcurrentUpsertAndRebuild(t *testing.T) {
+	db := newCRUDTestDB(t)
+	st := NewStore(db.DB)
+	ctx := context.Background()
+	const episodes = 6
+	dramaID, ids := seedMergeDrama(t, st, episodes)
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	const rounds = 10
+	errCh := make(chan error, 3)
+	// 写路径 A：刷新同一部剧的每一集（同剧并发 upsert）。
+	go func() {
+		for round := 0; round < rounds; round++ {
+			for i := 1; i <= episodes; i++ {
+				if _, err := st.UpsertEpisode(ctx, Episode{
+					DramaID: dramaID, EpNo: i, DurationSec: 100 + i, Source: "web", Vid: "v2",
+				}); err != nil {
+					errCh <- fmt.Errorf("upsert ep%d: %w", i, err)
+					return
+				}
+			}
+		}
+		errCh <- nil
+	}()
+	// 写路径 B：两个并发的派生表重建（与刷新交错）。
+	for i := 0; i < 2; i++ {
+		go func() {
+			for round := 0; round < rounds; round++ {
+				if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+					errCh <- fmt.Errorf("rebuild: %w", err)
+					return
+				}
+			}
+			errCh <- nil
+		}()
+	}
+	for i := 0; i < 3; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("并发写失败: %v", err)
+		}
+	}
+
+	items, err := st.ListEmbyItems(ctx, dramaID)
+	if err != nil {
+		t.Fatalf("ListEmbyItems: %v", err)
+	}
+	seen := make(map[int]bool, len(items))
+	for _, it := range items {
+		if seen[it.EpNo] {
+			t.Fatalf("派生表出现重复对外集号 %d（items=%+v）", it.EpNo, items)
+		}
+		seen[it.EpNo] = true
+	}
+	if len(items) != episodes {
+		t.Fatalf("派生表条目 = %d, 期望 %d", len(items), episodes)
+	}
+	if n := countRows(t, db.DB, "emby_item"); n != episodes {
+		t.Fatalf("emby_item 行数 = %d, 期望 %d（无重复行）", n, episodes)
+	}
+	if n := countRows(t, db.DB, "episode"); n != episodes {
+		t.Fatalf("episode 行数 = %d, 期望 %d（并发 upsert 不得重复建集）", n, episodes)
+	}
+	_ = ids
 }

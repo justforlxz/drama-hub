@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"modernc.org/sqlite"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // 写层哨兵错误。调用方用 errors.Is 判断，不比较错误字符串。
@@ -17,29 +17,23 @@ var (
 	ErrInvalid = errors.New("入参非法")
 )
 
-// SQLite 扩展结果码。modernc.org/sqlite 在每条连接上启用扩展结果码
-// （conn.go:130 调用 sqlite3_extended_result_codes），所以约束冲突带回子码
-// 而不是基码 SQLITE_CONSTRAINT(19)。驱动没有导出这两个常量的名字，这里按
-// lib/sqlite.go 的数值固化；实测（真实唯一/主键冲突）与之一致。
-const (
-	sqliteConstraintUnique     = 2067 // SQLITE_CONSTRAINT_UNIQUE
-	sqliteConstraintPrimaryKey = 1555 // SQLITE_CONSTRAINT_PRIMARYKEY
-)
+// PostgreSQL SQLSTATE：23505 = unique_violation。
+//
+// 唯一索引与主键冲突在 PostgreSQL 里都是这一个码（不像 SQLite 分 UNIQUE /
+// PRIMARYKEY 两个扩展码），因此映射到 ErrConflict 只需要一条规则。
+const pgUniqueViolation = "23505"
 
 // wrapWriteErr 把写路径的驱动错误映射为 store 的哨兵错误。
 //
 // 唯一/主键约束冲突统一映射为 ErrConflict；其余错误保持原样并带上 op 上下文。
-// 所有写方法都必须经过它，保证 store 不向调用方泄漏裸露的 *sqlite.Error。
+// 所有写方法都必须经过它，保证 store 不向调用方泄漏裸露的 *pgconn.PgError。
 func wrapWriteErr(op string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var sqliteErr *sqlite.Error
-	if errors.As(err, &sqliteErr) {
-		switch sqliteErr.Code() {
-		case sqliteConstraintUnique, sqliteConstraintPrimaryKey:
-			return fmt.Errorf("%s: %w", op, ErrConflict)
-		}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+		return fmt.Errorf("%s: %w", op, ErrConflict)
 	}
 	return fmt.Errorf("%s: %w", op, err)
 }

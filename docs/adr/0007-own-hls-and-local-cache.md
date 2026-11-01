@@ -75,7 +75,7 @@ rclone 从播放链路里退出，只留 WebDAV 只读挂载。
   Emby/rclone 的配置建议要重写。
 - 本服务多两件事要自己保证：缓存不写坏值、生成失败不留半截文件。都写进了
   `docs/CACHE-MODEL.md` 的测试要求。
-- SQLite 多一类 `artifact` 行（`kind='segment'`）：行数 = 缓存条目数（默认 8 GB / 650 KB ≈ 1.3 万行），
+- 数据库里多一类 `artifact` 行（`kind='segment'`）：行数 = 缓存条目数（默认 8 GB / 650 KB ≈ 1.3 万行），
   不是全库规模，可接受。
 - 换 `stream_secret` 会让所有已发出的 URL 失效（与 1.0 一致），但**不影响已缓存的分片**
   （缓存键用 `uid` 不用 `id`）。

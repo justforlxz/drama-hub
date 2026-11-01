@@ -121,7 +121,7 @@ func (s *Settings) Set(ctx context.Context, key SettingKey, raw string) error {
 		return fmt.Errorf("编码配置 %s: %w", key, err)
 	}
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?)
+		`INSERT INTO settings(key, value_json, updated_at) VALUES($1, $2, $3)
 		 ON CONFLICT(key) DO UPDATE
 		 SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
 		string(key), string(encoded), time.Now().UTC().Format(time.RFC3339),
@@ -172,7 +172,7 @@ func (s *Settings) SetMany(ctx context.Context, values map[SettingKey]string) (m
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, key := range keys {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?)
+			`INSERT INTO settings(key, value_json, updated_at) VALUES($1, $2, $3)
 			 ON CONFLICT(key) DO UPDATE
 			 SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
 			string(key), encoded[key], now,
@@ -201,7 +201,7 @@ func (s *Settings) SetIfAbsent(ctx context.Context, key SettingKey, raw string) 
 		return false, fmt.Errorf("编码配置 %s: %w", key, err)
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?)
+		`INSERT INTO settings(key, value_json, updated_at) VALUES($1, $2, $3)
 		 ON CONFLICT(key) DO NOTHING`,
 		string(key), string(encoded), time.Now().UTC().Format(time.RFC3339),
 	)
@@ -328,7 +328,7 @@ func (s *Settings) value(ctx context.Context, key SettingKey) (any, error) {
 // load 读 key 的已编码值。found 为 false 表示库中无该行。
 func (s *Settings) load(ctx context.Context, key SettingKey) (encoded string, found bool, err error) {
 	err = s.db.QueryRowContext(ctx,
-		`SELECT value_json FROM settings WHERE key = ?`, string(key)).Scan(&encoded)
+		`SELECT value_json FROM settings WHERE key = $1`, string(key)).Scan(&encoded)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}

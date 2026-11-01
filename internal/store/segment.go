@@ -40,13 +40,13 @@ func scanSegment(scan func(dest ...any) error) (Segment, error) {
 // 清空该集索引。唯一/主键约束冲突返回 ErrConflict。
 func (s *Store) ReplaceSegments(ctx context.Context, episodeID int64, segs []Segment) error {
 	return s.InTx(ctx, func(tx *Store) error {
-		if _, err := tx.db.ExecContext(ctx, `DELETE FROM segment WHERE episode_id = ?`, episodeID); err != nil {
+		if _, err := tx.db.ExecContext(ctx, `DELETE FROM segment WHERE episode_id = $1`, episodeID); err != nil {
 			return wrapWriteErr("清空旧索引", err)
 		}
 		for _, seg := range segs {
 			if _, err := tx.db.ExecContext(ctx,
 				`INSERT INTO segment(episode_id, start_sec, dur, keyframe, codec_sig, mode)
-				 VALUES(?, ?, ?, ?, ?, ?)`,
+				 VALUES($1, $2, $3, $4, $5, $6)`,
 				episodeID, seg.StartSec, seg.Dur, seg.Keyframe, seg.CodecSig, seg.Mode,
 			); err != nil {
 				return wrapWriteErr("写入索引", err)
@@ -62,7 +62,7 @@ func (s *Store) ReplaceSegments(ctx context.Context, episodeID int64, segs []Seg
 // 「该集还没有索引」是正常状态（索引任务未跑完），由调用方按 503 处理。
 func (s *Store) ListSegments(ctx context.Context, episodeID int64) ([]Segment, error) {
 	rows, err := s.db.QueryContext(ctx,
-		segmentColumns+` WHERE episode_id = ? ORDER BY start_sec`, episodeID)
+		segmentColumns+` WHERE episode_id = $1 ORDER BY start_sec`, episodeID)
 	if err != nil {
 		return nil, fmt.Errorf("列索引 episode_id=%d: %w", episodeID, err)
 	}

@@ -1,4 +1,4 @@
-// Package store 负责 SQLite 连接、迁移与派生表重建，以及 drama / episode
+// Package store 负责 PostgreSQL 连接、迁移与派生表重建，以及 drama / episode
 // 两张表的读写（Store），是依赖层级的底座。
 //
 // 依赖方向：rank 10（最低），不 import 其他 internal 包；其余 internal 包

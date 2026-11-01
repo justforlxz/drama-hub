@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/cache"
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
@@ -44,7 +45,7 @@ func shardOf(providerID string) string {
 // handler。播放面需要数据库（settings / episode 表），因此开一个临时库装配。
 func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
-	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "cmd.db"))
+	db, err := store.Open(context.Background(), pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -213,7 +214,7 @@ func TestHandler_LogsRequests(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.path, func(t *testing.T) {
 			buf := &bytes.Buffer{}
-			db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "log.db"))
+			db, err := store.Open(context.Background(), pgtest.DSN(t))
 			if err != nil {
 				t.Fatalf("store.Open: %v", err)
 			}
@@ -265,7 +266,7 @@ func TestHandler_WebDAV(t *testing.T) {
 		pass   = "davpass"
 		secret = "0123456789abcdef0123456789abcdef"
 	)
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "dav.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -343,7 +344,7 @@ func TestHandler_WebDAV(t *testing.T) {
 // 立刻用新凭据（不重启），非法值与未知键 400 且库里不动。
 func TestHandler_SettingsWrite(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "patch.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -486,7 +487,7 @@ func TestHandler_SettingsWrite(t *testing.T) {
 func TestHandler_PlaybackSurface(t *testing.T) {
 	ctx := context.Background()
 	const secret = "0123456789abcdef0123456789abcdef"
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "video.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -610,8 +611,8 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 func TestIDStability(t *testing.T) {
 	ctx := context.Background()
 	const secret = "0123456789abcdef0123456789abcdef"
-	path := filepath.Join(t.TempDir(), "stable.db")
-	db, err := store.Open(ctx, path)
+	dsn := pgtest.DSN(t)
+	db, err := store.Open(ctx, dsn)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -685,7 +686,7 @@ func TestIDStability(t *testing.T) {
 	assertSame("全量刷新后", idsOf(st), before)
 
 	// 4. 重启（重开库、重建 Store / Settings，secret 不变）后一致。
-	db2, err := store.Open(ctx, path)
+	db2, err := store.Open(ctx, dsn)
 	if err != nil {
 		t.Fatalf("重开库: %v", err)
 	}
@@ -734,7 +735,7 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 	}))
 	t.Cleanup(site.Close)
 
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "plugin.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -807,7 +808,7 @@ func TestPluginConfigReachesPlugin(t *testing.T) {
 // 插件被停用（没有任何配置行时默认启用）时服务照常启动，状态页给出原因。
 func TestPluginDisabledStillStarts(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "disabled.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -892,7 +893,7 @@ func g4Source(t *testing.T, seconds int) (string, float64) {
 func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 	ctx := context.Background()
 	const secret = "g4-backfill-duration-test-secret"
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "g4.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -1008,5 +1009,35 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 	}
 	if want := "<runtime>0</runtime>"; !strings.Contains(string(body), want) {
 		t.Errorf("未播放集 .nfo 缺 %s：%s", want, body)
+	}
+}
+
+// AC：数据库不可用时启动路径 fail fast —— openDB 返回错误、main 记日志后 os.Exit(1)。
+// 这里钉住错误返回（退出码由 main 的那一行 os.Exit(1) 保证）：
+//  1. 没设 DRAMA_HUB_DB_URL；
+//  2. 连不上；
+//  3. 正常时把 schema 版本报给日志（启动日志的唯一来源）。
+func TestOpenDBFailsFast(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	ctx := context.Background()
+
+	t.Setenv(store.EnvDBURL, "")
+	if _, err := openDB(ctx, logger); err == nil {
+		t.Fatal("未设 DRAMA_HUB_DB_URL 时 openDB 未报错")
+	}
+
+	t.Setenv(store.EnvDBURL, "postgres://nobody:nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=1")
+	if _, err := openDB(ctx, logger); err == nil {
+		t.Fatal("连不上数据库时 openDB 未报错")
+	}
+
+	t.Setenv(store.EnvDBURL, pgtest.DSN(t))
+	db, err := openDB(ctx, logger)
+	if err != nil {
+		t.Fatalf("正常配置 openDB: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if db.SchemaVersion == 0 {
+		t.Fatal("openDB 未把 schema 版本报出来（启动日志没有版本可打）")
 	}
 }

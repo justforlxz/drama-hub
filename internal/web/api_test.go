@@ -7,12 +7,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/store"
@@ -78,10 +78,10 @@ func (f *fakeSchedule) Status(context.Context) ([]scheduler.SourceStatus, error)
 	return f.status, f.statusErr
 }
 
-// newTestServer 起一套真实依赖：临时 SQLite + 真 handler。不 mock 自己的 handler。
+// newTestServer 起一套真实依赖：临时数据库 + 真 handler。不 mock 自己的 handler。
 func newTestServer(t *testing.T) (*Server, *store.Store, *fakeSyncer) {
 	t.Helper()
-	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "web.db"))
+	db, err := store.Open(context.Background(), pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestAPI_CreateDrama(t *testing.T) {
 	srv, _, syncer := newTestServer(t)
 
 	rec := do(t, srv, http.MethodPost, "/api/dramas",
-		`{"series_id":"https://hongguoduanju.com/player/7503745441910017049"}`)
+		`{"series_id":"https://example.test/player/7503745441910017049"}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("状态码 = %d, 期望 201（body=%s）", rec.Code, rec.Body.String())
 	}
@@ -509,10 +509,10 @@ func TestNormalizeSeriesID(t *testing.T) {
 	}{
 		{"7503745441910017049", "7503745441910017049", true},
 		{"  7503745441910017049 ", "7503745441910017049", true},
-		{"https://hongguoduanju.com/player/7503745441910017049", "7503745441910017049", true},
-		{"https://hongguoduanju.com/player/7503745441910017049/", "7503745441910017049", true},
-		{"https://hongguoduanju.com/player/7503745441910017049?from=list", "7503745441910017049", true},
-		{"https://hongguoduanju.com/player/7503745441910017049/vid123", "7503745441910017049", true},
+		{"https://example.test/player/7503745441910017049", "7503745441910017049", true},
+		{"https://example.test/player/7503745441910017049/", "7503745441910017049", true},
+		{"https://example.test/player/7503745441910017049?from=list", "7503745441910017049", true},
+		{"https://example.test/player/7503745441910017049/vid123", "7503745441910017049", true},
 		{"", "", false},
 		{"abc", "", false},
 		{"7503745441910017049abc", "", false},
@@ -705,7 +705,7 @@ func (g *gatedSyncer) SyncSeries(ctx context.Context, _ *store.Store, _ string) 
 // 409 来自调度器的单飞锁，经过 internal/web 的哨兵映射，不靠假实现对齐。
 func TestAPI_Refresh_RealScheduler(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "refresh.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

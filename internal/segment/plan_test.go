@@ -3,6 +3,7 @@ package segment
 import (
 	"context"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/justforlxz/drama-hub/internal/store"
@@ -292,3 +293,59 @@ func TestCutter_Gate(t *testing.T) {
 }
 
 func closeEnough(a, b float64) bool { return math.Abs(a-b) < 1e-6 }
+
+// TestFailureClass 锁定「客户端只看得到稳定类别」：stderr 里的直链、签名参数、
+// 上游措辞一个字符都不进返回值（MKACG-639）。403 / Forbidden 单列成 upstream
+// rejected —— 它对应「换直链/换身份」而不是「换源」。
+func TestFailureClass(t *testing.T) {
+	cases := []struct {
+		name     string
+		fallback string
+		stderr   string
+		want     string
+	}{
+		{"ffprobe 撞 403 带签名直链", classProbeFailed,
+			"http://cdn.example.com/v.mp4?n80_tk=SECRET: Server returned 403 Forbidden (access denied)", classRejected},
+		{"ffmpeg 撞 403", classCutFailed,
+			"Error opening input file http://cdn.example.com/v.mp4?n80_tk=SECRET.\nError opening input files: Server returned 403 Forbidden (access denied)", classRejected},
+		{"坏源", classProbeFailed, "Invalid data found when processing input", classProbeFailed},
+		{"空 stderr 用调用方的默认类别", classCutFailed, "", classCutFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := failureClass(tc.fallback, []byte(tc.stderr))
+			if got != tc.want {
+				t.Errorf("failureClass = %q, 期望 %q", got, tc.want)
+			}
+			for _, bad := range []string{"SECRET", "n80_tk", "http", "?", "&", "Server returned"} {
+				if strings.Contains(got, bad) {
+					t.Errorf("类别里漏出了 stderr 片段 %q：%q", bad, got)
+				}
+			}
+		})
+	}
+}
+
+// TestLoggableStderr 锁定「stderr 只在确实不含地址/查询串时进日志」：被 200 字节
+// 截断后可能只剩查询串中段（`6110…&n80=1&n80_tk=…`），那也必须整条丢弃 ——
+// 日志禁止记带签名的播放直链（docs/DEV-STANDARDS.md「日志」）。
+func TestLoggableStderr(t *testing.T) {
+	cases := []struct{ name, tail, want string }{
+		{"空", "", ""},
+		{"只有措辞", "Invalid data found when processing input", "Invalid data found when processing input"},
+		{"解密自检", "non-existing PPS 0 referenced", "non-existing PPS 0 referenced"},
+		{"完整直链", "http://cdn.example.com/v.mp4: Server returned 403 Forbidden", withheldDetail},
+		{"截断后只剩查询串中段", "6110116410888CE9&n80=1&n80_tk=SECRET: Server returned 403", withheldDetail},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := loggableStderr(tc.tail)
+			if got != tc.want {
+				t.Errorf("loggableStderr(%q) = %q, 期望 %q", tc.tail, got, tc.want)
+			}
+			if strings.Contains(got, "SECRET") || strings.Contains(got, "n80_tk") || strings.Contains(got, "://") {
+				t.Errorf("日志备注里漏出了直链片段：%q", got)
+			}
+		})
+	}
+}

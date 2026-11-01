@@ -28,6 +28,9 @@ import (
 // testSecret 是测试用的出流密钥（literal，不用占位符，黄金 id 才能稳定）。
 const testSecret = "unit-test-secret-32-bytes-minimum!"
 
+// discardLogger 是直接调 probe / cut 的测试用的丢弃 logger（生产由 Cutter 注入）。
+var discardLogger = slog.New(slog.DiscardHandler)
+
 // rig 注入给出站子进程的两份请求头（生产里由装配根从 hongguo 的浏览器身份派生，
 // 见 cmd/drama-hub 的 playbackHeaders）。内容不重要，但要能被假 CDN 逐字断言，
 // 因此用不会与 ffmpeg 默认（`Lavf/...`）混淆的值。
@@ -136,6 +139,10 @@ type fakeCDN struct {
 	broken bool
 	// hanging 为 true 时永不回包（算索引超时那条路径）。
 	hanging bool
+	// reject 非 0 时以该状态码拒绝（模拟媒体 CDN 对 App 直链回 403，MKACG-639）。
+	reject int
+	// query 是 url() 附带的查询串：模拟 App 片源直链的签名参数（n80_tk 等）。
+	query string
 }
 
 func newFakeCDN(t *testing.T, body []byte) *fakeCDN {
@@ -145,10 +152,14 @@ func newFakeCDN(t *testing.T, body []byte) *fakeCDN {
 		f.mu.Lock()
 		f.n++
 		f.seen = append(f.seen, r.Header.Clone())
-		broken, hanging, body := f.broken, f.hanging, f.body
+		broken, hanging, reject, body := f.broken, f.hanging, f.reject, f.body
 		f.mu.Unlock()
 		if hanging {
 			<-r.Context().Done()
+			return
+		}
+		if reject != 0 {
+			w.WriteHeader(reject)
 			return
 		}
 		if broken {
@@ -170,7 +181,11 @@ func (f *fakeCDN) setBody(body []byte) {
 	f.mu.Unlock()
 }
 
-func (f *fakeCDN) url() string { return f.srv.URL + "/ep.mp4" }
+func (f *fakeCDN) url() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.srv.URL + "/ep.mp4" + f.query
+}
 
 // hits 返回被请求次数（含 Range 续传，一次 ffmpeg 切片可能多次）。
 func (f *fakeCDN) hits() int {
@@ -197,6 +212,14 @@ func (f *fakeCDN) setBroken(v bool) {
 func (f *fakeCDN) setHang() {
 	f.mu.Lock()
 	f.hanging = true
+	f.mu.Unlock()
+}
+
+// rejectWith 让假源站以 status 拒绝请求，并把自身地址换成带签名的直链：
+// 复现「媒体 CDN 回 403、直链带 n80_tk 查询串」那种失败（MKACG-639）。
+func (f *fakeCDN) rejectWith(status int, query string) {
+	f.mu.Lock()
+	f.reject, f.query = status, query
 	f.mu.Unlock()
 }
 
@@ -796,5 +819,65 @@ func TestSegment_SourceLinkRotated(t *testing.T) {
 	}
 	if got := old.hits(); got != oldHits {
 		t.Errorf("旧源被打了 %d 次（换链后新增 %d）, 期望 0（每次都重新解析直链）", got, got-oldHits)
+	}
+}
+
+// appSignedQuery 是假 App 直链的签名查询串：它的任何一个参数名都不许出现在
+// 响应体里（MKACG-639）。
+const appSignedQuery = "?n80=1&n80_dm=bjk4LXYtcmVhZGluZ3ZpZGVv&n80_tk=deadbeefcafebabe"
+
+// TestPlayback_ErrorTextCarriesNoDirectLink 覆盖 AC「502 错误文本只给稳定类别」：
+// ffprobe / ffmpeg 的 stderr 里带着**完整直链**（实测 `<url>?n80_tk=…: Server
+// returned 403 Forbidden`），报错时客户端只该看到稳定类别。因此响应体不许出现
+// 参数名 `n80_tk`、查询串分隔符 `&`、scheme `http`（626 契约：解出的 URL 查询串
+// MUST NOT 出现在日志与错误文本里）。
+func TestPlayback_ErrorTextCarriesNoDirectLink(t *testing.T) {
+	r := newRig(t, "4")
+	ep := r.addEpisode(t, 1, 8)
+	uid := "e" + strconv.FormatInt(ep.ID, 10)
+	id := r.id(uid)
+	cdn := r.cdn[ep.ID]
+
+	// 一、索引建不起来：playlist 现解析直链，ffprobe 被 403 拒绝。
+	cdn.rejectWith(http.StatusForbidden, appSignedQuery)
+	rec := r.do(t, http.MethodGet, "/video/"+id+".m3u8")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("ffprobe 被拒时 playlist 状态码 = %d, 期望 502（body=%s）", rec.Code, rec.Body.String())
+	}
+	assertNoDirectLink(t, "playlist 502 响应体", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "upstream rejected") {
+		t.Errorf("502 错误文本没给出稳定类别 upstream rejected：%s", rec.Body.String())
+	}
+
+	// 二、切片失败走同一条口子：先让索引建成功，再让 ffmpeg 撞 403。
+	cdn.rejectWith(0, "")
+	if rec := r.do(t, http.MethodGet, "/video/"+id+".m3u8"); rec.Code != http.StatusOK {
+		t.Fatalf("基线 playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	cdn.rejectWith(http.StatusForbidden, appSignedQuery)
+	rec = r.do(t, http.MethodGet, "/video/"+id+"/0.ts")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("ffmpeg 被拒时分片状态码 = %d, 期望 502（body=%s）", rec.Code, rec.Body.String())
+	}
+	assertNoDirectLink(t, "分片 502 响应体", rec.Body.String())
+
+	// 三、日志这一面同样不许出现签名参数（DEV-STANDARDS「日志」：禁止记带签名的
+	// 播放直链）。stderr 原文只在确实不含地址/查询串时才进日志。
+	if logs := r.logs.String(); strings.Contains(logs, "n80_tk") || strings.Contains(logs, "deadbeefcafebabe") {
+		t.Errorf("日志里出现了直链签名查询串：%s", logs)
+	}
+}
+
+// assertNoDirectLink 断言一段面向客户端的文本里没有直链痕迹。
+//
+// 只断言「不含 n80_tk」太窄 —— 上游换个参数名就漏过去了，所以按**形态**断言：
+// 参数名、查询串分隔符、scheme 都不许出现。
+func assertNoDirectLink(t *testing.T, what, text string) {
+	t.Helper()
+	// 响应体是 JSON，`&` 会被编码成 `\u0026`，两种形态都得查。
+	for _, bad := range []string{"n80_tk", "n80_dm", "deadbeefcafebabe", "&", `\u0026`, "?", "http", "://"} {
+		if strings.Contains(text, bad) {
+			t.Errorf("%s 里出现了直链痕迹 %q：%s", what, bad, text)
+		}
 	}
 }

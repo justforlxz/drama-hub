@@ -59,7 +59,7 @@ func parsePlayerPage(html, sid string) (series, error) {
 		firstVisibleTime: page.SeriesDetail.FirstVisibleTime,
 		tags:             page.SeriesDetail.Tags,
 		vids:             vids,
-		protected:        page.SeriesDetail.ProtectedPlayback,
+		protected:        page.ProtectedPlayback,
 	}, nil
 }
 
@@ -225,19 +225,23 @@ func normalizeURL(raw string) (string, error) {
 
 // playerPageData 是 player_(series_id)/(vid)/page 载荷的最小结构。
 type playerPageData struct {
-	IsSuccess    bool   `json:"isSuccess"`
-	SeriesID     string `json:"series_id"`
-	SeriesDetail struct {
+	IsSuccess bool   `json:"isSuccess"`
+	SeriesID  string `json:"series_id"`
+	// ProtectedPlayback 是页面声明的「这剧的网页通道只给 10 秒 SEO 预览」。
+	//
+	// 它在 **page 级**，不在 seriesDetail 里（MKACG-637 实测抓包）：
+	// loaderData["player_(series_id)/page"].protectedPlayback，整页只出现一次，
+	// seriesDetail 下没有这个键。读错层级会让 protected 恒为 false，网页通道的
+	// 10.07 秒预览被当成完整片源交付（MKACG-625 F）。
+	ProtectedPlayback bool `json:"protectedPlayback"`
+	SeriesDetail      struct {
 		SeriesID         string   `json:"series_id"`
 		Name             string   `json:"series_name"`
 		Cover            string   `json:"series_cover"`
 		Intro            string   `json:"series_intro"`
 		FirstVisibleTime string   `json:"first_visible_time"`
 		Tags             []string `json:"tags"`
-		// ProtectedPlayback 是 MKACG-626 实测的上游字段：受保护剧的网页只给
-		// 10 秒 SEO 预览（88/88 部样本为 true，docs/L1-CORPUS-SCOPE.md 取证 D）。
-		ProtectedPlayback bool     `json:"protectedPlayback"`
-		VidList           []string `json:"vid_list"`
+		VidList          []string `json:"vid_list"`
 	} `json:"seriesDetail"`
 }
 

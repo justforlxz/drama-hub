@@ -1,13 +1,15 @@
 <!--
 来源：https://hongguoduanju.com/player/7503745441910017049（2026-10-29 匿名抓取）+ MKACG-626 实测口径
-改造：在 page-series-small.html 的 seriesDetail 上补 "protectedPlayback":true。
-      88/88 部付费剧的 seriesDetail 都是这个形态（docs/L1-CORPUS-SCOPE.md 取证 D），
-      页面只给 10 秒 SEO 预览，完整片源在 App 通道。
+改造：在 page-series-small.html 的 **page 级**补 "protectedPlayback":true（与 seriesDetail
+      平级）。真实页面就是这么放的：loaderData["player_(series_id)/page"].protectedPlayback
+      整页只出现一次，seriesDetail 下没有这个键（MKACG-637 实测抓包）。
+      88/88 部付费剧都是这个形态（docs/L1-CORPUS-SCOPE.md 取证 D），页面只给 10 秒
+      SEO 预览，完整片源在 App 通道。
 覆盖：MKACG-630 AC「网页给预览时 Resolve 不把 10 秒 URL 当结果」——取址顺序
-      web(非预览) → app 的第一条分支。
+      web(非预览) → app 的第一条分支；MKACG-637 的层级回归。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>红果短剧</title></head><body>
-<script async="" data-script-src="modern-inline">_ROUTER_DATA = {"loaderData":{"player_layout":null,"player_(series_id)\u002Fpage":{"isSuccess":true,"series_id":"7503745441910017049","seriesDetail":{"episode_cnt":76,"accessible_episode_cnt":5,"pay_type":0,"protectedPlayback":true,"series_id":"7503745441910017049","series_name":"测试剧 三集版","series_cover":"https://p3-novel.byteimg.com/novel-pic/34ad28f319c9c2b6598792ce2deaaaf8~tplv-shrink:640:0.image","series_intro":"七年前，顾星晚捅伤亲生父亲入狱；五年前，宴矜撑伞在监狱门口等她，却得知她早已出狱。时隔七年重逢，顾星晚望着律界大佬宴矜怔愣，对方却称不认识她，且早已订有婚约。顾星晚选择缄口不言，无人知晓，她曾在狱中为宴矜生下过一个孩子，过往的纠葛与未说出口的秘密，成了她心底最深的牵挂。","first_visible_time":"1747533495","vid_list":["7503780574541122622","7503780577347128382","7503780574608231486"]}}}};
+<script async="" data-script-src="modern-inline">_ROUTER_DATA = {"loaderData":{"player_layout":null,"player_(series_id)\u002Fpage":{"isSuccess":true,"series_id":"7503745441910017049","protectedPlayback":true,"seriesDetail":{"episode_cnt":76,"accessible_episode_cnt":5,"pay_type":0,"series_id":"7503745441910017049","series_name":"测试剧 三集版","series_cover":"https://p3-novel.byteimg.com/novel-pic/34ad28f319c9c2b6598792ce2deaaaf8~tplv-shrink:640:0.image","series_intro":"七年前，顾星晚捅伤亲生父亲入狱；五年前，宴矜撑伞在监狱门口等她，却得知她早已出狱。时隔七年重逢，顾星晚望着律界大佬宴矜怔愣，对方却称不认识她，且早已订有婚约。顾星晚选择缄口不言，无人知晓，她曾在狱中为宴矜生下过一个孩子，过往的纠葛与未说出口的秘密，成了她心底最深的牵挂。","first_visible_time":"1747533495","vid_list":["7503780574541122622","7503780577347128382","7503780574608231486"]}}}};
 function runWindowFn(){"use strict";}</script>
 </body></html>

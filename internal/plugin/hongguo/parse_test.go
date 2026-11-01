@@ -112,6 +112,7 @@ func TestParsePlayerPageProtectedPlayback(t *testing.T) {
 		want    bool
 	}{
 		{"page-series-protected.html", true},
+		{"page-series-protected-realpage.html", true},
 		{"page-series.html", false},
 	}
 	for _, tc := range cases {
@@ -122,6 +123,26 @@ func TestParsePlayerPageProtectedPlayback(t *testing.T) {
 		if got.protected != tc.want {
 			t.Fatalf("%s 的 protected = %v, 期望 %v", tc.fixture, got.protected, tc.want)
 		}
+	}
+}
+
+// MKACG-637：判据只在 page 级。把同一个键挪进 seriesDetail（625 之前读错的层级）
+// 必须解出 false —— 不做「两处都读、取或」，否则将来又一个页面形态就能把 10 秒
+// 预览放回直链位置。
+func TestParsePlayerPageProtectedPlaybackIsPageLevelOnly(t *testing.T) {
+	html := readFixture(t, "page-series-protected-realpage.html")
+	html = strings.Replace(html, `"protectedPlayback":true,"publicVideoSeo"`, `"publicVideoSeo"`, 1)
+	html = strings.Replace(html, `"seriesDetail":{"episode_cnt"`, `"seriesDetail":{"protectedPlayback":true,"episode_cnt"`, 1)
+	if strings.Contains(html, `"page":{"isSuccess":true,"series_id":"`+fixtureSID+`","protectedPlayback"`) {
+		t.Fatal("夹具改造没把 protectedPlayback 从 page 级挪走（测试本身失效）")
+	}
+
+	got, err := parsePlayerPage(html, fixtureSID)
+	if err != nil {
+		t.Fatalf("parsePlayerPage: %v", err)
+	}
+	if got.protected {
+		t.Fatal("seriesDetail 里的 protectedPlayback 被当成判据了：判据只认 page 级")
 	}
 }
 

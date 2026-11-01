@@ -1,0 +1,13 @@
+<!--
+来源：https://hongguoduanju.com/player/7503745441910017049（2026-11-01 MKACG-625 验收抓包）
+裁剪：只保留 page 级载荷本身，seriesDetail 的 76 项 vid_list 裁到前 3 项，其余字段原样
+      （`publicVideoSeo.durationSeconds` 就是那条 10.07 秒 SEO 预览的声明）。
+覆盖：MKACG-637 —— `protectedPlayback` 在 **page 级**（与 `seriesDetail`、`publicVideoSeo`
+      平级），不在 `seriesDetail` 里。整页只出现一次。这份是真实形态的最小回归：
+      `page-series-protected.html` 是由其它夹具改造来的 3 集页，这里保留抓到的原始层级。
+-->
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>红果短剧</title></head><body>
+<script async="" data-script-src="modern-inline">_ROUTER_DATA = {"loaderData":{"player_layout":null,"player_(series_id)\u002Fpage":{"isSuccess":true,"series_id":"7503745441910017049","protectedPlayback":true,"publicVideoSeo":{"available":true,"seriesId":"7503745441910017049","durationSeconds":10.066667},"seriesDetail":{"episode_cnt":76,"accessible_episode_cnt":3,"pay_type":0,"series_id":"7503745441910017049","series_name":"宴律，你的白月光回国了","vid_list":["7503780574541122622","7503780577347128382","7503780574608231486"]}}}};
+function runWindowFn(){"use strict";}</script>
+</body></html>

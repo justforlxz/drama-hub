@@ -170,7 +170,7 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // playbackHeaders 是播放面取直链时 ffmpeg / ffprobe 要带的出站身份（`名称: 值`
 // 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624）：本函数不认识具体源。
 func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver, playbackHeaders []string, adminToken string) http.Handler {
-	cutter := segment.NewCutter(st, settings, logger, caches, resolver.DirectURL, playbackHeaders)
+	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, playbackHeaders)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)

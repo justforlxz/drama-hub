@@ -44,8 +44,15 @@ var testFetchHeaders = []string{
 // 于是「关键帧位置」在测试里是可断言的确定值。
 func makeVideo(t *testing.T, path string, seconds int) {
 	t.Helper()
+	makeVideoSize(t, path, seconds, "160x120")
+}
+
+// makeVideoSize 同 makeVideo，但指定分辨率：通道测试要两个通道的画面不同，
+// 而 codec_sig 不含分辨率 —— 正是「签名相同、字节不同」那种串味的前提。
+func makeVideoSize(t *testing.T, path string, seconds int, size string) {
+	t.Helper()
 	cmd := exec.Command("ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=160x120:rate=25:duration=%d", seconds),
+		"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=%s:rate=25:duration=%d", size, seconds),
 		"-c:v", "libx264", "-pix_fmt", "yuv420p",
 		"-g", "25", "-keyint_min", "25", "-sc_threshold", "0",
 		"-force_key_frames", "expr:gte(t,n_forced*1)",
@@ -112,6 +119,8 @@ type fakeCDN struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 	n   int
+	// body 是当前提供的源字节（通道切换时用 setBody 换掉）。
+	body []byte
 	// seen 是每个请求收到的头（按到达顺序）：断言 ffprobe / ffmpeg 的 -headers
 	// 真的挂到了出站请求上（MKACG-624），而不是只写进了命令行。
 	seen []http.Header
@@ -123,12 +132,12 @@ type fakeCDN struct {
 
 func newFakeCDN(t *testing.T, body []byte) *fakeCDN {
 	t.Helper()
-	f := &fakeCDN{}
+	f := &fakeCDN{body: body}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.n++
 		f.seen = append(f.seen, r.Header.Clone())
-		broken, hanging := f.broken, f.hanging
+		broken, hanging, body := f.broken, f.hanging, f.body
 		f.mu.Unlock()
 		if hanging {
 			<-r.Context().Done()
@@ -144,6 +153,13 @@ func newFakeCDN(t *testing.T, body []byte) *fakeCDN {
 	t.Cleanup(f.srv.Close)
 
 	return f
+}
+
+// setBody 换掉这个假源站提供的字节：模拟同一集换了通道（web 明文 → app 密文）。
+func (f *fakeCDN) setBody(body []byte) {
+	f.mu.Lock()
+	f.body = body
+	f.mu.Unlock()
 }
 
 func (f *fakeCDN) url() string { return f.srv.URL + "/ep.mp4" }
@@ -186,6 +202,8 @@ type rig struct {
 	dramaID int64
 	segs    int
 	cdn     map[int64]*fakeCDN // episode id → 假源
+	// keys 是每集当前的内容密钥：非空即模拟「这条走的是 App 通道的密文源」。
+	keys map[int64][]byte
 	// resolveErr 非 nil 时直链解析按它失败（模拟 ErrNoStream 等）。
 	resolveErr map[int64]error
 	// resolves 数「直链解析次数」：命中缓存的分片请求不该增加它（零外呼的直接证据）。
@@ -221,20 +239,21 @@ func newRig(t *testing.T, segTarget string) *rig {
 
 	r := &rig{
 		st: st, settings: settings, logs: &bytes.Buffer{},
-		dramaID: dramaID, cdn: map[int64]*fakeCDN{}, resolveErr: map[int64]error{},
+		dramaID: dramaID, cdn: map[int64]*fakeCDN{}, keys: map[int64][]byte{},
+		resolveErr: map[int64]error{},
 	}
 	logger := slog.New(slog.NewJSONHandler(r.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	r.c = NewCutter(st, settings, logger, cache.New(st, settings, logger),
-		func(_ context.Context, ep store.Episode) (string, error) {
+		func(_ context.Context, ep store.Episode) (stream.Direct, error) {
 			r.resolves.Add(1)
 			if err := r.resolveErr[ep.ID]; err != nil {
-				return "", err
+				return stream.Direct{}, err
 			}
 			f, ok := r.cdn[ep.ID]
 			if !ok {
-				return "", fmt.Errorf("测试没有给剧集 %d 配源", ep.ID)
+				return stream.Direct{}, fmt.Errorf("测试没有给剧集 %d 配源", ep.ID)
 			}
-			return f.url(), nil
+			return stream.Direct{URL: f.url(), Key: r.keys[ep.ID]}, nil
 		}, testFetchHeaders)
 	return r
 }

@@ -55,15 +55,3 @@ func (r *Resolver) Direct(ctx context.Context, ep store.Episode) (Direct, error)
 	}
 	return Direct{URL: s.URL, Key: s.Key}, nil
 }
-
-// DirectURL 只取直链，丢掉 key —— 只给「不需要解密」的调用方用。
-//
-// 现在的唯一调用方是切片路径的注入点（segment.ResolveFunc 的形状），它接 key 之后
-// 改用 Direct，本方法随之消失。不要为它新增调用方。
-func (r *Resolver) DirectURL(ctx context.Context, ep store.Episode) (string, error) {
-	d, err := r.Direct(ctx, ep)
-	if err != nil {
-		return "", err
-	}
-	return d.URL, nil
-}

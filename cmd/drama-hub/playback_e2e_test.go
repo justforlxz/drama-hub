@@ -477,21 +477,28 @@ func TestPlaybackFullEpisode(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	up.setMedia("/media/full.mp4", fullCipher)
-	previewPath := "/media/" + e2eVidProtected[0] + "/preview.mp4"
-	up.setMedia(previewPath, preview)
-
-	// 受保护剧：episode 页是真实存在的「诱饵」——内容就是 10 秒预览。插件按契约
-	// 不该请求它（protectedPlayback==true），断言见下面的 hit 计数。
-	decoy := strings.Replace(
-		readE2EFixture(t, "page-episode.html"),
-		// 夹具里那条 10 秒预览地址（站点根来自插件常量，测试不写死上游域名）。
-		hongguo.DefaultBaseURL+"/video/public/"+e2eVidProtected[0]+"/360p.mp4",
-		srv.URL+previewPath, 1)
-	if decoy == readE2EFixture(t, "page-episode.html") {
-		t.Fatal("诱饵集页没有替换成预览地址（夹具形态变了？）")
+	// 受保护剧：集页是真实存在的「诱饵」——内容就是 10 秒预览。插件按契约不该请求它
+	// （protectedPlayback==true），断言见下面的 hit 计数；App 不可用时它也是「回落预览」
+	// 那条错路的具体形态（200 + 10 秒 playlist，见最后一条子测试）。
+	previewPath := func(vid string) string { return "/media/" + vid + "/preview.mp4" }
+	decoyEpisode := func(vid string) string {
+		t.Helper()
+		up.setMedia(previewPath(vid), preview)
+		page := strings.ReplaceAll(readE2EFixture(t, "page-episode.html"), e2eVidProtected[0], vid)
+		page = strings.Replace(page,
+			// 夹具里那条 10 秒预览地址（站点根来自插件常量，测试不写死上游域名）。
+			hongguo.DefaultBaseURL+"/video/public/"+vid+"/360p.mp4",
+			srv.URL+previewPath(vid), 1)
+		if !strings.Contains(page, srv.URL+previewPath(vid)) {
+			t.Fatalf("诱饵集页没有替换成预览地址（vid=%s，夹具形态变了？）", vid)
+		}
+		return page
 	}
 	up.setSeries(e2eSIDProtected, readE2EFixture(t, "page-series-e2e.html"))
-	up.setEpisode(e2eSIDProtected, e2eVidProtected[0], decoy)
+	up.setEpisode(e2eSIDProtected, e2eVidProtected[0], decoyEpisode(e2eVidProtected[0]))
+	// ep2 也要有诱饵：App 被拒那条子测试断言「502 而不是 200 + 10 秒 playlist」，
+	// 只有该集的预览页真实存在，这条断言才有区分力。
+	up.setEpisode(e2eSIDProtected, e2eVidProtected[1], decoyEpisode(e2eVidProtected[1]))
 
 	// 非保护剧：复用完整 76 集列表（只把 series_id 换成 e2eSIDOpen，页面解析会校验
 	// 它等于请求的 sid），第 4 集的集页**不存在**（404 = 网页无片源）。
@@ -629,6 +636,14 @@ func TestPlaybackFullEpisode(t *testing.T) {
 		rec := serve(t, h, http.MethodGet, "/video/"+id+".m3u8")
 		if rec.Code != http.StatusBadGateway {
 			t.Fatalf("App 被拒时状态码 = %d, 期望 502（body=%s）", rec.Code, rec.Body.String())
+		}
+		// 626 D1 / MKACG-637：这一集的集页是真的能给出 10 秒预览。状态码 502 之外，
+		// 再钉住「没去取它」「响应体不是 playlist」——回落到预览就只能是 200 + 10 秒。
+		if n := up.hit("/player/" + e2eSIDProtected + "/" + e2eVidProtected[1]); n != 0 {
+			t.Errorf("App 不可用时请求了集页 %d 次（10 秒预览被当成回落目标）", n)
+		}
+		if strings.HasPrefix(strings.TrimSpace(rec.Body.String()), "#EXTM3U") {
+			t.Error("App 不可用时回落到网页预览 playlist（200 + 10 秒）")
 		}
 		var body struct {
 			Code    string `json:"code"`

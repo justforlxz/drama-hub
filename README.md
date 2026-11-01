@@ -215,6 +215,7 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
 - `docs/DEV-STANDARDS.md` — 依赖、错误处理、配置、日志规范
 - `docs/TEST-STANDARDS.md` — 测试分层、必须覆盖的协议断言
 - `docs/ACCEPTANCE.md` — 真机验收清单
+- `docs/DEPLOY.md` — 从零到能播的最短路径（env 清单、配置顺序、常见失败）
 - `docs/adr/` — 架构决策记录
 - **2.0（框架 + 播放源插件化）设计定稿件**：
   - `docs/PLUGIN-CONTRACT.md` — 插件接口、错误语义、注册与配置

@@ -574,6 +574,16 @@ playlist 在集边界插 `#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 
 本包只提供两件事：`x/net/webdav.FileSystem` 适配（`fs.go`）与 Basic 认证（`handler.go`）。
 路径与目录形状见 `docs/DIRECTORY-CONTRACT.md`。
 
+### `Depth` 只支持 0 / 1（MKACG-623）
+
+`PROPFIND` 的 `Depth` 由协议库解析（`x/net/webdav` 的 `parseDepth`：只认 `0`、`1`、
+`infinity` 三种字面量），**数值深度 ≥2 一律 `400 Bad Request`**。这是协议库的实现限制，
+不是本服务的缺陷：不要为它加兼容层，也不要把「按数值深度 ≥2 验一遍」写成验收步骤。
+
+客户端适配方式（rclone / Emby 都这么干）：**逐层 `Depth: 1` 递归**，每层一次请求。
+所以验收与排障只写 `Depth: 0` / `Depth: 1`；「一次请求拉多层」在本服务上不存在，
+看到 400 先去查请求头，而不是查 vfs 树。
+
 ### 路径映射
 
 **DAV 根 = vfs 根目录**（`vfs.Root`）：`/` → `短剧`，`/爱情/0a/剧名 (2024)/…` →
@@ -713,7 +723,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/api/dramas` | GET | 剧目列表：drama 行 + `episodes` / `playable_episodes` / `emby_items` / `merge_groups` 计数 |
-| `/api/dramas` | POST | 新增剧目：`{"series_id":"<上游剧 id 或 /player/ 链接>"}`，同步入库后返回 201 + 整份列表 |
+| `/api/dramas` | POST | 新增剧目：`{"series_id":"<上游剧 id 或 /player/ 链接>"}`，同步入库后返回整份列表：**库里新建了行 → 201，这部剧已存在（这次只更新）→ 200** |
 | `/api/dramas/{id}` | DELETE | 删剧目（级联删集与合并组），204；不存在 404 |
 | `/api/dramas/{id}/episodes` | GET | 该剧全部集（`ep_no` 升序）；只回库里的字段（直链不落库，没有 `has_play_url`） |
 | `/api/dramas/{id}/merge-groups` | GET | 该剧合并组与成员（`ord` 即时间轴顺序） |
@@ -726,6 +736,10 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 - **「增剧目」的唯一入口是数据源同步**：剧目与集的真值在上游，手工插空剧只会得到一条
   永远没有集的记录。`series_id` 只接受纯数字或 `/player/<id>` 链接 —— 归一后的值会拼进
   上游路径，放宽字符集等于把路径注入带进来。
+- **201 / 200 按「库里有没有新行」分**（MKACG-623）：重复 `POST` 同一个 `series_id` 时
+  `store.UpsertDrama` 只更新那一行、不新增，此时回 `201 Created` 等于对调用方说假话。
+  判断先查一次 `DramaByProviderID(syncer.Name(), sid)`，`store.ErrNotFound` 即新建；
+  判断留在本包，不下沉到 store（那是要整体重写的层）。
 - **同步失败统一 502**（数据源在远端，失败几乎总是上游/页面结构问题），错误原因进响应体；
   provider 的错误文本不含直链与签名。
 - **业务规则不复制到本包**：合并编排的「至少 2 集、同剧、不重复、不与已有组重叠」全部由

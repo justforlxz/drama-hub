@@ -29,8 +29,13 @@ var (
 //
 // 接口定义在消费方（docs/DEV-STANDARDS.md「代码组织」）：本包只调这一个动作，
 // 不 import internal/sync，也不关心事务、派生表与海报。
+//
+// Name 是写库用的 drama.provider（= 插件名）。调度本身用 map 的键，不需要它；但同一个
+// *sync.Syncer 也交给 internal/web 当建剧依赖，那边要靠 provider 名判断这次同步是
+// 「新建」还是「更新」（MKACG-623），接口带出来才不需要在装配根拆成两份。
 type Syncer interface {
 	SyncSeries(ctx context.Context, st *store.Store, id string) error
+	Name() string
 }
 
 // SourceStatus 是一个源的调度现状（状态页与 /api/status 的 sources[]）。

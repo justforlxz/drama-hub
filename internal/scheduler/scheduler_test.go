@@ -100,6 +100,9 @@ type fakeSyncer struct {
 	ids []string
 }
 
+// Name 与 map 键一致（生产实现 *sync.Syncer 返回插件名）；调度不用它，接口要求。
+func (f *fakeSyncer) Name() string { return "web" }
+
 func (f *fakeSyncer) SyncSeries(ctx context.Context, _ *store.Store, id string) error {
 	f.mu.Lock()
 	f.ids = append(f.ids, id)

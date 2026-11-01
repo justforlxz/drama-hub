@@ -19,10 +19,12 @@ import (
 // SeriesSyncer 是「新增剧目」的依赖：按上游剧 id 把一个剧同步入库。生产实现是
 // *sync.Syncer（签名一致，见 internal/sync），测试注入假实现。
 //
-// 接口定义在消费方（docs/DEV-STANDARDS.md「代码组织」）：本包只用这一个方法，
-// 不 import sync / plugin，也不预建别的数据源方法。
+// 接口定义在消费方（docs/DEV-STANDARDS.md「代码组织」）：本包只用到下面两个方法，
+// 不 import sync / plugin，也不预建别的数据源方法。Name 是写库用的 drama.provider
+// （= 插件名），建剧 handler 靠它判断这次同步是「新建」还是「更新」（MKACG-623）。
 type SeriesSyncer interface {
 	SyncSeries(ctx context.Context, st *store.Store, sid string) error
+	Name() string
 }
 
 // Source 是一个播放源在状态页上的展示身份与「启动时生效的构造期配置」。

@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -96,7 +97,13 @@ func (s *Server) handleListDramas(w http.ResponseWriter, r *http.Request) {
 // 「增剧目」的唯一入口是数据源同步 —— 剧目与集的真值都在上游，手工插空剧只会
 // 产生一条永远没有集的记录。同步失败统一归 502：数据源在远端，失败几乎总是上游
 // 或页面结构问题，失败原因原样进响应体（插件的错误文本不含直链与签名）。
-// 成功返回 201 + 整份剧目列表，页面直接套用。
+//
+// 状态码按库里「有没有新行」分：新建 201、已存在（这次只更新）200（MKACG-623）。
+// 重复 POST 同一 series_id 时 store 只更新那一行、不新增，回 201 Created 等于对
+// 调用方说了假话 —— 所以先查一次是否存在，再决定同步后回哪个码。判断留在本包，
+// 不下沉到 store（那层随后要整体重写）。
+//
+// 成功返回整份剧目列表，页面直接套用。
 func (s *Server) handleCreateDrama(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		SeriesID string `json:"series_id"`
@@ -110,6 +117,12 @@ func (s *Server) handleCreateDrama(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, fmt.Errorf("%w: series_id 必须是上游剧 id（纯数字）或 /player/<id> 链接", httpx.ErrInvalid))
 		return
 	}
+	_, foundErr := s.st.DramaByProviderID(r.Context(), s.syncer.Name(), sid)
+	created := errors.Is(foundErr, store.ErrNotFound)
+	if foundErr != nil && !created {
+		httpx.WriteError(w, foundErr)
+		return
+	}
 	if err := s.syncer.SyncSeries(r.Context(), s.st, sid); err != nil {
 		s.logger.WarnContext(r.Context(), "同步剧目失败", "sid", sid, "err", err)
 		httpx.WriteError(w, fmt.Errorf("%w: 同步剧 %s 失败: %v", httpx.ErrUpstream, sid, err))
@@ -120,7 +133,11 @@ func (s *Server) handleCreateDrama(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, dramaList{Dramas: views})
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, dramaList{Dramas: views})
 }
 
 // handleDeleteDrama 处理 DELETE /api/dramas/{id}：删剧连带删集、合并组与派生表

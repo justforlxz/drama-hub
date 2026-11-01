@@ -177,6 +177,9 @@ WebDAV 的 `PROPFIND` **没有分页**。客户端说「列出这个目录」，
 **所有**子项的元数据一次拼成一份 XML 返回。所以「一个目录里放多少东西」不是性能调优，
 而是**能不能列出来**的二值问题。
 
+`Depth` 只支持 `0` / `1`：数值深度 ≥2 由 `x/net/webdav` 直接回 `400`（协议库限制，
+不是我们的缺陷），客户端靠逐层 `Depth: 1` 递归，详见 `docs/DEV-STANDARDS.md`「WebDAV」。
+
 ### 会具体怎么炸
 
 `golang.org/x/net/webdav@v0.62.0/webdav/file.go:787` 的 `walkFS`：

@@ -9,6 +9,9 @@
 
 ## P2（虚拟 WebDAV + NFO）
 
+> `PROPFIND` 口径：只支持 `Depth: 0` / `Depth: 1`。数值深度 ≥2 由 `x/net/webdav`
+> 直接回 `400`，这不是缺陷；验收只按逐层 `Depth: 1` 走（rclone / Emby 本来就这么扫）。
+
 - [ ] 挂载点是 `/webdav`（`rclone config create dramahub webdav url http://127.0.0.1:8080/webdav vendor other`）
 - [ ] `rclone lsf --max-depth 5 dramahub:/` 输出五级：分类 → 分片 → 剧 → Season 01 → strm/nfo
 - [ ] 顶层只有分类目录（没有 `全部/`），分类数等于库里的 `SELECT DISTINCT genre`

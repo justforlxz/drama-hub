@@ -187,6 +187,10 @@ type Plugin interface {
    实测证据与取舍见 MKACG-624。
    App 通道是另一份身份（Android App 形态），与官网页的浏览器身份**不是一套**：
    两份常量各管各的出站，MUST NOT 互相顶掉，也不是 settings 键（MKACG-626 §6）。
+   **取字节的头还要再按通道分一次**（MKACG-638）：App 通道的媒体 CDN 对带站内 `Referer`
+   的请求回 `403`（实测：仅 `Referer` 403，无头 / 仅 UA 都能探出完整集时长），所以播放面给
+   App 通道的 `-headers` 只带 UA。这一份也由装配根从插件常量派生，不在 `internal/segment`
+   里写第二份身份（`docs/PLAYBACK-CONTRACT.md`「出站身份」）。
 
 ## 加密切片与 Key
 

@@ -37,32 +37,55 @@ type Cutter struct {
 	caches   *cache.Cache
 	resolve  ResolveFunc
 	gate     chan struct{}
-	// headerBlock 是取直链时传给 ffmpeg / ffprobe 的 `-headers` 值（CRLF 分隔）；
-	// 空 = 不带。本包不认识任何源，这一份由装配根注入（见 NewCutter 的 headers）。
-	headerBlock string
+	// headers 是取直链时传给 ffmpeg / ffprobe 的出站身份，两个通道各一份；
+	// 用哪一份由本次解析出的直链决定（见 fetchHeaders）。本包不认识任何源，
+	// 两份都由装配根注入（见 NewCutter 的 headers）。
+	headers Headers
 	// indexTimeout 是「按需建立索引」的硬上限，生产固定 indexDeadline；
 	// 测试把它调短，才能在 5 分钟测试预算里验证 503 那条路径。
 	indexTimeout time.Duration
 }
 
+// Headers 是 `ffmpeg` / `ffprobe` 取直链时的出站身份（`名称: 值` 每项一行），
+// 两个通道各一份。**同一份身份不能同时喂给两个通道**（MKACG-638）：网页通道的
+// 直链（`hongguoduanju.com/video/public/…`）要浏览器 UA + 源站根 `Referer`，
+// 而 App 通道的媒体 CDN 对带站内 `Referer` 的请求直接 403 —— 实测二分：仅 `Referer`
+// 403，无头 / 仅 UA 都是完整集。两份都由装配根从插件常量派生（`internal/segment`
+// 不认识任何源，也不提供默认 UA；见 docs/PLAYBACK-CONTRACT.md「出站身份」）。
+type Headers struct {
+	Web []string // 网页通道：浏览器 UA + 源站根 Referer
+	App []string // App 通道：浏览器 UA（不带 Referer）
+}
+
 // NewCutter 装配播放面。caches 是 S7 的本地缓存（分片落盘 + single-flight），
 // resolve 由装配根注入（stream.Resolver.DirectURL）。
 //
-// headers 是 ffmpeg / ffprobe 取直链时要带的出站请求头（`名称: 值` 每项一行），
-// 由装配根从插件侧的上游身份注入——源侧要浏览器 UA/Referer，而这两个子进程不走
-// http.Client，只能靠 `-headers`（见 docs/PLAYBACK-CONTRACT.md）。nil = 不带。
-func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc, headers []string) *Cutter {
+// headers 是 ffmpeg / ffprobe 取直链时要带的出站请求头，按通道两份：这两个子进程
+// 不走 http.Client，只能靠 `-headers`。空切片 = 该通道不带（见 Headers）。
+func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc, headers Headers) *Cutter {
 	return &Cutter{
-		st:          st,
-		settings:    settings,
-		logger:      logger,
-		caches:      caches,
-		resolve:     resolve,
-		gate:        make(chan struct{}, ffmpegSlots()),
-		headerBlock: headerBlock(headers),
+		st:       st,
+		settings: settings,
+		logger:   logger,
+		caches:   caches,
+		resolve:  resolve,
+		gate:     make(chan struct{}, ffmpegSlots()),
+		headers:  headers,
 
 		indexTimeout: indexDeadline,
 	}
+}
+
+// fetchHeaders 按本次解析出的直链挑一份通道身份，拼成 `-headers` 的值。
+//
+// 通道判据只有 channelOf 一处（与 codec_sig 的通道段、索引失效判定同一个），
+// 出站身份跟着它走：判据发现两条通道的字节流不同，出站身份也必须不同，否则
+// 一条通道的头会把另一条通道的请求打成 403（MKACG-638）。
+func (c *Cutter) fetchHeaders(d stream.Direct) string {
+	if channelOf(d) == channelApp {
+		return headerBlock(c.headers.App)
+	}
+	return headerBlock(c.headers.Web)
 }
 
 // ffmpegSlots 是 ffmpeg/ffprobe 并发闸上限：`min(4, max(1, NumCPU/2))`。
@@ -111,7 +134,7 @@ func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, d stream.
 	if err := c.acquire(ctx); err != nil {
 		return nil, err
 	}
-	info, probeErr := probe(ctx, d, c.headerBlock)
+	info, probeErr := probe(ctx, d, c.fetchHeaders(d))
 	c.release()
 	if probeErr != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {

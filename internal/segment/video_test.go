@@ -28,16 +28,24 @@ import (
 // testSecret 是测试用的出流密钥（literal，不用占位符，黄金 id 才能稳定）。
 const testSecret = "unit-test-secret-32-bytes-minimum!"
 
-// testFetchHeaders 是 rig 注入给出站子进程的请求头（生产里是 hongguo 的浏览器
-// UA/Referer）。内容不重要，但要能被假 CDN 逐字断言，因此用不会与 ffmpeg 默认
-// （`Lavf/...`）混淆的值。
+// rig 注入给出站子进程的两份请求头（生产里由装配根从 hongguo 的浏览器身份派生，
+// 见 cmd/drama-hub 的 playbackHeaders）。内容不重要，但要能被假 CDN 逐字断言，
+// 因此用不会与 ffmpeg 默认（`Lavf/...`）混淆的值。
 //
-// rig 默认带上它：ffprobe / ffmpeg 的 `-headers` 拼错会让所有切片测试一起失败，
+// rig 默认带上它们：ffprobe / ffmpeg 的 `-headers` 拼错会让所有切片测试一起失败，
 // 而不是只在专门的那条测试里。
-var testFetchHeaders = []string{
-	"User-Agent: drama-hub-test",
-	"Referer: https://example.test/site/",
-}
+var (
+	// testWebHeaders 是网页通道的身份：浏览器 UA + 源站根 Referer。
+	testWebHeaders = []string{
+		"User-Agent: drama-hub-test",
+		"Referer: https://example.test/site/",
+	}
+	// testAppHeaders 是 App 通道的身份：只有 UA —— 它的媒体 CDN 对带站内 Referer
+	// 的请求回 403（MKACG-638）。
+	testAppHeaders = []string{
+		"User-Agent: drama-hub-test",
+	}
+)
 
 // makeVideo 用容器内的 ffmpeg 现场生成测试源（进 t.TempDir()，不落版本库）。
 // -force_key_frames 每秒一个关键帧 + -sc_threshold 0 关掉场景切换插帧，
@@ -254,7 +262,7 @@ func newRig(t *testing.T, segTarget string) *rig {
 				return stream.Direct{}, fmt.Errorf("测试没有给剧集 %d 配源", ep.ID)
 			}
 			return stream.Direct{URL: f.url(), Key: r.keys[ep.ID]}, nil
-		}, testFetchHeaders)
+		}, Headers{Web: testWebHeaders, App: testAppHeaders})
 	return r
 }
 
@@ -501,6 +509,9 @@ func TestSegment_SliceThenCacheHit(t *testing.T) {
 //
 // 判据是「每一个出站请求都带」，不是「出现过一次」：只写进其中一条命令行，
 // 另一条仍然是 Lavf 默认身份，而它在真机上就是被风控挑出来的那类请求。
+//
+// 这条测试的源是明文（`Key` 为空）= 网页通道：它的身份是 UA + 源站根 Referer，
+// 两个通道各一份、不能互相顶掉（MKACG-638，App 通道见下一条）。
 func TestFetchHeaders_ReachBothFFmpegCalls(t *testing.T) {
 	r := newRig(t, "4")
 	ep := r.addEpisode(t, 1, 12)
@@ -538,6 +549,79 @@ func TestFetchHeaders_ReachBothFFmpegCalls(t *testing.T) {
 	}
 }
 
+// TestFetchHeaders_AppChannelDropsReferer 覆盖 MKACG-638：App 通道的出站身份不带 Referer。
+//
+// 判据来自真实 CDN 的二分：同一把 key、同一条直链，带站内 Referer 一律
+// `403 Forbidden`，不带（或只带 UA）就是完整集。只要 ffprobe 或 ffmpeg 有**一次**
+// 回源带着它，整集就是 502 —— 所以断言是「每一次回源都没有 Referer」，且读的是假
+// CDN 收到的真实请求头（不是只断言命令行）。网页通道仍带 UA + Referer 由
+// TestFetchHeaders_ReachBothFFmpegCalls 钉住。
+func TestFetchHeaders_AppChannelDropsReferer(t *testing.T) {
+	r := newRig(t, "4")
+	ep := r.addEpisode(t, 1, 12)
+	uid := "e" + strconv.FormatInt(ep.ID, 10)
+	id := r.id(uid)
+	cdn := r.cdn[ep.ID]
+
+	// 换成 CENC 密文源并把 Key 给出去：判据是「本次解析带 Key」= App 通道（626 契约 4）。
+	encPath := filepath.Join(t.TempDir(), "enc.mp4")
+	makeEncryptedVideo(t, encPath, 12, "160x120", testKey)
+	body, err := os.ReadFile(encPath)
+	if err != nil {
+		t.Fatalf("读取密文样本: %v", err)
+	}
+	cdn.setBody(body)
+	r.keys[ep.ID] = testKey
+
+	if rec := r.do(t, http.MethodGet, "/video/"+id+".m3u8"); rec.Code != http.StatusOK {
+		t.Fatalf("App 通道 playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	probeReqs := cdn.hits()
+	if probeReqs == 0 {
+		t.Fatal("建索引没有回源：ffprobe 没有请求假 CDN")
+	}
+	if rec := r.do(t, http.MethodGet, "/video/"+id+"/0.ts"); rec.Code != http.StatusOK {
+		t.Fatalf("App 通道分片状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	seen := cdn.seenHeaders()
+	if len(seen) <= probeReqs {
+		t.Fatalf("切片没有回源：请求数 %d，建索引时已有 %d", len(seen), probeReqs)
+	}
+
+	// 命令行层：探测与切片都不得残留 Referer 片段（含 `-headers` 里那一行），
+	// 且注入的 UA 还在 —— 断言的是 argv 本身，拒绝「只是碰巧成功」。
+	d := stream.Direct{URL: cdn.url(), Key: testKey}
+	for _, call := range []struct {
+		stage string
+		args  []string
+	}{
+		{"建索引（ffprobe）", probeArgs(d, r.c.fetchHeaders(d))},
+		{"切片（ffmpeg）", cutArgs(d, 0, 4, 0, r.c.fetchHeaders(d))},
+	} {
+		joined := strings.Join(call.args, "\n")
+		if strings.Contains(joined, "Referer:") {
+			t.Errorf("App 通道%s的 argv 里还有 Referer：%q", call.stage, joined)
+		}
+		if !strings.Contains(joined, "User-Agent: drama-hub-test") {
+			t.Errorf("App 通道%s的 argv 里丢了注入的 UA：%q", call.stage, joined)
+		}
+	}
+
+	for i, h := range seen {
+		stage := "切片（ffmpeg）"
+		if i < probeReqs {
+			stage = "建索引（ffprobe）"
+		}
+		if got := h.Get("User-Agent"); got != "drama-hub-test" {
+			t.Errorf("App 通道第 %d 次回源（%s）User-Agent = %q, 期望注入值", i, stage, got)
+		}
+		if got := h.Get("Referer"); got != "" {
+			t.Errorf("App 通道第 %d 次回源（%s）Referer = %q：媒体 CDN 对带站内 Referer 的请求回 403",
+				i, stage, got)
+		}
+	}
+}
+
 // TestHeaderBlock 是 headerBlock / headerArgs 的纯函数判据：CRLF 分隔、末行有
 // 终止符（ffmpeg 丢没有终止符的末行）、空输入不进命令行。
 func TestHeaderBlock(t *testing.T) {
@@ -548,7 +632,7 @@ func TestHeaderBlock(t *testing.T) {
 		t.Errorf("headerArgs(\"\") = %v, 期望 nil（nil 才是一个参数都不加）", got)
 	}
 
-	block := headerBlock(testFetchHeaders)
+	block := headerBlock(testWebHeaders)
 	want := "User-Agent: drama-hub-test\r\nReferer: https://example.test/site/\r\n"
 	if block != want {
 		t.Fatalf("headerBlock = %q, 期望 %q", block, want)

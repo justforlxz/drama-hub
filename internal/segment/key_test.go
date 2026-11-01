@@ -126,7 +126,7 @@ func TestCutWithKey(t *testing.T) {
 	}
 	cdn := newFakeCDN(t, encBody)
 
-	fromCipher, err := cut(context.Background(), stream.Direct{URL: cdn.url(), Key: testKey}, 4, 4, 0, "")
+	fromCipher, err := cut(context.Background(), discardLogger, stream.Direct{URL: cdn.url(), Key: testKey}, 4, 4, 0, "")
 	if err != nil {
 		t.Fatalf("密文源切片失败: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestCutWithKey(t *testing.T) {
 		t.Errorf("密文切片时长 = %v, 期望约 4 秒", d)
 	}
 
-	fromPlain, err := cut(context.Background(), stream.Direct{URL: plainPath}, 4, 4, 0, "")
+	fromPlain, err := cut(context.Background(), discardLogger, stream.Direct{URL: plainPath}, 4, 4, 0, "")
 	if err != nil {
 		t.Fatalf("明文源切片失败: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestProbeRejectsBadKey(t *testing.T) {
 	cdn := newFakeCDN(t, body)
 
 	// 正确 key：探针成功，关键帧、时长、编码签名都拿得到。
-	info, err := probe(context.Background(), stream.Direct{URL: cdn.url(), Key: testKey}, "")
+	info, err := probe(context.Background(), discardLogger, stream.Direct{URL: cdn.url(), Key: testKey}, "")
 	if err != nil {
 		t.Fatalf("正确 key 的探测失败: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestProbeRejectsBadKey(t *testing.T) {
 
 	// 错 key：必须报错（包 httpx.ErrUpstream → 502），不能返回一份「成功但空」的探测结果。
 	wrong := bytes.Repeat([]byte{0x5a}, 16)
-	if _, err := probe(context.Background(), stream.Direct{URL: cdn.url(), Key: wrong}, ""); err == nil {
+	if _, err := probe(context.Background(), discardLogger, stream.Direct{URL: cdn.url(), Key: wrong}, ""); err == nil {
 		t.Fatal("错 key 的探测返回成功：空索引会被当成合法索引写进库")
 	} else if !errors.Is(err, httpx.ErrUpstream) {
 		t.Fatalf("err = %v, 期望包 httpx.ErrUpstream（边界映射 502）", err)

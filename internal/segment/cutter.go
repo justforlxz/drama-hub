@@ -134,7 +134,7 @@ func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, d stream.
 	if err := c.acquire(ctx); err != nil {
 		return nil, err
 	}
-	info, probeErr := probe(ctx, d, c.fetchHeaders(d))
+	info, probeErr := probe(ctx, c.logger, d, c.fetchHeaders(d))
 	c.release()
 	if probeErr != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -213,19 +213,62 @@ const (
 	timeoutCut   = 60 * time.Second
 )
 
-// stderrTail 取子进程 stderr 的尾部作为失败原因。cmd.Output() 在 c.Stderr 为 nil
-// 时把 stderr 挂在 *exec.ExitError 上（stdout 在 out 里），因此从那里取。
-// 只留尾部 200 字节，且不落完整源 URL（见 safeHost）。
-func stderrTail(err error, out []byte) string {
+// 子进程失败的**稳定类别**：客户端可见的错误文本里只出现这几个常量。
+//
+// 为什么不能带原文：ffprobe / ffmpeg 会把**完整输入 URL** 打进报错（实测
+// `<url>?n80_tk=…: Server returned 403 Forbidden`），而 App 片源的直链带签名
+// 查询串。错误文本会进 502 响应体（httpx.WriteError 直接用 err.Error()），
+// 契约要求解出的 URL 查询串 MUST NOT 出现在日志与错误文本里（MKACG-626 /
+// MKACG-639）。只回类别还顺带免疫「上游换了措辞」：换措辞最多让类别退化成
+// `<op> failed`，不会把新措辞漏出去。
+const (
+	classProbeFailed   = "ffprobe failed"
+	classCutFailed     = "ffmpeg failed"
+	classDecryptFailed = "ffprobe decryption failed"
+	classRejected      = "upstream rejected"
+)
+
+// failureClass 把子进程 stderr 折成稳定类别。上游拒绝（403 / Forbidden）单列一类：
+// 它与「源本身坏了」的处置不同（换直链/换身份 vs 换源），排障时要能分开。
+func failureClass(fallback string, stderr []byte) string {
+	if bytes.Contains(stderr, []byte("403")) || bytes.Contains(stderr, []byte("Forbidden")) {
+		return classRejected
+	}
+	return fallback
+}
+
+// stderrTail 取子进程 stderr 的尾部（**只给日志用，绝不进错误文本**）。
+// cmd.Stderr 指向 buffer 时 stderr 在那里；未设置时 cmd.Output() 把它挂在
+// *exec.ExitError 上，因此从那里取。只留尾部 200 字节。
+func stderrTail(err error, buf []byte) string {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) && len(ee.Stderr) > 0 {
-		out = ee.Stderr
+		buf = ee.Stderr
 	}
-	s := strings.TrimSpace(string(out))
+	s := strings.TrimSpace(string(buf))
 	if len(s) > 200 {
 		s = s[len(s)-200:]
 	}
 	return s
+}
+
+// withheldDetail 是「有 stderr 但不适合进日志」的占位标记。
+const withheldDetail = "<withheld>"
+
+// loggableStderr 把 stderr 尾部折成可以进日志的一条备注。
+//
+// 判据是「出现地址/查询串特征就整条丢弃」，不是「像不像 URL」：上面那条报错里的
+// 直链被 200 字节截断后可能只剩查询串中段（`6110…&n80=1&n80_tk=…`），开头已经
+// 没有 `http://` 了。日志禁止记带签名的播放直链（docs/DEV-STANDARDS.md「日志」），
+// 因此宁可整条不记，由 host + 类别 + uid/ep_no 定位。
+func loggableStderr(tail string) string {
+	if tail == "" {
+		return ""
+	}
+	if strings.Contains(tail, "://") || strings.ContainsAny(tail, "?&=") {
+		return withheldDetail
+	}
+	return tail
 }
 
 // headerBlock 把 `名称: 值` 列表拼成 ffmpeg / ffprobe 的 `-headers` 值：行间 CRLF，
@@ -283,15 +326,16 @@ func probeArgs(src stream.Direct, headers string) []string {
 
 // probe 执行 `ffprobe -skip_frame nokey`：只解出关键帧，收集 pts 与源时长。
 //
-// 失败返回 httpx.ErrUpstream（带 stderr 尾部与源 host；不含完整 URL —— 直链可能
-// 带签名）。
+// 失败返回 httpx.ErrUpstream，**错误文本只有稳定类别**（`ffprobe failed` /
+// `upstream rejected`）：stderr 原文（含完整直链与签名查询串）绝不回给客户端，
+// 只按 loggableStderr 的判据进日志，定位靠 host + 类别 + 集标识。
 //
 // 密文源要单独判一次解密自检：key 错的时候 ffprobe 常常**以 0 退出**、只往 stderr
 // 吐 `non-existing PPS …`，拿不到关键帧却也不算失败 —— 那种「成功」会把空索引写进
 // 库、把空分片写进缓存。所以 key 非空时 stderr 必须为空（实测正确 key 下 0 字节），
 // 非空即解密失败（MKACG-626 AC-8）。明文流不看 stderr：`-v error` 下源本身也会吐
 // 无害告警，按它判失败会把好源打成 502。
-func probe(ctx context.Context, src stream.Direct, headers string) (sourceInfo, error) {
+func probe(ctx context.Context, logger *slog.Logger, src stream.Direct, headers string) (sourceInfo, error) {
 	dctx, cancel := context.WithTimeout(ctx, timeoutProbe)
 	defer cancel()
 	cmd := exec.CommandContext(dctx, "ffprobe", probeArgs(src, headers)...)
@@ -299,11 +343,17 @@ func probe(ctx context.Context, src stream.Direct, headers string) (sourceInfo, 
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return sourceInfo{}, fmt.Errorf("ffprobe %s: %w（%s）", safeHost(src.URL), httpx.ErrUpstream, stderrTail(err, stderr.Bytes()))
+		class := failureClass(classProbeFailed, stderr.Bytes())
+		logger.WarnContext(ctx, "ffprobe failed",
+			"host", safeHost(src.URL), "class", class,
+			"stderr", loggableStderr(stderrTail(err, stderr.Bytes())))
+		return sourceInfo{}, fmt.Errorf("%s: %w", class, httpx.ErrUpstream)
 	}
 	if len(src.Key) > 0 && stderr.Len() > 0 {
-		return sourceInfo{}, fmt.Errorf("ffprobe %s 解密自检失败: %w（%s）",
-			safeHost(src.URL), httpx.ErrUpstream, stderrTail(nil, stderr.Bytes()))
+		logger.WarnContext(ctx, "ffprobe decryption self-check failed",
+			"host", safeHost(src.URL),
+			"stderr", loggableStderr(stderrTail(nil, stderr.Bytes())))
+		return sourceInfo{}, fmt.Errorf("%s: %w", classDecryptFailed, httpx.ErrUpstream)
 	}
 	var decoded struct {
 		Frames []struct {
@@ -361,7 +411,9 @@ func cutArgs(src stream.Direct, start, dur, offset float64, headers string) []st
 }
 
 // cut 执行 ffmpeg：`-ss` 前置（输入寻址，切点已是关键帧所以不漂移）→ `-c copy`
-// → MPEG-TS 写到 stdout。返回完整字节；失败返回 httpx.ErrUpstream。
+// → MPEG-TS 写到 stdout。返回完整字节；失败返回 httpx.ErrUpstream，**错误文本只有
+// 稳定类别**（`ffmpeg failed` / `upstream rejected`）—— ffmpeg 的 stderr 里带着
+// 完整直链与签名查询串，只按 loggableStderr 的判据进日志（MKACG-639）。
 //
 // offset 是该片在合并时间轴上的绝对起点（单集传 0）：非零时用 -output_ts_offset
 // 把该片的 PTS/DTS 平移到绝对位置，跨集的连续时间轴因此没有时间戳回退——否则
@@ -373,13 +425,20 @@ func cutArgs(src stream.Direct, start, dur, offset float64, headers string) []st
 //
 // src.Key 非空时解密交给 ffmpeg 原生 `-decryption_key`（不自己解 CENC、不落整集
 // 明文）：同一条 `-ss … -c copy` 路径，只是多一个输入选项。
-func cut(ctx context.Context, src stream.Direct, start, dur, offset float64, headers string) ([]byte, error) {
+func cut(ctx context.Context, logger *slog.Logger, src stream.Direct, start, dur, offset float64, headers string) ([]byte, error) {
 	dctx, cancel := context.WithTimeout(ctx, timeoutCut)
 	defer cancel()
 	cmd := exec.CommandContext(dctx, "ffmpeg", cutArgs(src, start, dur, offset, headers)...)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("ffmpeg 切片 %s: %w（%s）", safeHost(src.URL), httpx.ErrUpstream, stderrTail(err, out))
+		// out 是 stdout（失败时可能是半截 TS 字节），既不进日志也不进错误文本：
+		// stderr 只从 ExitError 取。
+		tail := stderrTail(err, nil)
+		class := failureClass(classCutFailed, []byte(tail))
+		logger.WarnContext(ctx, "ffmpeg cut failed",
+			"host", safeHost(src.URL), "class", class,
+			"stderr", loggableStderr(tail))
+		return nil, fmt.Errorf("%s: %w", class, httpx.ErrUpstream)
 	}
 	return out, nil
 }

@@ -6,6 +6,7 @@
 
 - 一台装了 Emby 的机器；`rclone` 可执行；`ffmpeg` / `ffprobe` 可执行。
 - 库里只放测试剧，避免污染主库。
+- 机器判定用 `scripts/acceptance.sh`（A–I 逐项 PASS/FAIL/SKIP，用法见 `docs/DEPLOY.md` 第 7 节）。
 
 ## P2（虚拟 WebDAV + NFO）
 

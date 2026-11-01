@@ -187,6 +187,12 @@ ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（�
 
 新增参数必须同 PR 更新上表，并在 `settings` 里给默认值 + 范围校验。写非法值返回 400，不静默纠正。
 
+**App 通道的两个 host 不是参数，所以上表不新增行**（MKACG-626 D2，MKACG-628/630 落地）：
+`hongguo.Config` 的 `DeviceRegisterURL`（匿名设备注册）与 `AppVideoURL`（App 取流）都是
+构造期字段，默认值内置、测试注入假上游，与 `BaseURL` 同一类——改它们要重启，不是热读。
+理由是 App 侧协议事实（路径与查询串里的版本号是逆向常量），没有用户会调；多一个键就多
+一条「配了却不生效」的来源。代价：上游换域名发版。
+
 ## 播放面（`/video`）
 
 契约真值：`docs/PLAYBACK-CONTRACT.md`（S8 / MKACG-612 落地）。本节只写实现口径。
@@ -262,6 +268,13 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }
   自然拿到新链。解析失败一律 502，且不写库、不写缓存。返回的 `Key`（加密片源的内容
   密钥，`nil` = 明文）与直链同生命周期：只在本次请求的内存里，不落库、不进日志、
   不进缓存键。
+- **加密片源解密归 ffmpeg**（MKACG-626 契约 1/6，MKACG-629 落地）：`Key` 非空时切片与索引
+  探测的命令 MUST 把 `-decryption_key <hex>` 放在**源地址（`-i`）之前** —— 放到后面 ffmpeg
+  只会把它当输出选项静默忽略。明文流的 argv 里不出现这个参数（空值会被 ffmpeg 判非法）。
+- **探针解密自检**（MKACG-626 AC-8）：key 错时 ffprobe 常常**以 0 退出**、只往 stderr 吐
+  `non-existing PPS …`，拿不到关键帧却也不算失败——那种「成功」会把空索引写进库、把空分片
+  写进缓存。所以 `Key` 非空时 stderr **必须为空**（实测正确 key 下 0 字节），非空即解密失败
+  → 502、不写索引、不写缓存。明文流不看 stderr（`-v error` 下好源也会吐无害告警）。
 - playlist 是 `segment` 表的**纯函数视图**（`BuildPlaylist`）：不落盘、不缓存
   （理由见 `docs/CACHE-MODEL.md`「为什么 m3u8 文本不缓存」）。
 - HEAD 与 GET 的 `Content-Length` 一致（硬约束 3）：playlist 手写长度；分片走
@@ -275,6 +288,10 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }
 
 - 键 `sha256(uid \x1f seq \x1f codec_sig)`（`cache.SegmentKey`），落
   `<cache_dir>/seg/<hash 前 2 位>/<hash>.ts`；`artifact(kind='segment')` 是索引行。
+  `codec_sig` 是 **`<通道>/<探测签名>`**（`web/…` / `app/…`，MKACG-626 契约 4）：由
+  `ensureSegments` 一处产出，`segment.codec_sig` 与分片键共用这一个值；现存索引的通道段与
+  本次请求不一致即重建（含加通道段之前写下的老索引）。通道判据是「本次解析有没有带
+  `Key`」，内容密钥本身不进键。
 - 并发同一个 `(id, seq)` 只生成一次（`Cache.GetOrGenerate` 的 single-flight）；
   **返回的 `[]byte` 是共享只读**，调用方不得就地改写。
 - 生成失败 → 502，**不写缓存**（失败结果绝不进缓存）；缓存自身故障按 500 报，
@@ -344,12 +361,13 @@ playlist 在集边界插 `#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 
 | 方法 | 上游 | 请求数 |
 |---|---|---|
 | `Work(ctx, ref)` | `GET {BaseURL}/player/{id}` | 1（剧目元数据 + 全部集） |
-| `Resolve(ctx, ref, epNo)` | `GET /player/{id}` → `GET /player/{id}/{vid}` | 2 |
+| `Resolve(ctx, ref, epNo)` | 网页通道：`GET /player/{id}` → `GET /player/{id}/{vid}`；App 通道：设备注册（进程内一次）→ `POST` 取流 | 2（网页通道）；App 通道 1 次注册 + 1 次取流 |
 | `Enumerate(ctx, cur)` | 目录索引：`index.xml` + 29 份子 sitemap + `seo-important.xml` + `/category` 34 页 | 64（每份子 sitemap 前重取一次 4 KB 索引）= 30s 级 |
 
-`Resolve` 是 2 个请求：契约入参只有集号，集号 → 源侧集标识（`vid`）只能从详情页取，
-而插件不许保存状态；要压到 1 个必须改接口（把源侧集标识传进来）。`docs/PLUGIN-CONTRACT.md`
-能力矩阵写的「红果：1 个请求 / 集」与 `Resolve` 签名不自洽，实现按签名走。
+`Resolve` 在网页通道是 2 个请求：契约入参只有集号，集号 → 源侧集标识（`vid`）只能从详情页取，
+而插件不许保存状态；要压到 1 个必须改接口（把源侧集标识传进来）。
+受保护剧（`protectedPlayback == true`）不发集页请求，直接走 App 通道：设备注册 1 次
+（进程内缓存，不是每集都注册）+ 每次取流 1 个 `POST`。
 `Enumerate` 一页 = 一份上游文档（子 sitemap 整份返回，43,556 个 loc 一次读完），
 三段串行：子 sitemap（29）→ `seo-important.xml` → `/category` 第 1..34 页。并集才是全集：
 只用 sitemap 漏最新 53 部，只用 `/category` 只剩 800 部（`docs/L1-CORPUS-SCOPE.md`）。
@@ -357,7 +375,11 @@ playlist 在集边界插 `#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 
 `ErrSchema` 打回（静默从头开始会把「游标坏了」伪装成「枚举走完了」）。
 
 - `BaseURL` 默认 `https://hongguoduanju.com`，配置键 `plugin.web.base_url`（空 = 用它）。
-  它是唯一为测试开的缝（`--network=none` 下指向 `httptest.Server`）。`*http.Client`
+  它与 App 通道的两个 host 是**三个构造期缝**（`--network=none` 下都指向
+  `httptest.Server`）：`Config.BaseURL`（官网页）、`Config.DeviceRegisterURL`（匿名设备注册，
+  默认 `log5-applog-lf.fqnovel.com`）、`Config.AppVideoURL`（App 取流，默认
+  `api5-normal-sinfonlineb.fqnovel.com`）。三者都是构造期注入、默认值内置、**不进 settings**
+  （MKACG-626 D2：上游换域名就发版）。`*http.Client`
   由装配根按 `plugin.web.request_timeout_sec` 构造（默认 30s）。
 - 响应体经 `io.LimitReader` 读，两档上限：页面（列表页 / 集页 / `/category`）4 MiB，sitemap 8 MiB
   （实测子 sitemap 每份 5,242,7xx 字节）；超限按 `ErrSchema`（页面异常放大，不是可重试的传输错误）。
@@ -371,6 +393,11 @@ playlist 在集边界插 `#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 
   其余非 2xx / 传输失败 / 读体失败 / 空响应 → `ErrUpstream`；结构不符 → `ErrSchema`；
   `VideoObject` 在但 `contentUrl` 缺 → `ErrNoStream`。`ctx` 被取消 / 超时直接返回 ctx 错误，
   不冒充源故障。插件不 import `internal/httpx`，状态码映射由边界包负责。
+- 判定顺序 MUST 是**状态码先、响应体后**（MKACG-635）：404 + 空体曾因「空体 → 身份被挡」
+  被判成 `ErrRejected`，多换一轮设备身份、多打一次上游。App 通道每一格：403/429/444 →
+  `ErrRejected`（换一次身份，仍失败即 502）、404（带体或不带体）→ `ErrNoStream`、其余非
+  200 → `ErrUpstream`、200 + 空体或非 JSON → `ErrSchema`、200 + `code != 0` → `ErrRejected`。
+  网页通道同一顺序，200 + 空体按 `ErrUpstream`。
 - 框架校验（`internal/sync`）：集表非空、`Episodes[i].No == i+1`、源侧集标识数量与集数一致，
   违反即 `ErrSchema` 且**不写库**（这是插件实现 bug，不是上游问题）。
 - `episode.vid` 的来源不在契约的 `Episode` 里（只有集号 / 标题 / 时长）：框架用消费方定义的
@@ -382,9 +409,11 @@ playlist 在集边界插 `#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 
 **库里没有直链列。** `0004_drop_play_url.sql` 删掉了 `episode.play_url` /
 `play_url_at`：直链是请求时向插件解析的短时凭据，持久化等于把过期链接写进库。
 
-实测（2026-10-29，9 部剧逐一 ffprobe）：列表页 `vid_list` 给全全部集，但单集页 SSR 的
-`contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **实际时长恒为 10.08 秒**（JSON-LD
-却声明整集时长）。1.0 因此从不写这两列，读它们的出流端点（`/s/{token}/e/{uid}`）在真实
+实测（2026-10-29，9 部剧逐一 ffprobe，**网页通道**）：列表页 `vid_list` 给全全部集，但单集页
+SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **实际时长恒为 10.08 秒**
+（JSON-LD 却声明整集时长）。受保护剧的完整片源只在 App 通道（MKACG-626/630）——同一集
+换通道就是另一条字节流，所以分片身份带通道段（见「分片缓存」）。两条通道都不落库：
+1.0 从不写这两列，读它们的出流端点（`/s/{token}/e/{uid}`）在真实
 库上恒 502 —— 那条断链在 S8 直接接在 `/video` 上：**每次播放请求现调
 `plugin.Resolve`**（`internal/stream` 的 `Resolver`），失败一律 502、不写库不缓存。
 

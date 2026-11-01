@@ -19,7 +19,7 @@ ADR-0004 的理由是「视频分片是缓存代理在传输层做的，它拥�
 | 对象 | 缓存？ | 位置 | 键 | 说明 |
 |---|---|---|---|---|
 | 海报（cover） | **是** | `artifact(kind='cover')` + 文件 | `<provider>/<provider_id>` | 已有机制，本次只是把「刷新时下载」接上 |
-| 分片（`.ts`） | **是** | `artifact(kind='segment')` + 文件 | `sha256(uid \| seq \| codec_sig)` | 新增，播放的主收益在这 |
+| 分片（`.ts`） | **是** | `artifact(kind='segment')` + 文件 | `sha256(uid \| seq \| codec_sig)` | 新增，播放的主收益在这；`codec_sig` 带通道段（`web/…` / `app/…`，见「落盘布局与键」） |
 | 关键帧索引 | **是** | `artifact(kind='index')` | `uid` | 已有机制，改为按需建立（`docs/PLAYBACK-CONTRACT.md`） |
 | m3u8 文本 | **否** | — | — | 见下 |
 | 源 mp4 整文件 | **否** | — | — | 见下 |
@@ -59,6 +59,11 @@ playlist 是 `segment` 表的**纯函数**（`segment.BuildPlaylist`）：一次
   - 分片：`uid + "\x1f" + seq + "\x1f" + codec_sig`
   - 海报：`provider + "/" + provider_id`
   - 索引：`uid`
+- `codec_sig` 不是裸的编码签名，而是 **`<通道>/<签名>`**（`web/…` / `app/…`，
+  MKACG-626 契约 4）：同一集的网页源与 App 源字节流不同，而签名
+  （codec / profile / level / pix_fmt / tag / time_base）可能完全相同（它不含分辨率与时长，
+  10 秒 360p 预览与 3 分钟完整集会算出同一个值）——缺了通道段就会串味。内容密钥
+  （`plugin.Stream.Key`）**不进键**：通道段就是它在键里的替身。
 - 文件**不可变**：内容只由键决定，所以写用「临时文件 + `rename`」，读到半截文件的可能为零。
 - **海报的下载超时与失败口径（MKACG-620）**：单次出站超时按 `cover_timeout_sec`
   现读（默认 5 s，1–60，见 `docs/DEV-STANDARDS.md`「配置」表），不跟插件的
@@ -69,12 +74,13 @@ playlist 是 `segment` 表的**纯函数**（`segment.BuildPlaylist`）：一次
 
 ## 失效
 
-只有三种，全部按「保守」处理：
+只有四种，全部按「保守」处理：
 
 | 触发 | 处理 |
 |---|---|
 | 键变了 | 自然产生新文件，旧文件由 LRU 淘汰（不需要主动删） |
 | `stream_secret` 变了 | `uid` 没变 → 缓存仍命中；只有 URL 失效，缓存不受影响 |
+| 通道变了（web ↔ app） | `codec_sig` 带通道段 → 分片键自然变，旧片由 LRU 淘汰；`segment` 索引的通道段与本次请求不一致即**重建**（不沿用另一个通道的片数与时长；加通道段之前写下的老索引一律算失效） |
 | 上游同 `vid` 换了内容 | 无法自动感知（`vid` 不变、`codec_sig` 不变）。由 `cache_lru_days` 兜底过期 |
 
 **不做主动失效**：没有指纹比对、没有 ETag 回源校验。理由：单用户场景里

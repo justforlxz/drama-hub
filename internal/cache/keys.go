@@ -21,6 +21,11 @@ const keySeparator = "\x1f"
 // sha256(uid \x1f seq \x1f codec_sig) 的十六进制（ADR-0007 第 3 条）。
 //
 // codec_sig 参与键：切片是 `-c copy`，不同编码参数的源若混进同一个文件就是坏数据。
+//
+// 传进来的 codec_sig 已经带通道段（`web/…` / `app/…`，由 internal/segment 按
+// MKACG-626 裁决 3 拼）：同一集的网页源与 App 源编码参数可能完全相同、字节流不同，
+// 通道段是键里唯一能区分它们的东西。本函数不认识通道，也不该认识 —— 判据只有一处
+// （segment.channelSig），索引行与这里消费的是同一个字符串。
 func SegmentKey(uid string, seq int, codecSig string) string {
 	preimage := uid + keySeparator + strconv.Itoa(seq) + keySeparator + codecSig
 	sum := sha256.Sum256([]byte(preimage))

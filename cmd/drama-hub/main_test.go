@@ -515,10 +515,11 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 		ids = append(ids, id)
 	}
 	// 索引由 S8 按需建立；装配面测试不跑 ffprobe，直接写每集各 2 片。
+	// codec_sig 带通道段（`web/`）：没有通道段的签名会被当成老索引重建（MKACG-629）。
 	for _, id := range ids {
 		if err := st.ReplaceSegments(ctx, id, []store.Segment{
-			{EpisodeID: id, StartSec: 0, Dur: 4, Keyframe: true, Mode: "copy", CodecSig: "h264/High/40/yuv420p/[0][0][0][0]/1/12800"},
-			{EpisodeID: id, StartSec: 4, Dur: 2, Keyframe: true, Mode: "copy", CodecSig: "h264/High/40/yuv420p/[0][0][0][0]/1/12800"},
+			{EpisodeID: id, StartSec: 0, Dur: 4, Keyframe: true, Mode: "copy", CodecSig: "web/h264/High/40/yuv420p/[0][0][0][0]/1/12800"},
+			{EpisodeID: id, StartSec: 4, Dur: 2, Keyframe: true, Mode: "copy", CodecSig: "web/h264/High/40/yuv420p/[0][0][0][0]/1/12800"},
 		}); err != nil {
 			t.Fatalf("ReplaceSegments: %v", err)
 		}
@@ -939,7 +940,9 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 
 	logger := slog.New(slog.DiscardHandler)
 	cutter := segment.NewCutter(st, settings, logger, cache.New(st, settings, logger),
-		func(_ context.Context, ep store.Episode) (string, error) { return urls[ep.ID], nil },
+		func(_ context.Context, ep store.Episode) (stream.Direct, error) {
+			return stream.Direct{URL: urls[ep.ID]}, nil
+		},
 		playbackHeaders(nil))
 	mux := http.NewServeMux()
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)

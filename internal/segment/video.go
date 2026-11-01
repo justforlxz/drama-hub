@@ -121,11 +121,11 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 		func(ctx context.Context) ([]byte, error) {
 			// 直链只在真要切片时才解析：命中缓存的分片请求零外呼
 			// （契约「命中即回文件」，也是缓存存在的意义）。
-			playURL, err := c.directURL(ctx, tl, sl.EpisodeID)
+			d, err := c.direct(ctx, tl, sl.EpisodeID)
 			if err != nil {
 				return nil, err
 			}
-			return cut(ctx, playURL, sl.StartSec, sl.Dur, sl.OffsetSec, c.headerBlock)
+			return cut(ctx, d, sl.StartSec, sl.Dur, sl.OffsetSec, c.headerBlock)
 		})
 	if err != nil {
 		c.logger.WarnContext(ctx, "segment slice failed",
@@ -198,20 +198,24 @@ func (c *Cutter) unit(ctx context.Context, uid string) (playbackUnit, error) {
 	return playbackUnit{eps: []store.Episode{ep}}, nil
 }
 
-// resolvedTimeline 是播放单元的时间轴加上本次已解析的直链（集 id → 直链）。
+// resolvedTimeline 是播放单元的时间轴加上本次已解析的直链与 key（集 id → 直链）。
 //
 // 直链只活在这次请求里：不落库、不缓存、不进 Timeline（时间轴是纯时长视图）。
 type resolvedTimeline struct {
 	slices []Slice
-	urls   map[int64]string
+	direct map[int64]stream.Direct
 }
 
-// timelineFor 把播放单元展开成时间轴；索引缺失的集同步建一次索引。
+// timelineFor 把播放单元展开成时间轴；索引缺失、或现存索引属于另一个通道的集
+// 同步重建一次索引。
 //
 // resolveAll=true（playlist）：每个成员都现解析直链一次，拿不到就 502 —— 契约要求
-// 播放列表在「该集解析不到直链」时直接失败。
+// 播放列表在「该集解析不到直链」时直接失败。通道判据（web / app）就在这次解析的
+// 结果里，所以「索引是不是别的通道建的」只有这条路径能判，也只需要这条路径判：
+// 播放器总是先取 playlist 再取分片。
 // resolveAll=false（分片）：只在需要建索引时才解析（探测要源地址），其余的集留给
-// 调用方按需解析，免得一次分片请求把整组都解析一遍。
+// 调用方按需解析，免得一次分片请求把整组都解析一遍；已有索引的分片请求零外呼
+// （契约「命中即回文件」）。
 //
 // 索引建立整体受 indexDeadline 约束：超时 → 503 + Retry-After（httpx.ErrUnavailable）。
 func (c *Cutter) timelineFor(ctx context.Context, u playbackUnit, resolveAll bool) (resolvedTimeline, error) {
@@ -219,46 +223,48 @@ func (c *Cutter) timelineFor(ctx context.Context, u playbackUnit, resolveAll boo
 	defer cancel()
 
 	eps := make([]EpisodeSegments, 0, len(u.eps))
-	urls := make(map[int64]string, len(u.eps))
+	direct := make(map[int64]stream.Direct, len(u.eps))
 	for _, ep := range u.eps {
 		segs, err := c.st.ListSegments(ctx, ep.ID)
 		if err != nil {
 			return resolvedTimeline{}, fmt.Errorf("读分片索引剧集 %d: %w", ep.ID, err)
 		}
 		if resolveAll || len(segs) == 0 {
-			url, err := c.resolve(ctx, ep)
+			d, err := c.resolve(ctx, ep)
 			if err != nil {
 				return resolvedTimeline{}, fmt.Errorf("解析剧集 %d 直链（%v）: %w", ep.ID, err, httpx.ErrUpstream)
 			}
-			urls[ep.ID] = url
-			if len(segs) == 0 {
-				if segs, err = c.ensureSegments(idxCtx, ep, url); err != nil {
+			direct[ep.ID] = d
+			// 没有索引，或者索引是另一个通道（含没有通道段的老索引）留下的：重建。
+			// 不重建就会把旧通道的片数、时长与分片键永久沿用下去（626 裁决 3）。
+			if len(segs) == 0 || indexStale(segs, channelOf(d)) {
+				if segs, err = c.ensureSegments(idxCtx, ep, d); err != nil {
 					return resolvedTimeline{}, err
 				}
 			}
 		}
 		eps = append(eps, EpisodeSegments{EpisodeID: ep.ID, EpNo: ep.EpNo, Segments: segs})
 	}
-	return resolvedTimeline{slices: NewTimeline(eps).slices, urls: urls}, nil
+	return resolvedTimeline{slices: NewTimeline(eps).slices, direct: direct}, nil
 }
 
-// directURL 取某一集的直链：本次请求已解析过就复用，否则现解析一次。
+// direct 取某一集的直链与 key：本次请求已解析过就复用，否则现解析一次。
 //
 // 解析失败包 httpx.ErrUpstream（契约：Resolve 失败一律 502），且绝不写库、不写缓存
 // —— 调用方是缓存生成函数，返回错误即「不落缓存」。
-func (c *Cutter) directURL(ctx context.Context, tl resolvedTimeline, episodeID int64) (string, error) {
-	if u, ok := tl.urls[episodeID]; ok {
-		return u, nil
+func (c *Cutter) direct(ctx context.Context, tl resolvedTimeline, episodeID int64) (stream.Direct, error) {
+	if d, ok := tl.direct[episodeID]; ok {
+		return d, nil
 	}
 	ep, err := c.st.EpisodeByID(ctx, episodeID)
 	if err != nil {
-		return "", fmt.Errorf("查分片所属剧集 %d: %w", episodeID, err)
+		return stream.Direct{}, fmt.Errorf("查分片所属剧集 %d: %w", episodeID, err)
 	}
-	u, err := c.resolve(ctx, ep)
+	d, err := c.resolve(ctx, ep)
 	if err != nil {
-		return "", fmt.Errorf("解析剧集 %d 直链（%v）: %w", episodeID, err, httpx.ErrUpstream)
+		return stream.Direct{}, fmt.Errorf("解析剧集 %d 直链（%v）: %w", episodeID, err, httpx.ErrUpstream)
 	}
-	return u, nil
+	return d, nil
 }
 
 // parseSeqFile 解析 `<seq>.ts` 文件名：必须以 `.ts` 结尾，seq 是**纯十进制数字**

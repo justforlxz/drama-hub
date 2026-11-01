@@ -1,7 +1,9 @@
 package segment
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,13 +18,14 @@ import (
 	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/httpx"
 	"github.com/justforlxz/drama-hub/internal/store"
+	"github.com/justforlxz/drama-hub/internal/stream"
 )
 
-// ResolveFunc 在请求时解析一集的直链（装配根注入 stream.Resolver.DirectURL）。
+// ResolveFunc 在请求时解析一集的直链与解密 key（装配根注入 stream.Resolver.Direct）。
 //
 // 契约要求直链只在请求时解析、任何列都不存（docs/PLAYBACK-CONTRACT.md）：
 // 本包不 import plugin，解析能力由上层以函数注入，错误原样透出。
-type ResolveFunc func(ctx context.Context, ep store.Episode) (string, error)
+type ResolveFunc func(ctx context.Context, ep store.Episode) (stream.Direct, error)
 
 // Cutter 是播放面的中枢：`/video/{id}.m3u8` 与 `/video/{id}/{seq}.ts` 的 handler、
 // 按需建立的关键帧索引、以及分片缓存共用同一个实例（store / settings / 缓存 /
@@ -93,20 +96,14 @@ func (c *Cutter) release() { <-c.gate }
 // 30 s，超时 503 + Retry-After）。只有第一次播放某个 uid 时会走到这里。
 const indexDeadline = 30 * time.Second
 
-// ensureSegments 返回某集的分片索引；库里还没有（该 uid 第一次被播放）就同步
-// ffprobe 建一次并落库，顺手把实测时长回填到 episode.duration_sec。
+// ensureSegments 同步 ffprobe 建一次某集的分片索引并落库，顺手把实测时长回填到
+// episode.duration_sec。「该不该建」由调用方（timelineFor）判定：库里没有行，或者
+// 现有行的通道段与本次请求的通道不一致。
 //
 // 索引按需建立、禁止批量预建（库里 2847 万集，全库预扫不可完成）。建立超时
 // （indexDeadline）返回 httpx.ErrUnavailable —— 边界包据此回 503 + Retry-After，
 // 不出半截时间轴。探测失败不写任何行（库里保留旧索引或保持为空）。
-func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, playURL string) ([]store.Segment, error) {
-	segs, err := c.st.ListSegments(ctx, ep.ID)
-	if err != nil {
-		return nil, fmt.Errorf("读分片索引 episode_id=%d: %w", ep.ID, err)
-	}
-	if len(segs) > 0 {
-		return segs, nil
-	}
+func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, d stream.Direct) ([]store.Segment, error) {
 	target, err := c.settings.Int(ctx, store.KeySegTargetSec)
 	if err != nil {
 		return nil, fmt.Errorf("读 seg_target_sec: %w", err)
@@ -114,7 +111,7 @@ func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, playURL s
 	if err := c.acquire(ctx); err != nil {
 		return nil, err
 	}
-	info, probeErr := probe(ctx, playURL, c.headerBlock)
+	info, probeErr := probe(ctx, d, c.headerBlock)
 	c.release()
 	if probeErr != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -122,6 +119,8 @@ func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, playURL s
 		}
 		return nil, probeErr
 	}
+	// 通道段并进签名：索引行与分片缓存键都用这一个值（channel.go）。
+	info.codecSig = channelSig(channelOf(d), info.codecSig)
 	// 首次建索引顺手把实测时长回填进 episode.duration_sec：ffprobe 已经拿到了真实
 	// 时长，白丢它会让 .nfo 的 <runtime> 恒为 0（Emby 全库时长 0、进度条与续播失真）。
 	// 回填排在写索引之前：反过来一旦索引写成功而回填失败，下次请求会命中已有索引
@@ -129,12 +128,13 @@ func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, playURL s
 	if _, err := c.st.BackfillEpisodeDuration(ctx, ep.ID, int(math.Round(info.durationSec))); err != nil {
 		return nil, fmt.Errorf("回填剧集 %d 时长: %w", ep.ID, err)
 	}
-	segs = planSegments(info, ep.ID, float64(target))
+	segs := planSegments(info, ep.ID, float64(target))
 	if err := c.st.ReplaceSegments(ctx, ep.ID, segs); err != nil {
 		return nil, fmt.Errorf("写入分片索引 episode_id=%d: %w", ep.ID, err)
 	}
 	c.logger.InfoContext(ctx, "segment index built",
-		"episode_id", ep.ID, "segments", len(segs), "duration_sec", info.durationSec)
+		"episode_id", ep.ID, "segments", len(segs), "duration_sec", info.durationSec,
+		"channel", channelOf(d))
 	return segs, nil
 }
 
@@ -228,25 +228,59 @@ func headerArgs(block string) []string {
 	return []string{"-headers", block}
 }
 
-// probe 执行 `ffprobe -skip_frame nokey`：只解出关键帧，收集 pts 与源时长。
+// decryptionArgs 返回要插在输入前的 `-decryption_key <hex>`（ffmpeg / ffprobe 的
+// mov 解复用器选项，CENC-AES-CTR 由 ffmpeg 原生解）。明文流返回 nil：命令行里
+// 一个多余参数都没有 —— 传空值会被 ffmpeg 当非法参数。
 //
-// 失败返回 httpx.ErrUpstream（带 stderr 尾部与源 host；不含完整 URL —— 直链可能
-// 带签名）。
-func probe(ctx context.Context, src, headers string) (sourceInfo, error) {
-	dctx, cancel := context.WithTimeout(ctx, timeoutProbe)
-	defer cancel()
-	args := append([]string{
+// key 只在这里变成命令行参数：不进日志、不进错误文本（docs/DEV-STANDARDS.md
+// 「播放面」）。
+func decryptionArgs(key []byte) []string {
+	if len(key) == 0 {
+		return nil
+	}
+	return []string{"-decryption_key", hex.EncodeToString(key)}
+}
+
+// probeArgs 拼 `ffprobe -skip_frame nokey` 的完整 argv（纯函数，argv 顺序就是契约：
+// `-decryption_key` 与 `-headers` 必须落在源地址之前，否则 ffmpeg 只把它们当输出
+// 选项、静默忽略）。
+func probeArgs(src stream.Direct, headers string) []string {
+	args := []string{
 		"-v", "error",
 		"-select_streams", "v:0",
 		"-skip_frame", "nokey",
 		"-show_entries",
 		"frame=pts_time:format=duration:stream=codec_name,profile,level,pix_fmt,codec_tag_string,time_base",
 		"-of", "json",
-	}, headerArgs(headers)...)
-	cmd := exec.CommandContext(dctx, "ffprobe", append(args, src)...)
+	}
+	args = append(args, headerArgs(headers)...)
+	args = append(args, decryptionArgs(src.Key)...)
+	return append(args, src.URL)
+}
+
+// probe 执行 `ffprobe -skip_frame nokey`：只解出关键帧，收集 pts 与源时长。
+//
+// 失败返回 httpx.ErrUpstream（带 stderr 尾部与源 host；不含完整 URL —— 直链可能
+// 带签名）。
+//
+// 密文源要单独判一次解密自检：key 错的时候 ffprobe 常常**以 0 退出**、只往 stderr
+// 吐 `non-existing PPS …`，拿不到关键帧却也不算失败 —— 那种「成功」会把空索引写进
+// 库、把空分片写进缓存。所以 key 非空时 stderr 必须为空（实测正确 key 下 0 字节），
+// 非空即解密失败（MKACG-626 AC-8）。明文流不看 stderr：`-v error` 下源本身也会吐
+// 无害告警，按它判失败会把好源打成 502。
+func probe(ctx context.Context, src stream.Direct, headers string) (sourceInfo, error) {
+	dctx, cancel := context.WithTimeout(ctx, timeoutProbe)
+	defer cancel()
+	cmd := exec.CommandContext(dctx, "ffprobe", probeArgs(src, headers)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return sourceInfo{}, fmt.Errorf("ffprobe %s: %w（%s）", safeHost(src), httpx.ErrUpstream, stderrTail(err, out))
+		return sourceInfo{}, fmt.Errorf("ffprobe %s: %w（%s）", safeHost(src.URL), httpx.ErrUpstream, stderrTail(err, stderr.Bytes()))
+	}
+	if len(src.Key) > 0 && stderr.Len() > 0 {
+		return sourceInfo{}, fmt.Errorf("ffprobe %s 解密自检失败: %w（%s）",
+			safeHost(src.URL), httpx.ErrUpstream, stderrTail(nil, stderr.Bytes()))
 	}
 	var decoded struct {
 		Frames []struct {
@@ -286,6 +320,23 @@ func probe(ctx context.Context, src, headers string) (sourceInfo, error) {
 	return info, nil
 }
 
+// cutArgs 拼 `ffmpeg` 切片的完整 argv（纯函数）：`-decryption_key` 与 `-headers`
+// 落在 `-i` 之前，才是输入选项；`-ss` 也在 `-i` 之前（输入寻址）。
+func cutArgs(src stream.Direct, start, dur, offset float64, headers string) []string {
+	args := append([]string{"-v", "error"}, headerArgs(headers)...)
+	args = append(args, decryptionArgs(src.Key)...)
+	args = append(args,
+		"-ss", formatSeconds(start),
+		"-i", src.URL,
+		"-t", formatSeconds(dur),
+		"-c", "copy",
+	)
+	if offset > 0 {
+		args = append(args, "-output_ts_offset", formatSeconds(offset))
+	}
+	return append(args, "-f", "mpegts", "pipe:1")
+}
+
 // cut 执行 ffmpeg：`-ss` 前置（输入寻址，切点已是关键帧所以不漂移）→ `-c copy`
 // → MPEG-TS 写到 stdout。返回完整字节；失败返回 httpx.ErrUpstream。
 //
@@ -297,27 +348,15 @@ func probe(ctx context.Context, src, headers string) (sourceInfo, error) {
 // 字节全部收进内存再返回，调用方才能「先定状态码再写响应」：ffmpeg 中途失败时
 // 客户端看到的是干净的 502，不是半截流。单片 10s 约 2–5 MB（DESIGN §2）。
 //
-// headers 是 `-headers` 的值（见 headerBlock），空 = 不带。
-func cut(ctx context.Context, src string, start, dur, offset float64, headers string) ([]byte, error) {
+// src.Key 非空时解密交给 ffmpeg 原生 `-decryption_key`（不自己解 CENC、不落整集
+// 明文）：同一条 `-ss … -c copy` 路径，只是多一个输入选项。
+func cut(ctx context.Context, src stream.Direct, start, dur, offset float64, headers string) ([]byte, error) {
 	dctx, cancel := context.WithTimeout(ctx, timeoutCut)
 	defer cancel()
-	args := append([]string{
-		"-v", "error",
-	}, headerArgs(headers)...)
-	args = append(args,
-		"-ss", formatSeconds(start),
-		"-i", src,
-		"-t", formatSeconds(dur),
-		"-c", "copy",
-	)
-	if offset > 0 {
-		args = append(args, "-output_ts_offset", formatSeconds(offset))
-	}
-	args = append(args, "-f", "mpegts", "pipe:1")
-	cmd := exec.CommandContext(dctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(dctx, "ffmpeg", cutArgs(src, start, dur, offset, headers)...)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("ffmpeg 切片 %s: %w（%s）", safeHost(src), httpx.ErrUpstream, stderrTail(err, out))
+		return nil, fmt.Errorf("ffmpeg 切片 %s: %w（%s）", safeHost(src.URL), httpx.ErrUpstream, stderrTail(err, out))
 	}
 	return out, nil
 }

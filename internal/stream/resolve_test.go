@@ -74,29 +74,29 @@ func newResolveRig(t *testing.T, src *fakeSource) (*Resolver, *store.Store, []st
 	return NewResolver(st, reg), st, eps
 }
 
-// TestDirectURL 覆盖正常路径：按集号向剧所属插件现解析，每次请求都调一次 Resolve。
-func TestDirectURL(t *testing.T) {
+// TestDirectResolvesEveryRequest 覆盖正常路径：按集号向剧所属插件现解析，每次请求
+// 都调一次 Resolve（直链不缓存，插件换链后下一次就拿新链）。
+func TestDirectResolvesEveryRequest(t *testing.T) {
 	src := &fakeSource{name: "web", byEp: map[int]plugin.Stream{
 		1: {URL: "https://cdn.example/1.mp4"},
 		2: {URL: "https://cdn.example/2.mp4"},
 	}}
 	r, _, eps := newResolveRig(t, src)
 
-	got, err := r.DirectURL(context.Background(), eps[0])
+	got, err := r.Direct(context.Background(), eps[0])
 	if err != nil {
-		t.Fatalf("DirectURL: %v", err)
+		t.Fatalf("Direct: %v", err)
 	}
-	if want := "https://cdn.example/1.mp4"; got != want {
-		t.Fatalf("直链 = %q, 期望 %q", got, want)
+	if want := "https://cdn.example/1.mp4"; got.URL != want {
+		t.Fatalf("直链 = %q, 期望 %q", got.URL, want)
 	}
-	// 第二次请求仍然回源（直链不缓存）：插件换链后下一次就拿新链。
 	src.byEp[1] = plugin.Stream{URL: "https://cdn.example/1-v2.mp4"}
-	got, err = r.DirectURL(context.Background(), eps[0])
+	got, err = r.Direct(context.Background(), eps[0])
 	if err != nil {
-		t.Fatalf("第二次 DirectURL: %v", err)
+		t.Fatalf("第二次 Direct: %v", err)
 	}
-	if want := "https://cdn.example/1-v2.mp4"; got != want {
-		t.Fatalf("第二次直链 = %q, 期望 %q（必须重新解析，不缓存旧链）", got, want)
+	if want := "https://cdn.example/1-v2.mp4"; got.URL != want {
+		t.Fatalf("第二次直链 = %q, 期望 %q（必须重新解析，不缓存旧链）", got.URL, want)
 	}
 	if len(src.calls) != 2 {
 		t.Fatalf("Resolve 调用 %d 次, 期望 2", len(src.calls))
@@ -133,29 +133,29 @@ func TestDirectPassesKey(t *testing.T) {
 	}
 }
 
-// TestDirectURLNoStream 覆盖「插件说没有直链」→ 错误里带 plugin.ErrNoStream，
+// TestDirectNoStream 覆盖「插件说没有直链」→ 错误里带 plugin.ErrNoStream，
 // 边界包据此映射 502（契约状态码矩阵）。
-func TestDirectURLNoStream(t *testing.T) {
+func TestDirectNoStream(t *testing.T) {
 	src := &fakeSource{name: "web", err: plugin.ErrNoStream}
 	r, _, eps := newResolveRig(t, src)
 
-	if _, err := r.DirectURL(context.Background(), eps[0]); !errors.Is(err, plugin.ErrNoStream) {
+	if _, err := r.Direct(context.Background(), eps[0]); !errors.Is(err, plugin.ErrNoStream) {
 		t.Fatalf("err = %v, 期望 plugin.ErrNoStream", err)
 	}
 }
 
-// TestDirectURLEmptyURL 覆盖「插件不报错但给空链」：同样归 ErrNoStream，不放空 URL 出去。
-func TestDirectURLEmptyURL(t *testing.T) {
+// TestDirectEmptyURL 覆盖「插件不报错但给空链」：同样归 ErrNoStream，不放空 URL 出去。
+func TestDirectEmptyURL(t *testing.T) {
 	src := &fakeSource{name: "web", byEp: map[int]plugin.Stream{1: {}}}
 	r, _, eps := newResolveRig(t, src)
 
-	if _, err := r.DirectURL(context.Background(), eps[0]); !errors.Is(err, plugin.ErrNoStream) {
+	if _, err := r.Direct(context.Background(), eps[0]); !errors.Is(err, plugin.ErrNoStream) {
 		t.Fatalf("err = %v, 期望 plugin.ErrNoStream", err)
 	}
 }
 
-// TestDirectURLUnknownPlugin 覆盖剧的 provider 没有注册插件：返回错误而不是空链。
-func TestDirectURLUnknownPlugin(t *testing.T) {
+// TestDirectUnknownPlugin 覆盖剧的 provider 没有注册插件：返回错误而不是空链。
+func TestDirectUnknownPlugin(t *testing.T) {
 	db, err := store.Open(context.Background(), pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
@@ -177,8 +177,8 @@ func TestDirectURLUnknownPlugin(t *testing.T) {
 	}
 
 	r := NewResolver(st, plugin.NewRegistry())
-	url, err := r.DirectURL(ctx, ep)
-	if err == nil || url != "" {
-		t.Fatalf("未注册插件却返回 (%q, %v)", url, err)
+	d, err := r.Direct(ctx, ep)
+	if err == nil || d.URL != "" {
+		t.Fatalf("未注册插件却返回 (%q, %v)", d.URL, err)
 	}
 }

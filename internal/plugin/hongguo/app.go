@@ -186,11 +186,10 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string)
 		return plugin.Stream{}, fmt.Errorf("%w: POST %s 响应体超过 %d 字节",
 			plugin.ErrSchema, logPath, maxAppResponseBytes)
 	}
-	// 空响应按 626 的错误表归 ErrRejected：这是身份被挡（签名/设备鉴权）的典型形态，
-	// 换一条身份重试才有意义。
-	if len(payload) == 0 {
-		return plugin.Stream{}, fmt.Errorf("%w: POST %s 返回空响应体", plugin.ErrRejected, logPath)
-	}
+	// 判定顺序（MKACG-635）：状态码先判，响应体后判。空体不是「身份被挡」的证据——
+	// 404 + 空体正是「这集没有片源」的形态，先判空体会把它误归 ErrRejected，于是多换
+	// 一轮身份、多打一次上游。只有 200 这一格会带着空体走到下面：那时它落进
+	// appStream，按「不是 JSON」归 ErrSchema（结构不符，重试无用）。
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden ||
 		resp.StatusCode == statusDropped:

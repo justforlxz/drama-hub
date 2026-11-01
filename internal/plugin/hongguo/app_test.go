@@ -516,6 +516,70 @@ func TestAppResolveRenewsDeviceOnce(t *testing.T) {
 	}
 }
 
+// TestAppResolveStatusAndBodyClassification 覆盖 app.go 的「状态码 × 响应体」判定
+// 顺序（MKACG-635）：状态码先判，空体后判。每一格都断言错误类别与上游请求次数——
+// 归类错了的代价不是日志措辞，而是多走一轮换身份、多打一次取流。
+func TestAppResolveStatusAndBodyClassification(t *testing.T) {
+	// 非 200 时上游带的 JSON 体只有诊断价值：判定不该看它。
+	const upstreamErrorBody = `{"code":-1,"message":"no"}`
+	// 200 + 业务 code != 0 是业务拒绝（与风控同一条动作）。
+	const bizRejectedBody = `{"code":-1,"message":"rejected"}`
+
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		want       error
+		wantReg    int
+		wantVideos int
+	}{
+		// 635 的现象：404 + 空体曾被「空体 → 被拒」抢在状态码之前，误归 ErrRejected。
+		{name: "404 + 空体 → 无片源，只注册一次", status: http.StatusNotFound, body: "",
+			want: plugin.ErrNoStream, wantReg: 1, wantVideos: 1},
+		{name: "404 + JSON 体 → 无片源（既有归类）", status: http.StatusNotFound, body: upstreamErrorBody,
+			want: plugin.ErrNoStream, wantReg: 1, wantVideos: 1},
+		// 风控三格：判被拒 → 换一次身份，仍被拒 → 各两次上游请求。
+		{name: "403 + 空体 → 被拒", status: http.StatusForbidden, body: "",
+			want: plugin.ErrRejected, wantReg: 2, wantVideos: 2},
+		{name: "429 + JSON 体 → 被拒", status: http.StatusTooManyRequests, body: upstreamErrorBody,
+			want: plugin.ErrRejected, wantReg: 2, wantVideos: 2},
+		{name: "444 + 空体 → 被拒（上游丢连接）", status: statusDropped, body: "",
+			want: plugin.ErrRejected, wantReg: 2, wantVideos: 2},
+		// 5xx：换身份解决不了服务端故障，不重试。
+		{name: "500 + 空体 → 上游故障", status: http.StatusInternalServerError, body: "",
+			want: plugin.ErrUpstream, wantReg: 1, wantVideos: 1},
+		{name: "503 + JSON 体 → 上游故障", status: http.StatusServiceUnavailable, body: upstreamErrorBody,
+			want: plugin.ErrUpstream, wantReg: 1, wantVideos: 1},
+		// 200 + 空体是结构不符，不是身份被挡：同样不重试。
+		{name: "200 + 空体 → 结构不符", status: http.StatusOK, body: "",
+			want: plugin.ErrSchema, wantReg: 1, wantVideos: 1},
+		{name: "200 + 非 JSON 体 → 结构不符", status: http.StatusOK, body: "not json",
+			want: plugin.ErrSchema, wantReg: 1, wantVideos: 1},
+		{name: "200 + 非零 code → 被拒", status: http.StatusOK, body: bizRejectedBody,
+			want: plugin.ErrRejected, wantReg: 2, wantVideos: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, webSrv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series-protected.html"))
+			app, appSrv := newFakeApp(t)
+			app.replyVideo(func(int) (int, string) { return tc.status, tc.body })
+			p := newAppTestPlugin(t, webSrv, appSrv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			st, err := p.Resolve(context.Background(), testRef(), 1)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, 期望 %v", err, tc.want)
+			}
+			if st.URL != "" || st.Key != nil {
+				t.Fatalf("失败时仍返回了 Stream: %+v", st)
+			}
+			if reg, videos := app.count(); reg != tc.wantReg || videos != tc.wantVideos {
+				t.Fatalf("App 请求 = 注册 %d / 取流 %d, 期望 %d / %d",
+					reg, videos, tc.wantReg, tc.wantVideos)
+			}
+		})
+	}
+}
+
 // lastQueryDeviceID 取最后一次取流请求的 device_id（测试辅助）。
 func (f *fakeApp) lastQueryDeviceID() string {
 	f.mu.Lock()

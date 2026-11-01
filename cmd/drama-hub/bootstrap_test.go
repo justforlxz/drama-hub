@@ -6,10 +6,10 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
@@ -19,7 +19,7 @@ const testStreamSecret = "0123456789abcdef0123456789abcdef"
 // newBootstrapEnv 开一个临时库并给出 Settings 与原始连接（断言「有没有写行」）。
 func newBootstrapEnv(t *testing.T) (*store.Settings, *sql.DB) {
 	t.Helper()
-	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "bootstrap.db"))
+	db, err := store.Open(context.Background(), pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -31,7 +31,7 @@ func newBootstrapEnv(t *testing.T) (*store.Settings, *sql.DB) {
 func hasSettingRow(t *testing.T, db *sql.DB, key store.SettingKey) bool {
 	t.Helper()
 	var n int
-	if err := db.QueryRow(`SELECT count(*) FROM settings WHERE key = ?`, string(key)).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM settings WHERE key = $1`, string(key)).Scan(&n); err != nil {
 		t.Fatalf("统计 %s: %v", key, err)
 	}
 	return n > 0

@@ -3,9 +3,9 @@ package stream
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
@@ -41,7 +41,7 @@ func (f *fakeSource) Health(context.Context) error { return nil }
 // newResolveRig 建临时库，写入一部剧与两集，并按插件注册表装配 Resolver。
 func newResolveRig(t *testing.T, src *fakeSource) (*Resolver, *store.Store, []store.Episode) {
 	t.Helper()
-	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "resolve.db"))
+	db, err := store.Open(context.Background(), pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestDirectURLEmptyURL(t *testing.T) {
 
 // TestDirectURLUnknownPlugin 覆盖剧的 provider 没有注册插件：返回错误而不是空链。
 func TestDirectURLUnknownPlugin(t *testing.T) {
-	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "unknown.db"))
+	db, err := store.Open(context.Background(), pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

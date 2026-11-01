@@ -72,7 +72,7 @@ func NewStore(db *sql.DB) *Store {
 // InTx 在同一事务内执行 fn：fn 返回错误即回滚并把该错误原样返回，返回 nil 则提交。
 //
 // 事务内的 *Store 复用同一批读写方法，SQL 与语义与根 Store 完全一致。fn 里不得做
-// 网络或外部进程 I/O：SQLite 单写者，长事务会持锁阻塞其它写入（同步的取数阶段
+// 网络或外部进程 I/O：长事务会持行锁、挡住同剧的其它写入（同步的取数阶段
 // 必须在 InTx 之外完成）。
 func (s *Store) InTx(ctx context.Context, fn func(tx *Store) error) error {
 	if s.root == nil {
@@ -128,7 +128,7 @@ func (s *Store) UpsertDrama(ctx context.Context, d Drama) (int64, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx,
 		`INSERT INTO drama(provider, provider_id, title, year, plot, cover_url, episode_total, sync_at, genre, tags, shard)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		 ON CONFLICT(provider, provider_id) DO UPDATE
 		 SET title = excluded.title,
 		     year = excluded.year,
@@ -154,7 +154,7 @@ func (s *Store) UpsertDrama(ctx context.Context, d Drama) (int64, error) {
 // 无行返回 ErrNotFound；其余错误带上下文返回。
 func (s *Store) DramaByProviderID(ctx context.Context, provider, providerID string) (Drama, error) {
 	row := s.db.QueryRowContext(ctx,
-		dramaColumns+` WHERE provider = ? AND provider_id = ?`, provider, providerID)
+		dramaColumns+` WHERE provider = $1 AND provider_id = $2`, provider, providerID)
 	d, err := scanDrama(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Drama{}, ErrNotFound
@@ -169,7 +169,7 @@ func (s *Store) DramaByProviderID(ctx context.Context, provider, providerID stri
 //
 // 无行返回 ErrNotFound；其余错误带上下文返回。
 func (s *Store) DramaByID(ctx context.Context, id int64) (Drama, error) {
-	row := s.db.QueryRowContext(ctx, dramaColumns+` WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, dramaColumns+` WHERE id = $1`, id)
 	d, err := scanDrama(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Drama{}, ErrNotFound
@@ -206,7 +206,7 @@ func (s *Store) ListDramas(ctx context.Context) ([]Drama, error) {
 //
 // 级联依赖 foreign_keys=ON，由 Open 的 DSN 施加。无行受影响返回 ErrNotFound。
 func (s *Store) DeleteDrama(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM drama WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM drama WHERE id = $1`, id)
 	if err != nil {
 		return wrapWriteErr("删除剧目", err)
 	}
@@ -225,7 +225,7 @@ func (s *Store) DeleteDrama(ctx context.Context, id int64) error {
 // 一轮「新剧灌库」用它算差集（枚举到的标识里哪些库里还没有）：一次查询取全量身份，
 // 不做「每部剧一次 SELECT」。集合是只读快照，调用方不要改它。
 func (s *Store) ExistingProviderIDs(ctx context.Context, provider string) (map[string]struct{}, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT provider_id FROM drama WHERE provider = ?`, provider)
+	rows, err := s.db.QueryContext(ctx, `SELECT provider_id FROM drama WHERE provider = $1`, provider)
 	if err != nil {
 		return nil, fmt.Errorf("列 %s 的已有作品标识: %w", provider, err)
 	}
@@ -255,7 +255,7 @@ func (s *Store) StaleProviderIDs(ctx context.Context, provider string, limit int
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT provider_id FROM drama WHERE provider = ? ORDER BY sync_at, id LIMIT ?`,
+		`SELECT provider_id FROM drama WHERE provider = $1 ORDER BY sync_at, id LIMIT $2`,
 		provider, limit)
 	if err != nil {
 		return nil, fmt.Errorf("列 %s 最旧的 %d 部作品: %w", provider, limit, err)
@@ -288,7 +288,7 @@ func (s *Store) UpsertEpisode(ctx context.Context, e Episode) (int64, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx,
 		`INSERT INTO episode(drama_id, ep_no, title, duration_sec, source, vid)
-		 VALUES(?, ?, ?, ?, ?, ?)
+		 VALUES($1, $2, $3, $4, $5, $6)
 		 ON CONFLICT(drama_id, ep_no) DO UPDATE
 		 SET title = excluded.title,
 		     duration_sec = CASE WHEN excluded.duration_sec > 0
@@ -320,8 +320,23 @@ func (s *Store) BackfillEpisodeDuration(ctx context.Context, episodeID int64, du
 	}
 	changed := false
 	err := s.InTx(ctx, func(tx *Store) error {
+		// 锁序必须是 drama → episode：先读所属剧目（普通读，不加锁），再锁 drama，
+		// 最后才 UPDATE episode。反过来（先改集、再锁剧目）会与同步事务构成环：
+		// 同步持 drama 等某集，回填持该集等 drama → 40P01 死锁。
+		var dramaID int64
+		err := tx.db.QueryRowContext(ctx,
+			`SELECT drama_id FROM episode WHERE id = $1`, episodeID).Scan(&dramaID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil // 该集不存在：与「已有非零值」一样不动派生表
+		}
+		if err != nil {
+			return fmt.Errorf("查回填集所属剧目 episode_id=%d: %w", episodeID, err)
+		}
+		if err := tx.lockDrama(ctx, dramaID); err != nil {
+			return err
+		}
 		res, err := tx.db.ExecContext(ctx,
-			`UPDATE episode SET duration_sec = ? WHERE id = ? AND duration_sec = 0`,
+			`UPDATE episode SET duration_sec = $1 WHERE id = $2 AND duration_sec = 0`,
 			durationSec, episodeID)
 		if err != nil {
 			return wrapWriteErr("回填集时长", err)
@@ -331,12 +346,7 @@ func (s *Store) BackfillEpisodeDuration(ctx context.Context, episodeID int64, du
 			return fmt.Errorf("回填集时长 episode_id=%d: %w", episodeID, err)
 		}
 		if n == 0 {
-			return nil // 已有非零值或该集不存在：都不动派生表
-		}
-		var dramaID int64
-		if err := tx.db.QueryRowContext(ctx,
-			`SELECT drama_id FROM episode WHERE id = ?`, episodeID).Scan(&dramaID); err != nil {
-			return fmt.Errorf("查回填集所属剧目 episode_id=%d: %w", episodeID, err)
+			return nil // 已有非零值或该集已被删：都不动派生表
 		}
 		changed = true
 		return tx.rebuildEmbyItems(ctx, dramaID)
@@ -351,7 +361,7 @@ func (s *Store) BackfillEpisodeDuration(ctx context.Context, episodeID int64, du
 //
 // 无行返回 ErrNotFound；其余错误带上下文返回。
 func (s *Store) EpisodeByID(ctx context.Context, id int64) (Episode, error) {
-	row := s.db.QueryRowContext(ctx, episodeColumns+` WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, episodeColumns+` WHERE id = $1`, id)
 	e, err := scanEpisode(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Episode{}, ErrNotFound
@@ -366,7 +376,7 @@ func (s *Store) EpisodeByID(ctx context.Context, id int64) (Episode, error) {
 //
 // (drama_id, ep_no) 唯一，因此顺序确定。
 func (s *Store) ListEpisodes(ctx context.Context, dramaID int64) ([]Episode, error) {
-	rows, err := s.db.QueryContext(ctx, episodeColumns+` WHERE drama_id = ? ORDER BY ep_no`, dramaID)
+	rows, err := s.db.QueryContext(ctx, episodeColumns+` WHERE drama_id = $1 ORDER BY ep_no`, dramaID)
 	if err != nil {
 		return nil, fmt.Errorf("列集 drama_id=%d: %w", dramaID, err)
 	}

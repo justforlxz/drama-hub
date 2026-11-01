@@ -7,10 +7,15 @@
 | 层 | 形式 | 管什么 | 不跑什么 |
 |---|---|---|---|
 | 单元 | `go test`，无 I/O | 纯逻辑：集号派生、segment 切点计算、`seq → (集号, 秒)`、HMAC 签名校验、settings 范围校验 | 不起 HTTP、不碰磁盘、不调 ffmpeg |
-| 集成 | `go test`，`httptest` + 真 SQLite（临时文件）+ 真 ffmpeg | 端点契约：Range/206、Content-Length、token、playlist 合法性、并发闸 | 不访问外网、不连真 Emby |
+| 集成 | `go test`，`httptest` + 真 PostgreSQL（每个测试一个独立 schema）+ 真 ffmpeg | 端点契约：Range/206、Content-Length、token、playlist 合法性、并发闸 | 不访问外网、不连真 Emby |
 | 验收 | 手工清单，真 Emby + 真 rclone | 播放、拖动、续播、电视墙 | 不做成自动化 |
 
-单元与集成都在 `make test` 内；验收清单在 `docs/ACCEPTANCE.md`，每阶段合并前跑一次并留记录。
+单元与集成都在 `make test`（即 `scripts/ci.sh --test`）内，分两级：unit 不碰数据库、容器
+`--network=none`；integration 起 `postgres:16` 服务容器，测试容器同网络、用
+`DRAMA_HUB_TEST_DB_URL` 连它。测试的上游一律 mock（`httptest` / `testdata` fixture），
+`scripts/check-test-upstream.sh` 会断言测试代码里没有真实上游域名。
+
+验收清单在 `docs/ACCEPTANCE.md`，每阶段合并前跑一次并留记录。
 
 ## 必须真跑的（这些没测试不许合并）
 

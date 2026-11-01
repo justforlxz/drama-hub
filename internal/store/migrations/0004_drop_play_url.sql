@@ -1,4 +1,4 @@
--- 0004_drop_play_url.sql
+-- 0004_drop_play_url.sql（PostgreSQL 版）
 
 -- 直链是请求时向插件解析的短时凭据，持久化等于把过期链接写进库；
 -- 播放改为请求时解析（docs/DATA-MODEL.md「0003：直链不落库」，

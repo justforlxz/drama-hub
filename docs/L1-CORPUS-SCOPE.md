@@ -141,7 +141,7 @@ ffprobe -v error -show_entries format=duration  # duration=10.066667
 | `drama` 行 | 608,372 | 取证 A+B |
 | `episode` 行 | ≈ 2,580 万 | 608,372 × 42.4（取证 F4 的真实均值） |
 | `emby_item` 行（派生） | ≈ 2,580 万 | 每集一条对外剧集 |
-| SQLite 文件 | ≈ 6–9 GB | 每行含索引约 155–190 B |
+| 数据库（表 + 索引） | ≈ 6–9 GB | 每行含索引约 155–190 B |
 | WebDAV 每类目录子项 | 最大类 ≈ 18.3 万 | 17,558 部实测「剧情」占 30.1%，外推（取证 F4） |
 
 `/全部/` 一级目录已按 lxz 2026-10-30 口径删除（`docs/DIRECTORY-CONTRACT.md` v2），

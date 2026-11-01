@@ -4,11 +4,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -41,16 +41,10 @@ func main() {
 	slog.SetDefault(logger)
 	logger.Info("starting drama-hub", "version", version, "commit", commit)
 
-	dbPath := envOr("DRAMA_HUB_DB", "./data/drama.db")
-	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			logger.Error("创建数据库目录失败", "dir", dir, "err", err)
-			os.Exit(1)
-		}
-	}
-	db, err := store.Open(context.Background(), dbPath)
+	db, err := openDB(context.Background(), logger)
 	if err != nil {
-		logger.Error("打开数据库失败", "path", dbPath, "err", err)
+		// 迁移失败必须立即退出：继续跑等于对外提供半迁移服务。
+		logger.Error("数据库不可用，启动中止", "err", err, "supported", supportedEnv())
 		os.Exit(1)
 	}
 	defer func() { _ = db.Close() }()
@@ -140,6 +134,23 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+// openDB 连接 PostgreSQL 并迁移到最新版本，成功时打一条带 schema 版本的日志。
+//
+// 连不上、迁移失败、连接池参数非法都返回错误：调用方（main）记日志后 os.Exit(1)。
+// 这里不吞任何错误——半迁移的进程比不启动更危险（ADR-0009）。
+func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
+	dbURL := os.Getenv(store.EnvDBURL)
+	if dbURL == "" {
+		return nil, fmt.Errorf("%s 未设置：PostgreSQL 连接串是必填项", store.EnvDBURL)
+	}
+	db, err := store.Open(ctx, dbURL)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("数据库已就绪", "schema_version", db.SchemaVersion, "applied_migrations", db.Applied)
+	return db, nil
 }
 
 // newHandler 装配顶层路由。cmd 是唯一的装配根：路由表在这里一眼可见，

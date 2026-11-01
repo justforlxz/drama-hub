@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/cache"
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
 	"github.com/justforlxz/drama-hub/internal/store"
@@ -118,10 +119,10 @@ func newTestSyncer(t *testing.T, srv *httptest.Server, clock *fakeClock) *Syncer
 	return s
 }
 
-// newTestStore 建临时 SQLite 库并迁移到最新。
+// newTestStore 建临时测试库并迁移到最新。
 func newTestStore(t *testing.T) *store.Store {
 	t.Helper()
-	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "sync.db"))
+	db, err := store.Open(context.Background(), pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -515,7 +516,7 @@ func TestSyncSeriesLocalizesCover(t *testing.T) {
 	cdn, srv := newCoverCDN(t)
 	cacheDir := filepath.Join(t.TempDir(), "cache")
 
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cover-sync.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -577,7 +578,7 @@ func TestSyncSeriesCoverUnavailableIsNotFailure(t *testing.T) {
 	ctx := context.Background()
 	cacheDir := filepath.Join(t.TempDir(), "cache")
 
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cover-offline.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

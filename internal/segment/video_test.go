@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/cache"
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
 )
@@ -195,7 +196,7 @@ type rig struct {
 func newRig(t *testing.T, segTarget string) *rig {
 	t.Helper()
 	ctx := context.Background()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "video.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

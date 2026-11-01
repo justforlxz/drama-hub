@@ -11,10 +11,12 @@
 
 ```bash
 make build                    # 产出 ./bin/drama-hub
-DRAMA_HUB_DB=./data/drama.db DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
+# PostgreSQL 是必选外部依赖（ADR-0009）：先准备好库，再用连接串启动
+DRAMA_HUB_DB_URL='postgres://drama:drama@127.0.0.1:5432/drama?sslmode=disable' \
+DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 ```
 
-首次启动自动建库与迁移。`stream_secret` 与 `cache_dir` 由环境变量**只在键缺失时**写入
+启动时自动迁移到最新 schema（库本身要先存在，服务不建库）。`stream_secret` 与 `cache_dir` 由环境变量**只在键缺失时**写入
 一次；WebDAV 账号密码不走 env，用后台配置（`PATCH /api/settings` 或 `/status` 页的表单）
 写入：
 
@@ -153,7 +155,12 @@ Emby 库路径指向 `/mnt/dramahub`（DAV 根即剧集库根），类型选「�
 
 ```bash
 podman pull ghcr.io/justforlxz/drama-hub:latest
-podman run -d --name drama-hub -p 8080:8080 \
+podman network create drama-hub
+podman run -d --name drama-hub-pg --network drama-hub \
+  -e POSTGRES_USER=drama -e POSTGRES_PASSWORD=drama -e POSTGRES_DB=drama \
+  -v "$PWD/pgdata:/var/lib/postgresql/data:Z" postgres:16
+podman run -d --name drama-hub --network drama-hub -p 8080:8080 \
+  -e DRAMA_HUB_DB_URL='postgres://drama:drama@drama-hub-pg:5432/drama?sslmode=disable' \
   --userns=keep-id -v "$PWD/data:/data:Z" \
   ghcr.io/justforlxz/drama-hub:latest
 curl -s localhost:8080/healthz                        # 200 {"status":"ok"}
@@ -170,10 +177,12 @@ podman logs drama-hub | head -1                        # version / commit 与构
 - **门禁**：lint 与容器测试都过才发布（`needs: [lint, test]`）；ci 红就是没有任何 tag 被推。
 - 构建参数 `VERSION` / `COMMIT` 经 `-ldflags` 打进二进制，起服务的日志第一行即为实际值。
 - 镜像内 `USER app`（uid 1000）、`VOLUME ["/data"]`、`EXPOSE 8080`，默认
-  `DRAMA_HUB_ADDR=:8080`、`DRAMA_HUB_DB=/data/drama.db`；挂 `/data` 即持久化（含分片缓存）。
-- **绑宿主目录要带 `--userns=keep-id`（与 `make run` 一致）**：rootless podman 会把容器内的
-  uid 1000 映射到 subuid，写不进属主是宿主用户的目录（实测报 `unable to open database file`）。
-  不挂卷时 `podman run -p 8080:8080 <image>` 直接可用，数据落在匿名卷里。
+  `DRAMA_HUB_ADDR=:8080`。`DRAMA_HUB_DB_URL` 必填（镜像里不设：连接串含凭据），
+  没给就启动失败并打印支持的 env。挂 `/data` 持久化的是缓存（海报/分片/索引），
+  剧集数据在 PostgreSQL 里。
+- **绑宿主缓存目录要带 `--userns=keep-id`（与 `make run` 一致）**：rootless podman 会把容器内的
+  uid 1000 映射到 subuid，写不进属主是宿主用户的目录（实测报 `permission denied`）。
+  缓存目录不可用时服务仍能起（会 warn），但播放与封面会每次回源。
 - 起服务后调度器会立刻按默认间隔抓一次源，日志里有 `上游请求` 属正常。
 - ghcr 包默认私有：拉取前先 `podman login ghcr.io -u <user> -p <带 read:packages 的 PAT>`。
 - 首次配置入口：`DRAMA_HUB_STREAM_SECRET` / `DRAMA_HUB_CACHE_DIR` 由 env 在键缺失时种下
@@ -189,9 +198,9 @@ podman logs drama-hub | head -1                        # version / commit 与构
 ```bash
 make env-check                  # 校验容器内 go/ffmpeg 版本与 env.lock 一致
 make e2e-image                  # 构建测试镜像（runtime + Go 工具链）
-make test                       # 容器内跑全部测试，--network=none
+make test                       # 两级：unit（--network=none）+ integration（起 postgres:16）
 make run                        # 容器内起服务，挂 ./data，映射 :8080
-./scripts/ci.sh                 # 全量门禁：lint + 容器测试 + 版本锁
+./scripts/ci.sh                 # 全量门禁：lint + 两级测试 + 版本锁
 ```
 
 本机 `make build` / `make lint` 只用于快速迭代：开发机 ffmpeg 与容器 ffmpeg 版本不同，

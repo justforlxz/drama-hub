@@ -110,8 +110,10 @@ EXPOSE 8080
 #
 # DRAMA_HUB_ADMIN_TOKEN 不在这里设：它是写操作（POST/DELETE/PATCH）的令牌，必须由部署
 # 方在 `podman run -e` 时给。没给 = 写操作一律 401，状态页会说明「后台改配置不可用」。
+#
+# DRAMA_HUB_DB_URL（postgres://…）是必选项，不在这里设：连接串含凭据，由部署方
+# 在 `podman run -e` 时给。没给 = 启动直接失败（ADR-0009：PG 是必选外部依赖）。
 ENV DRAMA_HUB_ADDR=:8080 \
-    DRAMA_HUB_DB=/data/drama.db \
     DRAMA_HUB_LOG_LEVEL=info \
     DRAMA_HUB_CACHE_DIR=/data/cache
 
@@ -133,4 +135,4 @@ USER app
 WORKDIR /tmp
 
 ENTRYPOINT ["/usr/local/bin/run-tests"]
-CMD ["-test.v"]
+CMD ["all", "-test.v"]

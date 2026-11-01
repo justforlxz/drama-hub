@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
@@ -66,7 +67,7 @@ func newFakeCDN(t *testing.T) (*fakeCDN, *httptest.Server) {
 func newTestCoverCache(t *testing.T, srv *httptest.Server, cacheDir string) (*CoverCache, *store.Store) {
 	t.Helper()
 	ctx := context.Background()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cover.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

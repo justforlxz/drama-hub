@@ -12,13 +12,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/vfs"
 )
@@ -32,7 +32,7 @@ const (
 	walkTimeout    = 30 * time.Second
 )
 
-// fixture 是一次测试的服务与数据：真 SQLite 临时库 + 真 vfs.Tree + 真 handler。
+// fixture 是一次测试的服务与数据：真数据库（独立 schema）+ 真 vfs.Tree + 真 handler。
 type fixture struct {
 	srv      *httptest.Server
 	client   *http.Client
@@ -73,7 +73,7 @@ func newFixture(t *testing.T) fixture {
 		title  = "测试剧"
 	)
 
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "webdav.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -806,7 +806,7 @@ func (c *countingTree) reset() {
 	c.lists, c.renders, c.dirs = 0, 0, map[string]int{}
 }
 
-// bulkFixture 是「n 部剧、同一分类」的服务端：真 SQLite + 计数树 + 真 handler。
+// bulkFixture 是「n 部剧、同一分类」的服务端：真数据库 + 计数树 + 真 handler。
 type bulkFixture struct {
 	fixture
 	tree *countingTree
@@ -823,7 +823,7 @@ func newBulkFixture(t *testing.T, n int) bulkFixture {
 		secret = "0123456789abcdef0123456789abcdef"
 	)
 
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "bulk.db"))
+	db, err := store.Open(ctx, pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

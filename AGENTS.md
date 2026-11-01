@@ -19,7 +19,7 @@
 1. **虚拟，不落盘。** strm / nfo / 目录树全部按请求渲染。磁盘上只允许两类文件：图片缓存、分片缓存。禁止把剧集元数据导出成实体目录。
 2. **合并集只有一种实现：虚拟 HLS 分片聚合。** 禁止物化合并文件、禁止字节拼接多集 MP4（`moov` 只描述首集，拼字节必然时长错、seek 崩）。这条是两个方案对比后定的，不要再试。
 3. **每个虚拟文件必须给出精确 `Content-Length`。** WebDAV 的 `PROPFIND` 少了它，rclone mount 读不到文件、Emby 扫不出集。渲染 → 算长度 → 再返回，一次请求内完成。
-4. **单二进制 + SQLite。** 没有 Node、没有前端构建步骤、没有第二个运行时、没有外部缓存服务。界面用 Go 模板 + 少量原生 JS，模板随二进制嵌入（`embed`）。
+4. **单二进制 + PostgreSQL。** 一个 Go 二进制装三个面：没有 Node、没有前端构建步骤、没有第二个应用运行时、没有外部缓存服务。界面用 Go 模板 + 少量原生 JS，模板随二进制嵌入（`embed`）。**PostgreSQL 是必选外部依赖**（ADR-0009）：连接串由 `DRAMA_HUB_DB_URL` 给，迁移随启动自动执行，连不上就启动失败；代码里不留任何内嵌数据库路径。
 5. **可调参数进 `settings` 表。** strm 前缀、出流签名密钥、分片时长、缓存目录/上限/LRU 天数运行时可变，改完即时生效。代码里出现这类魔法数字视为缺陷。**缓存由本服务自己负责（ADR-0007）**：海报、分片、关键帧索引落 `<cache_dir>`，按 `cache_max_mb` 与 `cache_lru_days` 淘汰，规则与测试见 `docs/CACHE-MODEL.md`。2.0 不做缓存预热：1.0 的 `seg_prefetch` / `pin_days` 占位键已删除（MKACG-616），代码里没有预取实现。
 6. **对外集号只由 `emby_item` 派生表决定。** 合并调整只重建派生表，`drama` / `episode` 原始数据不动。
 7. **出流用字节透传，不用 302。** 302 到签名 CDN 会让缓存键漂移、过期链接命中旧缓存返回错内容。
@@ -33,7 +33,7 @@ cmd/drama-hub/          main，只做装配，不含业务逻辑
 internal/plugin/        播放源插件契约（接口 / 5 条哨兵 / 注册表）与实现 hongguo/
 internal/sync/          框架侧同步编排：插件取数 → 事务写库 → 重建派生表
 internal/scheduler/     刷新调度：一轮三段、同源单飞、间隔热读、手动触发与状态
-internal/store/         SQLite、迁移、派生表重建
+internal/store/         PostgreSQL 连接、迁移、派生表重建
 internal/vfs/           虚拟文件树 → strm/nfo/图片 渲染
 internal/webdav/        x/net/webdav 自定义 FileSystem
 internal/stream/        播放 id 签名（HMAC）与请求时直链解析（不碰 HTTP）

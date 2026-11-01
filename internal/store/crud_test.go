@@ -2,20 +2,23 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
-	"path/filepath"
+	"fmt"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
-	"modernc.org/sqlite"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/justforlxz/drama-hub/internal/pgtest"
 )
 
-// newCRUDTestDB 用 Open 建临时文件库。测试级联删除与并发写必须走真实 DSN
-// （WAL / busy_timeout / foreign_keys）；不能用 sql.Open 裸连接，否则 FK 不生效、
-// 级联删除测试会假绿。
+// newCRUDTestDB 走 Open（连接 + 迁移），用一个独立 schema 的测试库。
+// 级联删除与并发写必须跑在真实 schema 上，裸 sql.Open 不建表、FK 也不存在。
 func newCRUDTestDB(t *testing.T) *DB {
 	t.Helper()
-	db, err := Open(context.Background(), filepath.Join(t.TempDir(), "crud.db"))
+	db, err := Open(context.Background(), pgtest.DSN(t))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -421,12 +424,12 @@ func TestFullFieldRoundtrip(t *testing.T) {
 }
 
 // AC9：真实唯一/主键约束冲突被 wrapWriteErr 映射为 ErrConflict，
-// 且在公开写路径外不泄漏 *sqlite.Error。
+// 且在公开写路径外不泄漏 *pgconn.PgError。
 func TestWrapWriteErrMapsConstraintConflict(t *testing.T) {
 	ctx := context.Background()
 	db := newCRUDTestDB(t)
 
-	// 用原始 INSERT 触发真实约束冲突，取到驱动的 *sqlite.Error。
+	// 用原始 INSERT 触发真实约束冲突，取到驱动的 *pgconn.PgError。
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO drama(id, provider, provider_id, title) VALUES(1, 'web', 'p', '剧')`); err != nil {
 		t.Fatalf("建剧: %v", err)
@@ -442,12 +445,12 @@ func TestWrapWriteErrMapsConstraintConflict(t *testing.T) {
 		if err == nil {
 			t.Fatal("预期 UNIQUE(drama_id, ep_no) 冲突")
 		}
-		var se *sqlite.Error
-		if !errors.As(err, &se) {
-			t.Fatalf("驱动错误类型 = %T (%v), 期望 *sqlite.Error", err, err)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			t.Fatalf("驱动错误类型 = %T (%v), 期望 *pgconn.PgError", err, err)
 		}
-		if se.Code() != sqliteConstraintUnique {
-			t.Fatalf("实测 Code = %d, 期望 %d（常量与驱动不符）", se.Code(), sqliteConstraintUnique)
+		if pgErr.Code != pgUniqueViolation {
+			t.Fatalf("实测 SQLSTATE = %s, 期望 %s（常量与驱动不符）", pgErr.Code, pgUniqueViolation)
 		}
 		if got := wrapWriteErr("写入集", err); !errors.Is(got, ErrConflict) {
 			t.Fatalf("wrapWriteErr = %v, 期望 ErrConflict", got)
@@ -460,12 +463,12 @@ func TestWrapWriteErrMapsConstraintConflict(t *testing.T) {
 		if err == nil {
 			t.Fatal("预期 PRIMARY KEY 冲突")
 		}
-		var se *sqlite.Error
-		if !errors.As(err, &se) {
-			t.Fatalf("驱动错误类型 = %T (%v), 期望 *sqlite.Error", err, err)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			t.Fatalf("驱动错误类型 = %T (%v), 期望 *pgconn.PgError", err, err)
 		}
-		if se.Code() != sqliteConstraintPrimaryKey {
-			t.Fatalf("实测 Code = %d, 期望 %d（常量与驱动不符）", se.Code(), sqliteConstraintPrimaryKey)
+		if pgErr.Code != pgUniqueViolation {
+			t.Fatalf("实测 SQLSTATE = %s, 期望 %s（主键冲突也是 unique_violation）", pgErr.Code, pgUniqueViolation)
 		}
 		if got := wrapWriteErr("写入剧目", err); !errors.Is(got, ErrConflict) {
 			t.Fatalf("wrapWriteErr = %v, 期望 ErrConflict", got)
@@ -518,7 +521,7 @@ func TestConcurrentEpisodeWrites(t *testing.T) {
 		t.Fatalf("episode 行数 = %d, 期望 %d（不丢数据）", n, goroutines*perGoroutine)
 	}
 
-	rows, err := s.db.QueryContext(context.Background(), `SELECT ep_no FROM episode WHERE drama_id = ?`, dramaID)
+	rows, err := s.db.QueryContext(context.Background(), `SELECT ep_no FROM episode WHERE drama_id = $1`, dramaID)
 	if err != nil {
 		t.Fatalf("查询 ep_no: %v", err)
 	}
@@ -601,7 +604,7 @@ func TestInTxCommitAndRollback(t *testing.T) {
 		t.Fatalf("提交后按 id 查集: %v", err)
 	}
 
-	// 事务内 Store 不能再开事务：SQLite 不支持嵌套写事务，早失败好过隐式挂起。
+	// 事务内 Store 不能再开事务：同一连接上不支持嵌套写事务，早失败好过隐式挂起。
 	if err := s.InTx(ctx, func(tx *Store) error { return tx.InTx(ctx, func(*Store) error { return nil }) }); err == nil {
 		t.Fatal("嵌套 InTx 未报错")
 	}
@@ -664,5 +667,198 @@ func TestSchedulerQueries(t *testing.T) {
 		if len(got) != 0 {
 			t.Errorf("limit=%d 返回 %v, 期望空", limit, got)
 		}
+	}
+}
+
+// waitForLockWaiter 等到本库出现一个「正卡在 FOR UPDATE 等锁」的会话（排除自己）。
+//
+// 用它代替固定 sleep：外部事务先持住 drama 行，回填一旦请求那把行锁就会在
+// pg_stat_activity 里显示 wait_event_type=Lock，测试因此是确定性的。
+// 不能查 pg_locks 的 database 列：行锁等待是 transactionid 锁，那一列是 NULL。
+func waitForLockWaiter(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%FOR UPDATE%'`).Scan(&n); err != nil {
+			t.Fatalf("读 pg_stat_activity: %v", err)
+		}
+		if n > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("5 秒内没有出现等锁的会话：回填没有请求 drama 行锁（锁序或调用点变了）")
+}
+
+// AC：写事务的锁序是「drama → episode」。回填必须先锁剧目行，再去改集。
+//
+// 反过来（先改集、再锁剧目）会与同步事务构成环：同步持 drama 等某集、回填持该集等
+// drama → PostgreSQL 40P01 死锁。这里用确定性的探针钉住顺序：
+//  1. 外部事务先 UPDATE drama，持住那一行（模拟同步事务已锁 drama）；
+//  2. 起一个 BackfillEpisodeDuration，它在 pg_locks 里留下等锁记录；
+//  3. 此时对同一集做 FOR UPDATE NOWAIT —— 能拿到说明回填还没锁集（顺序正确）；
+//     拿到 55P03 说明它先锁了集（顺序反了，测试失败）。
+func TestBackfillLocksDramaBeforeEpisode(t *testing.T) {
+	db := newCRUDTestDB(t)
+	st := NewStore(db.DB)
+	ctx := context.Background()
+
+	dramaID, err := st.UpsertDrama(ctx, Drama{Provider: "web", ProviderID: "lock-order", Title: "锁序剧"})
+	if err != nil {
+		t.Fatalf("UpsertDrama: %v", err)
+	}
+	epID, err := st.UpsertEpisode(ctx, Episode{DramaID: dramaID, EpNo: 1, Source: "web", Vid: "v1"})
+	if err != nil {
+		t.Fatalf("UpsertEpisode: %v", err)
+	}
+
+	hold, err := db.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("开启持锁事务: %v", err)
+	}
+	defer func() { _ = hold.Rollback() }()
+	if _, err := hold.ExecContext(ctx, `UPDATE drama SET title = title WHERE id = $1`, dramaID); err != nil {
+		t.Fatalf("持住 drama 行: %v", err)
+	}
+
+	done := make(chan struct{})
+	var (
+		changed bool
+		backfil error
+	)
+	go func() {
+		defer close(done)
+		changed, backfil = st.BackfillEpisodeDuration(ctx, epID, 42)
+	}()
+
+	waitForLockWaiter(t, db.DB)
+
+	probe, err := db.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("开启探针事务: %v", err)
+	}
+	if _, err := probe.ExecContext(ctx, `SELECT 1 FROM episode WHERE id = $1 FOR UPDATE NOWAIT`, epID); err != nil {
+		_ = probe.Rollback()
+		t.Fatalf("回填先锁住了 episode（锁序反转，与同步并发会 40P01）：%v", err)
+	}
+	_ = probe.Rollback()
+
+	if err := hold.Rollback(); err != nil {
+		t.Fatalf("放开 drama 行: %v", err)
+	}
+	<-done
+	if backfil != nil {
+		t.Fatalf("回填失败: %v", backfil)
+	}
+	if !changed {
+		t.Fatal("回填没有写入（duration_sec 仍为 0？）")
+	}
+	ep, err := st.EpisodeByID(ctx, epID)
+	if err != nil {
+		t.Fatalf("EpisodeByID: %v", err)
+	}
+	if ep.DurationSec != 42 {
+		t.Fatalf("duration_sec = %d, 期望 42", ep.DurationSec)
+	}
+}
+
+// AC：同步（UpsertDrama → 逐集 UpsertEpisode → 重建派生表）与首播回填并发，
+// 无死锁（40P01）、无重复行、每集都拿到实测时长。
+func TestConcurrentBackfillAndSync(t *testing.T) {
+	db := newCRUDTestDB(t)
+	st := NewStore(db.DB)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const episodes = 8
+	dramaID, err := st.UpsertDrama(ctx, Drama{Provider: "web", ProviderID: "sync-backfill", Title: "并发剧"})
+	if err != nil {
+		t.Fatalf("UpsertDrama: %v", err)
+	}
+	ids := make([]int64, episodes)
+	for i := range ids {
+		id, err := st.UpsertEpisode(ctx, Episode{DramaID: dramaID, EpNo: i + 1, Source: "web", Vid: "v"})
+		if err != nil {
+			t.Fatalf("UpsertEpisode %d: %v", i+1, err)
+		}
+		ids[i] = id
+	}
+
+	const rounds = 10
+	errCh := make(chan error, 2)
+	// 写路径 A：与 sync.SyncSeries 同序的同步事务（先锁 drama，再逐集写，最后重建）。
+	go func() {
+		for r := 0; r < rounds; r++ {
+			err := st.InTx(ctx, func(tx *Store) error {
+				if _, err := tx.UpsertDrama(ctx, Drama{
+					Provider: "web", ProviderID: "sync-backfill", Title: "并发剧 v" + strconv.Itoa(r),
+				}); err != nil {
+					return err
+				}
+				for i := range ids {
+					if _, err := tx.UpsertEpisode(ctx, Episode{
+						DramaID: dramaID, EpNo: i + 1, Source: "web", Vid: "v",
+					}); err != nil {
+						return err
+					}
+				}
+				_, err := tx.RebuildEmbyItems(ctx, dramaID)
+				return err
+			})
+			if err != nil {
+				errCh <- fmt.Errorf("同步第 %d 轮: %w", r, err)
+				return
+			}
+		}
+		errCh <- nil
+	}()
+	// 写路径 B：首播回填（先锁 drama，再改集、重建）。
+	go func() {
+		for r := 0; r < rounds; r++ {
+			for _, id := range ids {
+				if _, err := st.BackfillEpisodeDuration(ctx, id, 100+r); err != nil {
+					errCh <- fmt.Errorf("回填第 %d 轮: %w", r, err)
+					return
+				}
+			}
+		}
+		errCh <- nil
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("并发写失败: %v", err)
+		}
+	}
+
+	eps, err := st.ListEpisodes(ctx, dramaID)
+	if err != nil {
+		t.Fatalf("ListEpisodes: %v", err)
+	}
+	if len(eps) != episodes {
+		t.Fatalf("episode 行数 = %d, 期望 %d（并发 upsert 不得重复建集）", len(eps), episodes)
+	}
+	for _, ep := range eps {
+		if ep.DurationSec <= 0 {
+			t.Errorf("第 %d 集 duration_sec = %d, 期望回填后的实测值", ep.EpNo, ep.DurationSec)
+		}
+	}
+	items, err := st.ListEmbyItems(ctx, dramaID)
+	if err != nil {
+		t.Fatalf("ListEmbyItems: %v", err)
+	}
+	seen := make(map[int]bool, len(items))
+	for _, it := range items {
+		if seen[it.EpNo] {
+			t.Fatalf("派生表出现重复对外集号 %d", it.EpNo)
+		}
+		seen[it.EpNo] = true
+	}
+	if len(items) != episodes {
+		t.Fatalf("派生表条目 = %d, 期望 %d", len(items), episodes)
 	}
 }

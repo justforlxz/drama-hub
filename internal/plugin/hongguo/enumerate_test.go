@@ -255,7 +255,7 @@ func TestEnumerateSitemapBodyLimit(t *testing.T) {
 	var body strings.Builder
 	body.WriteString(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`)
 	for i := 0; i < entries; i++ {
-		fmt.Fprintf(&body, "<url><loc>https://hongguoduanju.com/player/%d</loc></url>", 100000+i)
+		fmt.Fprintf(&body, "<url><loc>https://example.test/player/%d</loc></url>", 100000+i)
 	}
 	body.WriteString(`</urlset>`)
 	sitemap := body.String()
@@ -310,7 +310,7 @@ func TestEnumerateCategoryPageMismatch(t *testing.T) {
 // sitemap 里一个剧目 loc 都认不出（上游把 /player 换成别的形状）按 ErrSchema：
 // 静默返回空等于宣称「源里一部剧都没有」。
 func TestParseSitemapIDsUnrecognized(t *testing.T) {
-	_, err := parseSitemapIDs([]byte(`<urlset><url><loc>https://hongguoduanju.com/watch/123</loc></url></urlset>`))
+	_, err := parseSitemapIDs([]byte(`<urlset><url><loc>https://example.test/watch/123</loc></url></urlset>`))
 	if !errors.Is(err, plugin.ErrSchema) {
 		t.Fatalf("err = %v, 期望 ErrSchema", err)
 	}

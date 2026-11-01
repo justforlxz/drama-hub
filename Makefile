@@ -49,14 +49,10 @@ e2e-image:
 env-check:
 	./scripts/env-check.sh
 
-# 测试只有这一条路径。--network=none 把「测试不访问外网」变成环境强制，而不是靠自觉。
-# 源码只读挂载，测试临时文件写 /tmp（tmpfs，需 exec）。
-test: e2e-image
-	$(ENGINE) run --rm --pull=never --network=none \
-		--userns=keep-id --security-opt label=disable \
-		-v "$(CURDIR):/src:ro,Z" \
-		--tmpfs /tmp:exec \
-		$(IMAGE)-e2e:$(TAG) -test.timeout 5m
+# 测试只有这一条路径：两级（unit 不碰数据库、integration 起 PG 服务容器）都在
+# scripts/ci.sh 里，Makefile 不再抄一遍网络与 PG 的编排。
+test:
+	ENGINE=$(ENGINE) ./scripts/ci.sh --test
 
 check: lint test
 

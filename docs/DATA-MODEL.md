@@ -9,7 +9,7 @@
 结果是编号整体前移 —— 仓库里现在是 `0002_add_genre_and_source_state.sql`
 （本文「0002」块）与 `0003_segment_cache.sql`（本文「0004」块），删列由 S8 以
 `0004_drop_play_url.sql` 落地。SQL 内容逐字不变，本章的「0004」指的是 artifact
-重建这件事，不是文件名。因此 S3 收口时是 `applied=3` / `user_version=3`。
+重建这件事，不是文件名。因此 S3 收口时是 `applied=3` / schema 版本 3。
 
 ## 上游能给什么（先定数据来源，再定列）
 
@@ -247,7 +247,13 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
 
 一句话：**自动流程只增改，删除只能由人发起。**
 
-## 0002 的 dry-run 验证（已跑过）
+## 0002 的 dry-run 验证（历史记录，SQLite 时代）
+
+> 本节是换 PostgreSQL 之前（SQLite 后端）的一次 dry-run 记录：SQL 块、命令与输出都按
+> 当时的口径，保留下来只为说明「本文曾是 SQL 的唯一真值、文档与代码一起改」这条工作方式。
+> **现行迁移文件是 `internal/store/migrations/0001…0004` 的 PG DDL**（ADR-0009），
+> 与本节的 SQLite 版本不要互相校对：`0003` 现在是就地 drop/add CHECK，`0004` 的列名
+> 与顺序也不变但表类型是 PostgreSQL。
 
 验证方式：把本文上面三个 `sql` 代码块**原样抽出来**（不是手抄），放进仓库副本的
 `internal/store/migrations/`，用**仓库自己的迁移 runner**（`store.Open` → `migrate`）跑：
@@ -267,7 +273,7 @@ cd <repo-copy> && go test ./internal/store/ -run TestS1 -v
 ```
 首次 applied=4                       # 空库 → 最新（0001+0002+0003+0004）
 二次 applied=0                       # 重复执行幂等
-user_version=4                       # 两次打开后都停在 4
+schema 版本=4                        # 两次打开后都停在 4
 play_url 已移除: no such column: play_url
 索引 idx_drama_genre_shard_title / idx_drama_title / idx_artifact_kind_last_used 均存在
 默认值 genre="" tags="[]" shard=0
@@ -281,9 +287,9 @@ artifact 允许 kind='segment'；CHECK 拒绝未知 kind
 
 三条要写清楚的幂等边界：
 
-1. **幂等的保证在 runner，不在 SQL。** `migrate` 用 `PRAGMA user_version` 比对版本，
+1. **幂等的保证在 runner，不在 SQL。** `migrate` 用 `schema_migrations` 的最大 version 比对版本，
    第二次调用一个文件都不执行（`applied=0`）。因此「重复执行幂等」= 重复 `Open` 幂等。
-2. **裸重复执行 SQL 不幂等**，且这是 SQLite 的语义决定的：`ADD COLUMN` /
+2. **裸重复执行 SQL 不幂等**，且这是 SQL DDL 的语义决定的（PostgreSQL 同）：`ADD COLUMN` /
    `DROP COLUMN` 重复执行必然报错。不许为此写成「先查 `pragma_table_info` 再决定」
    的动态 SQL —— 那会让迁移文件变成不可 review 的脚本。
 3. **迁移文件名必须从 0001 连续递增**（`migrate.go` 强制），所以 0002–0004 之间

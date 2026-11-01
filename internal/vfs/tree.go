@@ -74,7 +74,7 @@ const (
 //
 //	根        1 次 DISTINCT genre
 //	分类       1 次 DISTINCT genre + 1 次 DISTINCT shard（兜底名「其他」最多两个 genre 值）
-//	分片       1 次 DISTINCT genre + 1 次 WHERE genre IN (…) AND shard = ?
+//	分片       1 次 DISTINCT genre + 1 次 WHERE genre IN (…) AND shard = $n
 //	剧        1 次剧目点查（tvshow.nfo 与 Season 01 两个子项）
 //	Season    1 次剧目点查 + 1 次 ListEmbyItems
 //
@@ -278,7 +278,7 @@ func (t *Tree) genresForDir(ctx context.Context, name string) ([]string, error) 
 // 归属（分类、分片），防止把别的分片/分类里的同名剧渲染到本路径下。
 //
 // 标题含 `/ : * ?` 等字符时目录名是 sanitize 过的，点查查不到，于是退到
-// 「本分片内的剧目比对」（`WHERE genre IN (…) AND shard = ?`，走
+// 「本分片内的剧目比对」（`WHERE genre IN (…) AND shard = $n`，走
 // idx_drama_genre_shard_title，不是全表扫）。
 func (t *Tree) locateDrama(ctx context.Context, genreDir, shardDir, name string) (store.Drama, error) {
 	shard, ok := parseShard(shardDir)

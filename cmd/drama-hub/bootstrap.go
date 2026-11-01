@@ -53,7 +53,8 @@ func bootstrapSettings(ctx context.Context, settings *store.Settings, logger *sl
 // （DRAMA_HUB_ADMIN_TOKEN）+ envBootstrap 的每次启动引导项。
 func isKnownEnv(name string) bool {
 	switch name {
-	case "DRAMA_HUB_DB", "DRAMA_HUB_ADDR", "DRAMA_HUB_LOG_LEVEL", "DRAMA_HUB_ADMIN_TOKEN":
+	case store.EnvDBURL, store.EnvDBMaxOpenConns, store.EnvDBMaxIdleConns, store.EnvDBConnMaxLifetimeSec,
+		"DRAMA_HUB_ADDR", "DRAMA_HUB_LOG_LEVEL", "DRAMA_HUB_ADMIN_TOKEN":
 		return true
 	}
 	for _, item := range envBootstrap {
@@ -82,7 +83,10 @@ func warnUnknownEnv(logger *slog.Logger) {
 //
 // WebDAV 账号密码不在此列：它们由后台配置接口管理（MKACG-622），不是 env。
 func supportedEnv() []string {
-	out := []string{"DRAMA_HUB_DB", "DRAMA_HUB_ADDR", "DRAMA_HUB_LOG_LEVEL", "DRAMA_HUB_ADMIN_TOKEN"}
+	out := []string{
+		store.EnvDBURL, store.EnvDBMaxOpenConns, store.EnvDBMaxIdleConns, store.EnvDBConnMaxLifetimeSec,
+		"DRAMA_HUB_ADDR", "DRAMA_HUB_LOG_LEVEL", "DRAMA_HUB_ADMIN_TOKEN",
+	}
 	for _, item := range envBootstrap {
 		out = append(out, item.env)
 	}

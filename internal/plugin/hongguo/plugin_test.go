@@ -201,6 +201,10 @@ func TestResolveFirstEpisode(t *testing.T) {
 	if !got.ExpiresAt.IsZero() {
 		t.Fatalf("ExpiresAt = %v, 上游没给过期时间就该是零值", got.ExpiresAt)
 	}
+	// 官网通道是明文 MP4：Key 必须是 nil（nil = 明文），不能给空切片或随手造 key。
+	if got.Key != nil {
+		t.Fatalf("Key = %x, 期望 nil（官网通道是明文）", got.Key)
+	}
 	reqs := fake.requests()
 	if len(reqs) != 2 || reqs[0] != "/player/"+fixtureSID || reqs[1] != "/player/"+fixtureSID+"/"+fixtureVID {
 		t.Fatalf("上游请求 = %v, 期望 详情页 → 集页 各一次", reqs)

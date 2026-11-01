@@ -114,6 +114,10 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid
 返回 MPEG-TS 分片。顺序是：**查本地缓存 → 命中即回文件；未命中 → 生成、落缓存、再回**。
 
 - 生成：`ffmpeg -ss … -t … -c copy`（关键帧对齐时可 copy），不可 copy 时转码（现有 `Cutter`）。
+- 加密片源：`Resolve` 带 `Key`（`plugin.Stream.Key`，16 字节 AES-128）时，切片与索引
+  探测的命令 MUST 在 `-i` **之前**加 `-decryption_key <hex>`，交给 ffmpeg 的 CENC-AES-CTR
+  原生解密；本服务不实现解密、不落整集明文。key 只在本次请求的内存里过一手：
+  不进日志、不进错误文本、不落库、不进缓存键（`docs/PLUGIN-CONTRACT.md`「加密切片与 Key」）。
 - 出站身份：`ffmpeg` / `ffprobe` 取直链 MUST 带 `-headers`（浏览器 UA + 源站根
   `Referer`），与同步抓页面是同一份身份；这一份由装配根从插件常量注入
   （`internal/segment` 不认识任何源），理由见 `docs/PLUGIN-CONTRACT.md` 硬性要求 8。
@@ -153,6 +157,7 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid
 
 - 多码率 / `master.m3u8` 变体列表：红果只给 360p，做 ABR 是无源之水。
 - 直播语义（`#EXT-X-ENDLIST` 恒在，VOD）。
-- 加密分片（`EXT-X-KEY`）：本地单用户，没有需要防的人。
+- 加密**输出**分片（`EXT-X-KEY`）：本地单用户，没有需要防的人。源的加密输入是另一件事，
+  解密在 ffmpeg 那一侧做（见 `GET /video/{id}/{seq}.ts`「加密片源」）。
 - 转码到高于源的码率/分辨率。
 - `/s/` 与 `/dav/` 的兼容层。

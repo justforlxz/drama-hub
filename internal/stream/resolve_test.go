@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -99,6 +100,36 @@ func TestDirectURL(t *testing.T) {
 	}
 	if len(src.calls) != 2 {
 		t.Fatalf("Resolve 调用 %d 次, 期望 2", len(src.calls))
+	}
+}
+
+// TestDirectPassesKey 覆盖 key 透传：插件给的 16 字节 AES-128 key 原样带出，
+// 明文流（插件不设 key）带出 nil。「可播」判据只看 URL，key 不影响。
+func TestDirectPassesKey(t *testing.T) {
+	key := bytes.Repeat([]byte{0x2a}, 16)
+	src := &fakeSource{name: "web", byEp: map[int]plugin.Stream{
+		1: {URL: "https://cdn.example/1.mp4", Key: key},
+		2: {URL: "https://cdn.example/2.mp4"},
+	}}
+	r, _, eps := newResolveRig(t, src)
+
+	got, err := r.Direct(context.Background(), eps[0])
+	if err != nil {
+		t.Fatalf("Direct: %v", err)
+	}
+	if !bytes.Equal(got.Key, key) {
+		t.Fatalf("Key = %x, 期望 %x（插件给的 key 必须原样透传）", got.Key, key)
+	}
+	if want := "https://cdn.example/1.mp4"; got.URL != want {
+		t.Fatalf("直链 = %q, 期望 %q", got.URL, want)
+	}
+
+	plain, err := r.Direct(context.Background(), eps[1])
+	if err != nil {
+		t.Fatalf("Direct（明文集）: %v", err)
+	}
+	if plain.Key != nil {
+		t.Fatalf("Key = %x, 期望 nil（插件没给 key 就是明文）", plain.Key)
 	}
 }
 

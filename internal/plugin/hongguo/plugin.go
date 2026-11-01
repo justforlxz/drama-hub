@@ -214,7 +214,9 @@ func (p *Plugin) Resolve(ctx context.Context, ref plugin.WorkRef, epNo int) (plu
 	if err != nil {
 		return plugin.Stream{}, err
 	}
-	return plugin.Stream{URL: url}, nil
+	// 官网 SSR 通道给的是明文 MP4：Key 显式留 nil（nil = 明文）。
+	// 带加密的通道（spade_a）由 App 通道接，key 只在本进程内存里过一手。
+	return plugin.Stream{URL: url, Key: nil}, nil
 }
 
 // Health 实现 plugin.Plugin：取一次源侧目录索引，证明「能连上、能拿到已知对象」。

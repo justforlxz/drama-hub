@@ -84,12 +84,17 @@ func newFakeSite(t *testing.T, status int, body string) (*fakeSite, *httptest.Se
 }
 
 // newTestPlugin 构造指向假官网的插件，日志丢弃。
+//
+// App 通道的两个端点指到不可达的本机端口：只测网页通道的用例不该顺手打到真实
+// 上游，任何误走 App 通道的调用会立刻失败而不是静默通过（测试规范：不碰外网）。
 func newTestPlugin(t *testing.T, srv *httptest.Server) *Plugin {
 	t.Helper()
 	return New(Config{
-		BaseURL:    srv.URL,
-		HTTPClient: srv.Client(),
-		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		BaseURL:           srv.URL,
+		HTTPClient:        srv.Client(),
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DeviceRegisterURL: "http://127.0.0.1:1/service/2/device_register/",
+		AppVideoURL:       "http://127.0.0.1:1/video",
 	})
 }
 
@@ -303,13 +308,28 @@ func TestSentinelMapping(t *testing.T) {
 			call:     workCall,
 		},
 		{
+			// 只有 ErrNoStream 会落到 App 通道（630 取址顺序）；其余错误原样上抛。
+			// 用 5xx 而不是 403 来钉这一条：App 端点在本插件里指向不可达端口，误落到
+			// App 通道会得到 ErrRejected 而不是 ErrUpstream，断言因此能分辨两条路径。
+			sentinel: plugin.ErrUpstream,
+			name:     "集页 5xx 不被 App 兜底掩盖",
+			routes: map[string]route{
+				detailPath:  {http.StatusOK, readFixture(t, "page-series.html")},
+				episodePath: {http.StatusBadGateway, "bad gateway"},
+			},
+			call: resolveCall,
+		},
+		{
+			// 网页通道的两条 ErrNoStream：Resolve 此时会落到 App 通道（MKACG-630 的
+			// 取址顺序），所以这里直接对网页通道断言——通道内的哨兵映射与「整体取址
+			// 顺序」是两件事，后者由 TestResolvePrecedence 覆盖。
 			sentinel: plugin.ErrNoStream,
 			name:     "集页 404",
 			routes: map[string]route{
 				detailPath:  {http.StatusOK, readFixture(t, "page-series.html")},
 				episodePath: {http.StatusNotFound, ""},
 			},
-			call: resolveCall,
+			call: webResolveCall,
 		},
 		{
 			sentinel: plugin.ErrNoStream,
@@ -318,7 +338,7 @@ func TestSentinelMapping(t *testing.T) {
 				detailPath:  {http.StatusOK, readFixture(t, "page-series.html")},
 				episodePath: {http.StatusOK, readFixture(t, "page-episode-no-content.html")},
 			},
-			call: resolveCall,
+			call: webResolveCall,
 		},
 	}
 	for _, tc := range cases {
@@ -349,6 +369,13 @@ func workCall(t *testing.T, p *Plugin) error {
 func resolveCall(t *testing.T, p *Plugin) error {
 	t.Helper()
 	_, err := p.Resolve(context.Background(), testRef(), 1)
+	return err
+}
+
+// webResolveCall 只走网页通道（不进入 App 兜底）。
+func webResolveCall(t *testing.T, p *Plugin) error {
+	t.Helper()
+	_, err := p.resolveWeb(context.Background(), fixtureSID, fixtureVID)
 	return err
 }
 

@@ -19,6 +19,9 @@ type series struct {
 	firstVisibleTime string
 	tags             []string
 	vids             []string
+	// protected 是页面声明的「这剧的网页通道只给 SEO 预览」（protectedPlayback）。
+	// 它决定 Resolve 走不走网页通道，见 app.go 的取址顺序。
+	protected bool
 }
 
 // routerDataRE 定位 _ROUTER_DATA 赋值的起始（match 以开括号 { 结尾，解码时从该
@@ -56,6 +59,7 @@ func parsePlayerPage(html, sid string) (series, error) {
 		firstVisibleTime: page.SeriesDetail.FirstVisibleTime,
 		tags:             page.SeriesDetail.Tags,
 		vids:             vids,
+		protected:        page.SeriesDetail.ProtectedPlayback,
 	}, nil
 }
 
@@ -230,7 +234,10 @@ type playerPageData struct {
 		Intro            string   `json:"series_intro"`
 		FirstVisibleTime string   `json:"first_visible_time"`
 		Tags             []string `json:"tags"`
-		VidList          []string `json:"vid_list"`
+		// ProtectedPlayback 是 MKACG-626 实测的上游字段：受保护剧的网页只给
+		// 10 秒 SEO 预览（88/88 部样本为 true，docs/L1-CORPUS-SCOPE.md 取证 D）。
+		ProtectedPlayback bool     `json:"protectedPlayback"`
+		VidList           []string `json:"vid_list"`
 	} `json:"seriesDetail"`
 }
 

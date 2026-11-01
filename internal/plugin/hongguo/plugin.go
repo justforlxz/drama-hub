@@ -108,6 +108,10 @@ type Config struct {
 	HTTPClient        *http.Client // nil → 30s 超时客户端
 	Logger            *slog.Logger // nil → slog.Default()
 	DeviceRegisterURL string       // 空 → defaultDeviceRegisterURL；测试注入假上游
+	// AppVideoURL 是 App 通道取流端点。App 通道就两个 host：设备注册
+	// （DeviceRegisterURL）与取流（本字段），两者都是构造期配置、默认值内置、
+	// 测试可注入；settings 不新增键（MKACG-626 D2：上游换域名就发版）。
+	AppVideoURL string // 空 → defaultAppVideoURL
 }
 
 // 编译期断言：红果插件实现契约的全部方法（少一个就是构建失败，不是运行时才发现）。
@@ -115,9 +119,10 @@ var _ plugin.Plugin = (*Plugin)(nil)
 
 // Plugin 是红果插件。零值不可用，用 New 构造。
 type Plugin struct {
-	baseURL string
-	client  *http.Client
-	logger  *slog.Logger
+	baseURL     string
+	appVideoURL string
+	client      *http.Client
+	logger      *slog.Logger
 	// device 是本插件唯一的进程内可变状态（匿名设备身份），规则见 device.go。
 	device *deviceCache
 }
@@ -125,9 +130,13 @@ type Plugin struct {
 // New 构造插件：空 BaseURL 用 DefaultBaseURL，空 client 用 30s 超时客户端，
 // 空 logger 用默认 logger。
 func New(cfg Config) *Plugin {
-	p := &Plugin{baseURL: cfg.BaseURL, client: cfg.HTTPClient, logger: cfg.Logger}
+	p := &Plugin{baseURL: cfg.BaseURL, appVideoURL: cfg.AppVideoURL,
+		client: cfg.HTTPClient, logger: cfg.Logger}
 	if p.baseURL == "" {
 		p.baseURL = DefaultBaseURL
+	}
+	if p.appVideoURL == "" {
+		p.appVideoURL = defaultAppVideoURL
 	}
 	if p.client == nil {
 		p.client = &http.Client{Timeout: defaultTimeout}
@@ -176,18 +185,25 @@ func (p *Plugin) WorkWithEpisodeKeys(ctx context.Context, ref plugin.WorkRef) (p
 	return p.work(ctx, ref)
 }
 
-// work 是 Work / WorkWithEpisodeKeys 的共同实现：取一页详情并解析出集表。
+// work 是 Work / WorkWithEpisodeKeys 的共同实现。
 func (p *Plugin) work(ctx context.Context, ref plugin.WorkRef) (plugin.WorkDetail, []string, error) {
+	detail, vids, _, err := p.workPage(ctx, ref)
+	return detail, vids, err
+}
+
+// workPage 是 work 的完整形态：多返回一个「网页通道只给预览」（protectedPlayback）
+// 的声明。只有 Resolve 关心它——Work 的返回值里没有这个字段，插件契约不变。
+func (p *Plugin) workPage(ctx context.Context, ref plugin.WorkRef) (plugin.WorkDetail, []string, bool, error) {
 	if ref.ID == "" {
-		return plugin.WorkDetail{}, nil, fmt.Errorf("%w: WorkRef.ID 为空", plugin.ErrSchema)
+		return plugin.WorkDetail{}, nil, false, fmt.Errorf("%w: WorkRef.ID 为空", plugin.ErrSchema)
 	}
 	body, err := p.get(ctx, "/player/"+ref.ID)
 	if err != nil {
-		return plugin.WorkDetail{}, nil, err
+		return plugin.WorkDetail{}, nil, false, err
 	}
 	ser, err := parsePlayerPage(string(body), ref.ID)
 	if err != nil {
-		return plugin.WorkDetail{}, nil, err
+		return plugin.WorkDetail{}, nil, false, err
 	}
 	episodes := make([]plugin.Episode, len(ser.vids))
 	for i := range ser.vids {
@@ -205,19 +221,21 @@ func (p *Plugin) work(ctx context.Context, ref plugin.WorkRef) (plugin.WorkDetai
 		},
 		Episodes: episodes,
 	}
-	return detail, ser.vids, nil
+	return detail, ser.vids, ser.protected, nil
 }
 
 // Resolve 实现 plugin.Plugin：解析某一集的可播放直链。
 //
-// 出站成本是 2 个请求（详情页取集表 + 集页取直链），不是契约能力矩阵写的 1 个：
-// Resolve 的入参只有集号，集号 → 源侧集标识的映射只能从详情页拿，而插件不许保存
-// 状态（契约硬性要求 2）。要压到 1 个请求必须改接口（传入源侧集标识），属设计侧。
+// 取址顺序（MKACG-626 契约）：web(非预览) → app。
+//   - 网页通道能给出真直链就用它（2 个请求：详情页取集表 + 集页取直链）；
+//   - 页面声明 protectedPlayback==true 时，网页只有 10 秒 SEO 预览，一律不请求
+//     集页、不把那个 URL 当片源（626 D1：不回落预览），直接走 App 通道；
+//   - 网页通道回 ErrNoStream（集页 404 / VideoObject 无 contentUrl）同样落到 App；
+//     其余错误照原样上抛——上游故障不该被 App 通道掩盖。
 //
-// epNo 超出集数 → ErrNotFound；集页 404 或 VideoObject 无 contentUrl → ErrNoStream
-// （契约错误语义表的两行：这一集不可播不是作品不存在）。
+// epNo 超出集数 → ErrNotFound（这一集不存在，与通道无关）。
 func (p *Plugin) Resolve(ctx context.Context, ref plugin.WorkRef, epNo int) (plugin.Stream, error) {
-	_, vids, err := p.work(ctx, ref)
+	_, vids, protected, err := p.workPage(ctx, ref)
 	if err != nil {
 		return plugin.Stream{}, err
 	}
@@ -226,19 +244,34 @@ func (p *Plugin) Resolve(ctx context.Context, ref plugin.WorkRef, epNo int) (plu
 			plugin.ErrNotFound, ref.ID, epNo, len(vids))
 	}
 	vid := vids[epNo-1]
-	body, err := p.get(ctx, "/player/"+ref.ID+"/"+vid)
+	if !protected {
+		st, err := p.resolveWeb(ctx, ref.ID, vid)
+		if err == nil {
+			return st, nil
+		}
+		if !errors.Is(err, plugin.ErrNoStream) {
+			return plugin.Stream{}, err
+		}
+	}
+	return p.resolveApp(ctx, vid)
+}
+
+// resolveWeb 是网页通道取址：集页 JSON-LD 的明文 MP4 直链。
+//
+// 集页 404 或 VideoObject 无 contentUrl → ErrNoStream（契约错误语义表的两行：
+// 这一集不可播不是作品不存在）。Key 显式留 nil：网页通道给的是明文。
+func (p *Plugin) resolveWeb(ctx context.Context, sid, vid string) (plugin.Stream, error) {
+	body, err := p.get(ctx, "/player/"+sid+"/"+vid)
 	if err != nil {
 		if errors.Is(err, plugin.ErrNotFound) {
-			return plugin.Stream{}, fmt.Errorf("%w: 集页 %s/%s 返回 404", plugin.ErrNoStream, ref.ID, vid)
+			return plugin.Stream{}, fmt.Errorf("%w: 集页 %s/%s 返回 404", plugin.ErrNoStream, sid, vid)
 		}
 		return plugin.Stream{}, err
 	}
-	url, err := parseDirectURL(string(body), ref.ID, vid)
+	url, err := parseDirectURL(string(body), sid, vid)
 	if err != nil {
 		return plugin.Stream{}, err
 	}
-	// 官网 SSR 通道给的是明文 MP4：Key 显式留 nil（nil = 明文）。
-	// 带加密的通道（spade_a）由 App 通道接，key 只在本进程内存里过一手。
 	return plugin.Stream{URL: url, Key: nil}, nil
 }
 

@@ -381,6 +381,128 @@ func TestSingleFlightTenConcurrent(t *testing.T) {
 	}
 }
 
+// 回归（MKACG-640 窗口 1）：leader 的结果必须先发布（close(done)）再摘除 flight。
+//
+// 钩子落在「已发布、尚未摘除」那一瞬，并在那一刻断言三件事：flight 还在 map 里、它的
+// done 已关闭、同一个 (kind, key) 此刻已经能 hit。三者一起说明「晚到者撞不进一个既查
+// 不到 flight、又命中不了缓存的状态」。旧实现是「摘除 → 解锁 → 发布」，窗口里 map 已
+// 空而结果还没发布，晚到者在窗口里当上第二个 leader（生成次数 = 2）。
+func TestSingleFlightPublishesBeforeRemoving(t *testing.T) {
+	tc := newTestCache(t)
+	ctx := context.Background()
+	spec := segSpec(testUID, 0)
+	id := spec.Kind + keySeparator + spec.Key
+
+	var probes atomic.Int32
+	tc.c.hooks.published = func(gotID string) {
+		probes.Add(1)
+		if gotID != id {
+			t.Errorf("钩子 id = %q, 期望 %q", gotID, id)
+			return
+		}
+		f, ok := tc.c.flights[id]
+		if !ok {
+			t.Error("发布时 flight 已不在 map 里：摘除早于发布")
+			return
+		}
+		select {
+		case <-f.done:
+		default:
+			t.Error("发布钩子里 done 还没关闭")
+		}
+		if _, hit, err := tc.c.hit(ctx, spec); err != nil || !hit {
+			t.Errorf("发布时同一个键还命中不了：hit = %v, err = %v", hit, err)
+		}
+	}
+
+	var gens atomic.Int32
+	got, err := tc.c.GetOrGenerate(ctx, spec, func(context.Context) ([]byte, error) {
+		gens.Add(1)
+		return []byte(testSegmentBody), nil
+	})
+	if err != nil {
+		t.Fatalf("GetOrGenerate: %v", err)
+	}
+	if string(got) != testSegmentBody {
+		t.Fatalf("返回字节 = %q", got)
+	}
+	if n := probes.Load(); n != 1 {
+		t.Fatalf("「已发布、未摘除」那一刻被观察到 %d 次，期望 1 次", n)
+	}
+	if n := gens.Load(); n != 1 {
+		t.Fatalf("生成次数 = %d, 期望 1", n)
+	}
+	if n := len(tc.c.flights); n != 0 {
+		t.Fatalf("结束后 flights 里还剩 %d 条，期望空", n)
+	}
+}
+
+// 回归（MKACG-640 窗口 2）：调用者的「hit() 未命中 → 进入单飞」之间也有窗口 ——
+// 这期间别的 leader 可能已经生成完并摘掉了 flight。当上 leader 后复查 hit() 才吃掉这个
+// 窗口；不复查就会再生成一次（生成次数 = 2）。
+//
+// 构造方式不靠 sleep 抢调度：用钩子把晚到者停在「已确认未命中、还没进单飞」，等 leader
+// 完整跑完（生成 + 落盘 + 写行 + 发布 + 摘除）再放行。
+func TestSingleFlightLeaderRechecksHit(t *testing.T) {
+	tc := newTestCache(t)
+	ctx := context.Background()
+	spec := segSpec(testUID, 0)
+
+	var gens atomic.Int32
+	gen := func(context.Context) ([]byte, error) {
+		gens.Add(1)
+		return []byte(testSegmentBody), nil
+	}
+
+	gate := make(chan struct{})
+	var entered atomic.Int32
+	blocked := make(chan struct{})
+	tc.c.hooks.beforeEnter = func() {
+		if entered.Add(1) != 1 {
+			return // leader 自己也要过这个点，不拦它
+		}
+		close(blocked)
+		<-gate
+	}
+
+	lateBody := make(chan []byte, 1)
+	lateErr := make(chan error, 1)
+	go func() {
+		body, err := tc.c.GetOrGenerate(ctx, spec, gen)
+		lateErr <- err
+		lateBody <- body
+	}()
+
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("晚到者没有停在「未命中 → 进单飞」的窗口上")
+	}
+
+	// leader 跑完整一轮：这一轮结束时 flight 已摘除、artifact 行已写。
+	leaderBody, err := tc.c.GetOrGenerate(ctx, spec, gen)
+	if err != nil {
+		t.Fatalf("leader GetOrGenerate: %v", err)
+	}
+	close(gate)
+
+	if err := <-lateErr; err != nil {
+		t.Fatalf("晚到者 GetOrGenerate: %v", err)
+	}
+	if got := <-lateBody; string(got) != string(leaderBody) {
+		t.Fatalf("晚到者拿到 %q, leader 拿到 %q", got, leaderBody)
+	}
+	if n := gens.Load(); n != 1 {
+		t.Fatalf("生成次数 = %d, 期望 1（当上 leader 后复查 hit 应命中）", n)
+	}
+	if n := len(tc.c.flights); n != 0 {
+		t.Fatalf("结束后 flights 里还剩 %d 条，期望空", n)
+	}
+	if files := contentFiles(t, tc.root); len(files) != 1 {
+		t.Fatalf("内容目录文件数 = %d, 期望 1：%v", len(files), files)
+	}
+}
+
 // 不同键互不阻塞：A 的生成等 B 开始，若被串行化就会超时。
 func TestDifferentKeysDoNotBlock(t *testing.T) {
 	tc := newTestCache(t)

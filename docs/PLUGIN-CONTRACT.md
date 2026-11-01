@@ -11,7 +11,7 @@ L1 口径（枚举到底有多少东西）见 `docs/L1-CORPUS-SCOPE.md`。
 | 目录发现 | 插件 | `Enumerate` | 红果：64 个请求 / 全量（30 份 sitemap + 34 页 `/category`），可分页 | 找出「源里有、库里没有」的作品 |
 | 剧目详情 | 插件 | `Work` | 红果：1 个请求 / 部 | 写 `drama` 行 |
 | 集列表 | 插件 | `Work`（同一返回值） | 0（与详情同一个响应） | 写 `episode` 行、重建 `emby_item` |
-| 直链解析 | 插件 | `Resolve` | 红果：1 个请求 / 集 | `/video/{id}/{seq}.ts` 生成分片时按需取，不落库也不进缓存索引（`docs/PLAYBACK-CONTRACT.md`） |
+| 直链解析 | 插件 | `Resolve` | 红果：1 个请求 / 集 | `/video/{id}/{seq}.ts` 生成分片时按需取，不落库也不进缓存索引（`docs/PLAYBACK-CONTRACT.md`）；加密切片另带内容密钥 `Stream.Key`，见「加密切片与 Key」 |
 | 刷新 | **框架** | — | — | 按 `docs/SCHEDULER-MODEL.md` 重新调用上面三个方法 |
 
 两处刻意的合并 / 缺席，都不是留白：
@@ -102,8 +102,14 @@ type Page struct {
 }
 
 // Stream 是一次直链解析结果。
+//
+// 「可播」的唯一判据是 URL 非空；Key 是附加属性，不影响可播性判定。
 type Stream struct {
-	URL       string
+	URL string
+	// Key 是 URL 指向内容的 AES-128 解密密钥（16 字节，CENC-AES-CTR），
+	// nil = 明文。只在内存里存在：MUST NOT 落库、MUST NOT 进日志与错误文本
+	// （「加密切片与 Key」）。
+	Key       []byte
 	ExpiresAt time.Time // 零值 = 不知道或不过期
 }
 
@@ -132,6 +138,7 @@ type Plugin interface {
 	//
 	// epNo 超出该作品集数 → ErrNotFound；集存在但源侧不公开直链 → ErrNoStream。
 	// 返回值只在本次请求内有意义，框架不持久化（docs/DATA-MODEL.md「播放入口」）。
+	// Key 与 URL 同生命周期：由播放面在本次请求内交给 ffmpeg，用完即弃。
 	Resolve(ctx context.Context, ref WorkRef, epNo int) (Stream, error)
 
 	// Health 做一次最小可用性自检：能连上、能认出一个已知对象。
@@ -147,8 +154,8 @@ type Plugin interface {
    `internal/plugin/<源>` 的 rank 为 30，`grep` 可查（`scripts/check-deps.sh`）。
 2. **不落任何状态。** 插件实例不保存游标、不保存上次结果、不缓存直链。
    唯一允许的字段是构造期注入的不可变配置（`Name`、`BaseURL`、`*http.Client`、`*slog.Logger`）。
-3. **错误必须 `%w` 包装哨兵**，且错误文本 **MUST NOT** 含直链、签名参数、
-   Cookie、请求头。可以含作品标识与集号（排障要）。
+3. **错误必须 `%w` 包装哨兵**，且错误文本 **MUST NOT** 含直链、解密 key、
+   签名参数、Cookie、请求头。可以含作品标识与集号（排障要）。
 4. **超时归插件。** 每次出站请求 MUST 带 `ctx`，且 `*http.Client` 有 `Timeout`
    （默认值见「配置」）。框架给整个调用另加一层 `ctx` 超时。
 5. **响应体必须限量。** 插件 MUST 用 `io.LimitReader` 封顶，超限按 `ErrSchema`
@@ -165,6 +172,24 @@ type Plugin interface {
    红果这一份写在 `internal/plugin/hongguo` 的常量里，播放链路的 `-headers`
    由装配根从同一份常量生成（`PlaybackHeaderLines`），不另写一份 UA。
    实测证据与取舍见 MKACG-624。
+
+## 加密切片与 Key
+
+有的源只给加密片源（红果 App 通道的 MP4 带 `spade_a`）。契约把内容密钥作为
+`Stream` 的附加属性带出来，解密归播放面，两件事都不在插件里做：
+
+| 项 | 口径 |
+|---|---|
+| 类型 | `Key []byte`，**16 字节 AES-128**（CENC-AES-CTR 的内容密钥） |
+| 明文 | `nil`。插件 MUST 给 `nil`；`len(Key) == 0`（含空切片）一律按明文处理 |
+| 可播判据 | 仍是 `URL` 非空。`Key` 有无不改变任何状态码（`docs/PLAYBACK-CONTRACT.md` 状态码矩阵） |
+| 生命周期 | 与 `URL` 相同：只在本次请求的内存里。**MUST NOT** 落库（`episode` / `artifact` / `settings` 都没有对应的列与键）、**MUST NOT** 进日志与错误文本、**MUST NOT** 进缓存键 |
+| 消费方 | `internal/stream.Resolver` 原样透传到 `Direct{URL, Key}`，播放面把它交给 `ffmpeg -decryption_key`（在 `-i` 之前）；框架与插件都不实现解密 |
+
+- key 是「上游给的内容密钥」，不是自造值：插件 MUST NOT 缓存它（与硬性要求 2
+  「不落任何状态」同源）。一个 `URL` 只对应一个 `Key`——换 key 必须同时换 URL。
+- 同一集的明文源与密文源字节流不同，分片身份里必须有通道段（`CodecSig` 的通道限定，
+  MKACG-626 裁决 3），否则缓存会串味、索引会被沿用。
 
 ## 错误语义
 

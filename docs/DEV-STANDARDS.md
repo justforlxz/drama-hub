@@ -200,8 +200,9 @@ ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（�
 - `/dav/`、`/s/{token}/*` 与 `/s/*/master.m3u8` **已退役、不留兼容层**：`.strm` 是按
   请求渲染的，下一次读取就是新内容，没有存量文件需要兼容。
 - `internal/stream`（rank 20）只剩两件事：`ID` / `ParseID`（对外 id 的 HMAC 签名）与
-  `Resolver`（请求时向插件解析直链）。它不碰 HTTP —— 状态码映射在
-  `internal/segment`。
+  `Resolver`（请求时向插件解析直链，返回 `stream.Direct{URL, Key}`；`Key` 是插件给的
+  内容密钥，原样透传给播放面，见 `docs/PLUGIN-CONTRACT.md`「加密切片与 Key」）。
+  它不碰 HTTP —— 状态码映射在 `internal/segment`。
 
 ### id 规则
 
@@ -256,9 +257,11 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }
 | 索引建立超时 | 503 + `Retry-After: 5` | 503 + `Retry-After: 5` |
 | secret 读失败 | 500（响应体与日志都不含 secret） | 500 |
 
-- **直链只在请求时解析**（`stream.Resolver.DirectURL`）：不落库（0004 已删
+- **直链只在请求时解析**（`stream.Resolver.Direct`）：不落库（0004 已删
   `episode.play_url` / `play_url_at`）、不缓存、不跨请求复用 —— 上游换链后下一次请求
-  自然拿到新链。解析失败一律 502，且不写库、不写缓存。
+  自然拿到新链。解析失败一律 502，且不写库、不写缓存。返回的 `Key`（加密片源的内容
+  密钥，`nil` = 明文）与直链同生命周期：只在本次请求的内存里，不落库、不进日志、
+  不进缓存键。
 - playlist 是 `segment` 表的**纯函数视图**（`BuildPlaylist`）：不落盘、不缓存
   （理由见 `docs/CACHE-MODEL.md`「为什么 m3u8 文本不缓存」）。
 - HEAD 与 GET 的 `Content-Length` 一致（硬约束 3）：playlist 手写长度；分片走
@@ -294,7 +297,8 @@ playlist 在集边界插 `#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 
 ## 日志
 
 - `slog` 结构化字段，键用小写下划线：`drama_id`、`ep_no`、`uid`、`seq`、`duration_ms`、`upstream_status`。
-- **禁止记录**：完整带签名的播放直链、token 明文、WebDAV 密码。需要定位时记 `vid` + `host` + 路径前 32 字符。
+- **禁止记录**：完整带签名的播放直链、token 明文、WebDAV 密码、解密 key（`plugin.Stream.Key`，
+  也不许出现在错误文本与缓存键里）。需要定位时记 `vid` + `host` + 路径前 32 字符。
 - 每个请求一条入口日志（方法、路径、状态、耗时），出站上游一条（源、状态、字节数；传输错误时该条额外带 `err` 底层原因，不含 URL）。
 
 ### 请求访问日志中间件
@@ -329,7 +333,9 @@ playlist 在集边界插 `#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 
 | `internal/plugin/hongguo` | 第一个实现：红果官网 SSR，`Name() == "web"` | `internal/plugin` |
 | `internal/sync` | 框架侧写库编排：`Syncer.SyncSeries` | `internal/plugin`、`internal/store` |
 
-插件只做「上游字节 → 领域值」：不写库、不开事务、不保存状态（不存游标、不缓存直链）。
+插件只做「上游字节 → 领域值」：不写库、不开事务、不保存状态（不存游标、不缓存直链、
+不缓存解密 key —— key 随 `Resolve` 的返回值一次性交给框架，见 `docs/PLUGIN-CONTRACT.md`
+「加密切片与 Key」）。
 写库、事务、`emby_item` 重建在 `internal/sync`；刷新调度与游标在 `internal/scheduler`
 （S4，MKACG-606）：本包只提供「按一个作品写一次库」这个幂等动作，调度器按源调它。
 

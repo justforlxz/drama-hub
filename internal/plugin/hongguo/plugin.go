@@ -99,10 +99,15 @@ const (
 //
 // 契约硬性要求 2：插件实例只允许保存构造期配置（名字、BaseURL、*http.Client、
 // *slog.Logger），不保存游标、上次结果或缓存的直链。
+//
+// 唯一例外是匿名设备身份（MKACG-628）：它是 App 通道取址的前置，单条、失败也
+// 缓存、续期 ≤ 1 次/分钟，只活在进程内存里（MKACG-626 契约第 3 条，
+// MKACG-632 写进 docs/PLUGIN-CONTRACT.md）。
 type Config struct {
-	BaseURL    string       // 空 → DefaultBaseURL
-	HTTPClient *http.Client // nil → 30s 超时客户端
-	Logger     *slog.Logger // nil → slog.Default()
+	BaseURL           string       // 空 → DefaultBaseURL
+	HTTPClient        *http.Client // nil → 30s 超时客户端
+	Logger            *slog.Logger // nil → slog.Default()
+	DeviceRegisterURL string       // 空 → defaultDeviceRegisterURL；测试注入假上游
 }
 
 // 编译期断言：红果插件实现契约的全部方法（少一个就是构建失败，不是运行时才发现）。
@@ -113,6 +118,8 @@ type Plugin struct {
 	baseURL string
 	client  *http.Client
 	logger  *slog.Logger
+	// device 是本插件唯一的进程内可变状态（匿名设备身份），规则见 device.go。
+	device *deviceCache
 }
 
 // New 构造插件：空 BaseURL 用 DefaultBaseURL，空 client 用 30s 超时客户端，
@@ -128,7 +135,23 @@ func New(cfg Config) *Plugin {
 	if p.logger == nil {
 		p.logger = slog.Default()
 	}
+	// 设备身份的注册点：构造期只装缓存，首次取用才发注册请求。
+	p.device = newDeviceCache(cfg.DeviceRegisterURL, p.client, p.logger)
 	return p
+}
+
+// deviceIdentity 取本进程的匿名设备身份（注册一次、失败也缓存、续期 ≤ 1 次/分钟）。
+//
+// 这是 App 通道取址（MKACG-630）的唯一入口；本包之外拿不到它，它也不落库、
+// 不落盘、不进 settings、不进日志。
+func (p *Plugin) deviceIdentity(ctx context.Context) (deviceIdentity, error) {
+	return p.device.get(ctx)
+}
+
+// renewDeviceIdentity 在 App 接口拒了 rejected 这条身份后换一条新的，重试一次
+// （626 契约）。续期 ≤ 1 次/分钟；静默期内再被拒就回 plugin.ErrRejected。
+func (p *Plugin) renewDeviceIdentity(ctx context.Context, rejected deviceIdentity) (deviceIdentity, error) {
+	return p.device.renew(ctx, rejected)
 }
 
 // Name 实现 plugin.Plugin。

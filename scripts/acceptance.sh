@@ -468,12 +468,13 @@ EOF
       info "" "集 $want 取实测时长失败（runtime=$rt）"
       continue
     fi
-    local wantmin
-    wantmin=$(python3 -c "import sys;print(int(float(sys.argv[1])//60))" "$dur")
-    local gotmin=$((rt / 60))
-    if [ "$gotmin" != "$wantmin" ]; then
+    # 按秒比对，容差 1 秒：runtime_sec 是 ffprobe 时长四舍五入到秒（segment/cutter.go
+    # 的 math.Round），拿「分钟截断」的结果互比会在 119.7–120.0 这种边界上假红
+    # （实测：ep13 duration_sec=120、ffprobe=119.734，两边都取 floor(/60) 得 2 与 1）。
+    # 判据是「runtime 与实测时长相符」，所以就在秒上判，不绕分钟。
+    if ! python3 -c "import sys;sys.exit(0 if abs(float('$dur')-$rt)<=1 else 1)"; then
       rt_bad=$((rt_bad + 1))
-      [ "$rt_bad" -le 3 ] && info "" "集 $want runtime=${gotmin}min ≠ 实测 ${dur}s（${wantmin}min）"
+      [ "$rt_bad" -le 3 ] && info "" "集 $want runtime=${rt}s ≠ 实测 ${dur}s"
     fi
   done
   if [ "$rt_bad" -eq 0 ] && [ "$rt_checked" -gt 0 ]; then
@@ -830,13 +831,25 @@ stage_H() {
   fi
   local after
   after=$(item_uid_for_ep "$(find_show_dir)" 1) || after=""
+  # 判据是「重启后数据与缓存都在、同一 id 仍可播」。播不出来要区分「持久性坏了」
+  # 与「上游当下不可用」：后者不是 H 的判据，但也不许当通过——所以仍旧判红，
+  # 只是把「id 变没变 / 缓存还在不在 / 上游为什么失败」分开写清（实测碰到过
+  # App 端点连续 25 分钟只回 200+空体，重启前后数据缓存全对但播不出来）。
   local code
   code=$(http_code "$BASE/video/$after.m3u8")
-  if [ "$before" = "$after" ] && [ "$code" = "200" ]; then
-    pass H1 "重启前后同一集 id 不变（$before）且 playlist 200；缓存 ${after_before:-?}MB → ${after_after:-?}MB"
-  else
-    fail H1 "重启后 id 变化或不可播：前 $before / 后 $after / code $code"
+  if [ "$before" != "$after" ] || [ -z "$after" ]; then
+    fail H1 "重启后同一集 id 变了：前 $before / 后 $after"
+    return
   fi
+  if [ "$code" = "200" ]; then
+    pass H1 "重启前后同一集 id 不变（$before）且 playlist 200；缓存 ${after_before:-?}MB → ${after_after:-?}MB"
+    return
+  fi
+  # 数据与缓存仍在、id 也没变，只是播不出来：把失败原因摊开，交给 F/上游判。
+  local why
+  why=$("$ENGINE" logs --since 5m "$DH_CONTAINER" 2>&1 |
+    grep -E '"msg":"(App 通道取址失败|App 取流|上游请求失败)"' | tail -1 | head -c 200)
+  fail H1 "重启后同一集 id 未变（$before）、缓存 ${after_before:-?}MB → ${after_after:-?}MB，但 playlist=$code — $why"
 }
 
 # ------------------------------------------------------------------ I 换链

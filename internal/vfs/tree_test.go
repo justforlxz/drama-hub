@@ -143,12 +143,6 @@ func seedTree(t *testing.T, strmPrefix string, withSecret bool) fixture {
 	if err != nil {
 		t.Fatalf("UpsertEpisode 2: %v", err)
 	}
-	// 派生表是 vfs 的唯一数据源（硬约束 6）：seed 后必须重建一次，等价于
-	// 「同步完成」那个生产调用点。
-	if _, err := st.RebuildEmbyItems(ctx, aID); err != nil {
-		t.Fatalf("RebuildEmbyItems A: %v", err)
-	}
-
 	if withSecret {
 		if err := settings.Set(ctx, store.KeyStreamSecret, testSecret); err != nil {
 			t.Fatalf("Set stream_secret: %v", err)
@@ -479,9 +473,6 @@ func TestListGenresEscapesPathSeparatorGenre(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertEpisode: %v", err)
 	}
-	if _, err := f.store().RebuildEmbyItems(ctx, dirty); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
-	}
 
 	buf := &bytes.Buffer{}
 	tree := NewTree(store.NewStore(f.db.DB), store.NewSettings(f.db.DB), stubID, f.covers,
@@ -787,9 +778,6 @@ func TestListMergedGroupCollapsesToOne(t *testing.T) {
 	if err := store.NewSettings(f.db.DB).Set(ctx, store.KeyMergeChunkSize, "2"); err != nil {
 		t.Fatalf("Set merge_chunk_size: %v", err)
 	}
-	if _, err := st.RebuildEmbyItems(ctx, 1); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
-	}
 	items, err := st.ListEmbyItems(ctx, 1)
 	if err != nil {
 		t.Fatalf("ListEmbyItems: %v", err)
@@ -870,9 +858,6 @@ func TestListRemainderSingleRendersSourceEpisodeNumber(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("UpsertEpisode %d: %v", i, err)
 		}
-	}
-	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
 
 	items, err := st.ListEmbyItems(ctx, dramaID)

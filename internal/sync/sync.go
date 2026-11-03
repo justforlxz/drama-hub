@@ -1,7 +1,7 @@
 // Package sync 是同步编排（框架侧）：按插件契约取数，把领域值写进 store。
 //
 // 插件只做「上游字节 → 领域值」的翻译：不写库、不开事务、不 import store（ADR-0006）。
-// 事务、派生表重建、sync_at 都在这里。刷新调度（一轮三段、游标推进、间隔热读）属
+// 事务与 sync_at 都在这里。刷新调度（一轮三段、游标推进、间隔热读）属
 // S4（MKACG-606）；本包只提供「按一个作品写一次库」这个幂等动作。
 package sync
 
@@ -123,11 +123,8 @@ func (s *Syncer) SyncSeries(ctx context.Context, st *store.Store, id string) err
 				return fmt.Errorf("写入第 %d 集: %w", ep.No, err)
 			}
 		}
-		// 同步完成是 emby_item 派生表的调用点之一（DEV-STANDARDS「数据库」）：剧与集
-		// 落库后立刻重建对外剧集视图，否则 vfs 树看不到任何集（硬约束 6 只认派生表）。
-		if _, err := tx.RebuildEmbyItems(ctx, dramaID); err != nil {
-			return fmt.Errorf("重建对外剧集 %s: %w", ref.ID, err)
-		}
+		// 对外剧集不落库（ADR-0014）：vfs 与播放面在每次读到时按当前 merge_chunk_size
+		// 现算，剧与集写完就已经是可见的，这里没有派生表要重建。
 		return nil
 	})
 	if err != nil {

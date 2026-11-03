@@ -8,6 +8,6 @@
 // scripts/check-deps.sh 强制。
 //
 // 边界：本包负责页面渲染、JSON 响应与传输层错误映射（httpx），业务规则（同步
-// 解析、分块规则、派生表重建）留在 domain 包。`/healthz` 属装配面，由 cmd
+// 解析、分块规则）留在 domain 包。`/healthz` 属装配面，由 cmd
 // 注册，不在本包。
 package web

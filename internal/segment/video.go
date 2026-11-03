@@ -267,41 +267,22 @@ type playbackUnit struct {
 
 // unit 把 uid 展开成播放单元。
 //
-// 「合法 uid」由 emby_item 派生表决定（硬约束 6 + 契约「不飘移」第 3 条）：某集被并进
-// 合并块后它的 `e<id>` 立刻不是播放单元，旧 URL 必须 404 —— 所以先查派生表再取集。
-// 单集一项；合并集由 uid 里的 `(dramaID, epFrom, epTo)` 反解成员区间，再取
-// `ep_no ∈ [a,b]` 的集（自动分块切的是连续列表切片，区间内没有别块的集）。
-// uid 语法不认识、派生表没有、区间里没有集 → httpx.ErrNotFound（404）。
+// 「合法 uid」由**当前配置**下的分块决定（硬约束 6 + 契约「不飘移」第 3 条）：某集被并进
+// 合并块后它的 `e<id>` 立刻不是播放单元，旧 URL 必须 404；改 merge_chunk_size 后同样
+// 立即生效（ADR-0014）。store 现算分块并一并返回成员集，这里不再另查区间。
+// uid 语法不认识、当前分块里没有这个句柄 → httpx.ErrNotFound（404）。
 func (c *Cutter) unit(ctx context.Context, uid string) (playbackUnit, error) {
-	if _, err := c.st.EmbyItemByUID(ctx, uid); err != nil {
+	_, eps, err := c.st.EmbyItemByUID(ctx, uid)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return playbackUnit{}, fmt.Errorf("%w: 播放单元 %s", httpx.ErrNotFound, uid)
 		}
 		return playbackUnit{}, fmt.Errorf("查播放单元 %s: %w", uid, err)
 	}
-	if dramaID, from, to, ok := store.ParseMergedUID(uid); ok {
-		eps, err := c.st.ListEpisodesInRange(ctx, dramaID, from, to)
-		if err != nil {
-			return playbackUnit{}, fmt.Errorf("读合并集成员 drama_id=%d ep_no=%d..%d: %w", dramaID, from, to, err)
-		}
-		if len(eps) == 0 {
-			return playbackUnit{}, fmt.Errorf("%w: 合并集 %s 没有成员", httpx.ErrNotFound, uid)
-		}
-		return playbackUnit{eps: eps}, nil
+	if len(eps) == 0 {
+		return playbackUnit{}, fmt.Errorf("%w: 播放单元 %s 没有成员", httpx.ErrNotFound, uid)
 	}
-
-	episodeID, ok := parseEpisodeUID(uid)
-	if !ok {
-		return playbackUnit{}, fmt.Errorf("%w: uid %q 不是播放单元句柄", httpx.ErrNotFound, uid)
-	}
-	ep, err := c.st.EpisodeByID(ctx, episodeID)
-	if errors.Is(err, store.ErrNotFound) {
-		return playbackUnit{}, fmt.Errorf("%w: 剧集 %s", httpx.ErrNotFound, uid)
-	}
-	if err != nil {
-		return playbackUnit{}, fmt.Errorf("查剧集 %s: %w", uid, err)
-	}
-	return playbackUnit{eps: []store.Episode{ep}}, nil
+	return playbackUnit{eps: eps}, nil
 }
 
 // timelineFor 把一个播放单元的成员集展开成时间轴：每集一片。
@@ -358,19 +339,6 @@ func parseSeqFile(name string) (int, bool) {
 		return 0, false
 	}
 	return seq, true
-}
-
-// parseEpisodeUID 解析单集 uid `e<episode.id>`。不匹配或超出 int64 返回 false，
-// 调用方映射 404。合并集 uid 用 `m` 前缀，两者互不匹配（DESIGN D3）。
-func parseEpisodeUID(uid string) (int64, bool) {
-	if !strings.HasPrefix(uid, "e") {
-		return 0, false
-	}
-	id, err := strconv.ParseInt(uid[1:], 10, 64)
-	if err != nil || id < 0 {
-		return 0, false
-	}
-	return id, true
 }
 
 // writeVideoError 按播放面的错误矩阵写出响应：时长探测超时 → 503 + Retry-After

@@ -73,7 +73,7 @@ const (
 	// Root 是 vfs 的固定一级目录名。DAV 挂载点根（`/`）映射到它：vfs 路径恒以
 	// `短剧/` 开头，DAV 路径没有这一段（internal/webdav 的 resolve 负责映射）。
 	Root = "短剧"
-	// seasonDir 是季目录名。2.0 只有单季，emby_item.season 恒为 1。
+	// seasonDir 是季目录名。2.0 只有单季，对外剧集的 Season 恒为 1。
 	seasonDir = "Season 01"
 	// posterName 是剧目录下的封面文件名（Emby / Jellyfin 认的剧集封面名）。
 	//
@@ -458,8 +458,8 @@ func sortNodes(nodes []Node) {
 // embyBase 是对外剧集的文件名主干（不含扩展名）：<剧名> - S01E01 - <标签>。
 // NFO 的 <title> 与 .strm/.nfo 的文件名共用它，杜绝两处漂移。
 //
-// 集号取 emby_item.ep_no、标签见 embyLabel，两者都只来自派生表（硬约束 6）：
-// 合并调整重算派生表后文件名随之变化。
+// 集号取对外集号、标签见 embyLabel，两者都只来自当前 merge_chunk_size 下的现算结果
+// （硬约束 6）：改 N 后下一次列举就是新文件名。
 func embyBase(d store.Drama, item store.EmbyItem) string {
 	return sanitizeName(d.Title) + " - " + embyNumber(item) + " - " + embyLabel(item)
 }

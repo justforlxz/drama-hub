@@ -298,15 +298,15 @@ func (s *Store) UpsertEpisode(ctx context.Context, e Episode) (int64, error) {
 	return id, nil
 }
 
-// BackfillEpisodeDuration 用实测时长回填 episode.duration_sec，并在同一事务里重建
-// 该剧的 emby_item 派生表，让 .nfo 的 <runtime> 当次就能取到真实值。
+// BackfillEpisodeDuration 用实测时长回填 episode.duration_sec。
 //
 // 只填库里的 0（首播建索引时 ffprobe 的实测那次）：已有非零值一律不动，重复播放与
 // 索引重建都不覆盖更权威的来源。durationSec <= 0（探测不到时长的异常源）视为没有
-// 实测值，不写库、不重建。返回是否真的写了行。
+// 实测值，不写库。返回是否真的写了行。
 //
-// 派生表必须重算，而不是就地改一行：runtime_sec 单集取本集时长、合并集取组内之和，
-// 只有一个派生实现（rebuildEmbyItems），不在这里再抄一份求和（硬约束 6）。
+// 不再重建任何派生表：对外剧集的 runtime 是读时现算的（`embyItems` 对块内时长求和，
+// ADR-0014），回填写进 episode 后下一次读就是新值。锁序仍保持 drama → episode，与
+// 同步事务的加锁顺序一致。
 func (s *Store) BackfillEpisodeDuration(ctx context.Context, episodeID int64, durationSec int) (bool, error) {
 	if durationSec <= 0 {
 		return false, nil
@@ -320,7 +320,7 @@ func (s *Store) BackfillEpisodeDuration(ctx context.Context, episodeID int64, du
 		err := tx.db.QueryRowContext(ctx,
 			`SELECT drama_id FROM episode WHERE id = $1`, episodeID).Scan(&dramaID)
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil // 该集不存在：与「已有非零值」一样不动派生表
+			return nil // 该集不存在：与「已有非零值」一样什么都不做
 		}
 		if err != nil {
 			return fmt.Errorf("查回填集所属剧目 episode_id=%d: %w", episodeID, err)
@@ -339,10 +339,10 @@ func (s *Store) BackfillEpisodeDuration(ctx context.Context, episodeID int64, du
 			return fmt.Errorf("回填集时长 episode_id=%d: %w", episodeID, err)
 		}
 		if n == 0 {
-			return nil // 已有非零值或该集已被删：都不动派生表
+			return nil // 已有非零值或该集已被删：什么都不做
 		}
 		changed = true
-		return tx.rebuildEmbyItems(ctx, dramaID)
+		return nil
 	})
 	if err != nil {
 		return false, err
@@ -372,18 +372,6 @@ func (s *Store) ListEpisodes(ctx context.Context, dramaID int64) ([]Episode, err
 	return s.listEpisodes(ctx,
 		fmt.Sprintf("列集 drama_id=%d", dramaID),
 		episodeColumns+` WHERE drama_id = $1 ORDER BY ep_no`, dramaID)
-}
-
-// ListEpisodesInRange 返回某部剧 ep_no ∈ [from, to] 的集，按 ep_no 升序。
-//
-// 播放面展开合并集时用它：合并集 uid 只带剧 id 与集号区间，成员就是区间内的集。
-// 自动分块切的是**连续列表切片**，所以一个区间里的集恰好全属于同一个块 —— 不会取到
-// 别的块的集（docs/adr/0010）。
-func (s *Store) ListEpisodesInRange(ctx context.Context, dramaID int64, from, to int) ([]Episode, error) {
-	return s.listEpisodes(ctx,
-		fmt.Sprintf("列集 drama_id=%d ep_no=%d..%d", dramaID, from, to),
-		episodeColumns+` WHERE drama_id = $1 AND ep_no BETWEEN $2 AND $3 ORDER BY ep_no`,
-		dramaID, from, to)
 }
 
 // listEpisodes 是上面两个入口的共用实现：what 只用于错误文本。

@@ -144,7 +144,7 @@ worker 数不复用 `ffmpeg` 那个常量（`internal/segment` 的闸），但�
 **不做成配置项**：没有用户会为「上游礼貌度」调参，而多一个可调项就多一条要测的边界。
 
 `busy_timeout=5000`（`internal/store` DSN 已设）覆盖 4 个写者的争用；
-单个事务只写 1 部剧 + 它的集 + 重建该剧的 `emby_item`，最长的是 252 集那部。
+单个事务只写 1 部剧 + 它的集（对外剧集读时现算，没有派生表要重建），最长的是 252 集那部。
 
 ## 超时
 
@@ -183,7 +183,7 @@ worker 数不复用 `ffmpeg` 那个常量（`internal/segment` 的闸），但�
 |---|---|---|
 | 剧目入库 | `drama(provider, provider_id)` upsert | 计数不变；`sync_at` 被本次刷新时间覆盖（这是刷新的证据，不是副作用） |
 | 集入库 | `episode(drama_id, ep_no)` upsert | 计数不变；`vid` 被覆盖为同值 |
-| 派生表 | `RebuildEmbyItems(dramaID)` 整体替换 | 逐行相同 |
+| 对外剧集 | 读时现算（ADR-0014），不落库 | 逐条相同 |
 | 枚举推进 | `source_state.cursor` 单调前进 | 同一游标起点重跑得到同一批新增（差集运算本身幂等） |
 | 手动触发 | 单飞锁 | 撞车时第二次返回 409，不重复执行 |
 

@@ -67,16 +67,16 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 - 迁移文件 `internal/store/migrations/NNNN_<verb>_<subject>.sql`，只向前，不改历史文件。启动时自动执行到最新；版本真值在 `schema_migrations`（不是数据库的 user_version），并发保护用会话级 `pg_advisory_lock`（锁与迁移共用一条连接，多副本同时启动只有一个真正执行）。迁移失败即返回错误，`main` 记日志后退出——不提供半迁移服务。
 - 所有 SQL 只在 `internal/store` 出现；其它包通过方法访问。占位符是 PostgreSQL 的 `$n`（`IN (…)` 的序号由 `placeholders(from, n)` 算偏移），值一律走绑定，不拼进 SQL 文本。
 - 连接串是必填项 `DRAMA_HUB_DB_URL`；连接池参数走 env（`DRAMA_HUB_DB_MAX_OPEN_CONNS` / `DRAMA_HUB_DB_MAX_IDLE_CONNS` / `DRAMA_HUB_DB_CONN_MAX_LIFETIME_SEC`），非法值启动即报错，不静默退回默认。
-- 派生的 `emby_item` 表由 `store.RebuildEmbyItems(dramaID)` 幂等重建，调用点只有同步完成（`internal/sync` 的 `Syncer.SyncSeries`）与首播回填时长（`store.BackfillEpisodeDuration`，事务内直接调 `rebuildEmbyItems`）两处。重建是「整体替换」：先删该剧全部行再按 `ep_no` 顺序插入；一块占 1 个对外集号，块内 1 集走单集规则、≥2 集是合并集。
-- 合并分块只在 `internal/store/merge.go`：`chunkEpisodes` 是纯函数（按列表连续切片），`merge_chunk_size` 每次重建现读 `settings`，结果只落 `emby_item`（ADR-0010）。没有 `merge_group` / `merge_item` 表，也没有人工编排入口。
+- **对外剧集不落库**（ADR-0014）：库里只有 `episode` 与 `settings.merge_chunk_size`，`emby_item` 表已由迁移 `0008` 删除。`store.ListEmbyItems(dramaID)` 现算（现读 N 一次 + 列 `episode` 一次），vfs 与播放面都走它。
+- 合并分块只在 `internal/store/merge.go`：`chunkEpisodes` 是纯函数（按列表连续切片），`embyItems` 由它与 N 产出对外剧集；`merge_chunk_size` 每次读现取 `settings`，没有派生表、没有重建调用点、没有「改 N 后等下一次同步」这条路径（ADR-0010 的分块规则 + ADR-0014 的现算）。
+- 播放单元的合法性由当前分块判定：`store.EmbyItemByUID` 现算并返回成员集，uid 不在当前分块里就是 `ErrNotFound`（播放面 404）。查不到、改 N 之后旧 uid 失效，都走这一条。
 - 时间统一存 UTC 的 RFC3339 文本（列类型是不透明 `TEXT`，`空串 = 还没发生过`）；展示时区转换在 Web 层做。只有 `schema_migrations.applied_at` 是 `TIMESTAMPTZ`（runner 自己的时间）。
 - store 用哨兵错误表达结果：查询/删除无行返回 `ErrNotFound`，唯一/主键约束冲突（SQLSTATE `23505`）由 `wrapWriteErr` 统一映射为 `ErrConflict`（均可 `errors.Is` 判断），不向调用方泄漏裸 `*pgconn.PgError`。
 - `drama` / `episode` 的写入一律 upsert：`drama` 以 `(provider, provider_id)`、`episode` 以 `(drama_id, ep_no)` 为幂等身份，冲突时只更新可变业务列，身份列与入参 `id` 被忽略，返回行 id。其中 `episode.duration_sec` 只在插件给了非零值时覆盖，否则保留库里已有的值 —— 上游批量拿不到时长（恒 0），首播建索引回填的实测值不能被下一轮刷新清零。
 - 删剧走 `drama → episode` 的 `ON DELETE CASCADE` 连带删集（PostgreSQL 外键默认强制，不需要连接参数），不影响其它剧目；`segment` 经 `episode` 级联一并删除。
 - `segment` 表是「每集的分片索引」，由 `internal/segment` 索引任务整体重建：`ReplaceSegments` 一事务内先删后插（重复索引幂等、失败整体回滚），`ListSegments` 按 `start_sec` 升序（即片内序）；无行返回空切片而非 `ErrNotFound`（「还没索引」是正常状态，由分片端点按 503 处理）。
 - 跨行写入用 `Store.InTx`：同一事务内执行、失败整体回滚。事务内 `Store` 复用同一批读写方法；取数/网络请求必须在事务之外完成（长事务持行锁，会挡住同剧的其它写者）。
-- **写事务的锁序固定为「drama → 子表」**：任何按剧写入子表的事务，第一条写语句之前先 `lockDrama`（`SELECT … FOR UPDATE`，`internal/store/lock.go`），再动 `episode` / `emby_item`。两条事务以相反顺序请求同两行即 40P01 死锁（一方被中止）：同步事务先锁 `drama`（`UpsertDrama`）再逐集锁 `episode`，所以首播回填必须先锁 `drama` 再 `UPDATE episode`，派生表重建必须先锁 `drama` 再删/插 `emby_item`。新增按剧写入的入口必须遵守，并用「外部持锁 + `FOR UPDATE NOWAIT` 探针」的测试钉住（`internal/store/crud_test.go` 的 `TestBackfillLocksDramaBeforeEpisode`）。
-- 派生表重建（`rebuildEmbyItems`）同一部剧的「先删后插」必须串行：READ COMMITTED 下两个并发重建会各自按自己的快照删、再各自插入同一批行，撞唯一约束。串行化同样由 `lockDrama` 提供，不另设锁。
+- **写事务的锁序固定为「drama → 子表」**：任何按剧写入子表的事务，第一条写语句之前先 `lockDrama`（`SELECT … FOR UPDATE`，`internal/store/lock.go`），再动 `episode`。两条事务以相反顺序请求同两行即 40P01 死锁（一方被中止）：同步事务先锁 `drama`（`UpsertDrama`）再逐集锁 `episode`，所以首播回填必须先锁 `drama` 再 `UPDATE episode`。新增按剧写入的入口必须遵守，并用「外部持锁 + `FOR UPDATE NOWAIT` 探针」的测试钉住（`internal/store/crud_test.go` 的 `TestBackfillLocksDramaBeforeEpisode`）。
 
 ## 配置
 
@@ -101,8 +101,9 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
   「下次计划」，实际触发最多晚 60 秒。
 - **≤5 分钟**：缓存淘汰循环固定 5 分钟一轮，`cache_max_mb` / `cache_lru_days` 在下一轮
   淘汰才生效。
-- **下次重建**：`merge_chunk_size` 只在 `RebuildEmbyItems` 里现读（同步完成、首播回填
-  两个调用点），改完要等下一次重建才重排对外集号；不重启、不新增全库重建端点。
+- **即时（含 `merge_chunk_size`）**：对外剧集在每次读取时现算（ADR-0014），改完
+  `merge_chunk_size` 下一次访问（目录列举、`.nfo`、playlist）就是新分块，旧 id 随即 404；
+  不需要同步、不需要重建、不需要重启，也没有全库重建端点。
 - **重启后**：`plugin.<源>.base_url` 与 `plugin.<源>.request_timeout_sec` 是构造期注入的
   不可变配置（`*http.Client` 的 Timeout 在这里定型，见 `docs/PLUGIN-CONTRACT.md` 硬性
   要求 2）。状态页对这两项同时给「settings 现值」（`base_url` / `request_timeout_sec`）
@@ -146,7 +147,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 |---|---|---|---|---|
 | `strm_prefix` | `""` | 带 host 的绝对 URL 或空 | 即时（每次渲染 `.strm`） | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，尾 `/` 写入时归一掉）；空 = 按请求 `Host` 推导绝对地址（见上「`.strm` 的绝对地址」）。不指向 rclone/openlist |
 | `stream_secret` | 必填 | ≥ 32 字节 | 即时（每请求） | 出流 HMAC 签名密钥（见 ADR-0003）；换了之后所有旧 URL 失效 |
-| `merge_chunk_size` | `10` | 1–500 | 下次重建（同步完成 / 首播回填） | 每 N 集并成 1 条对外剧集（ADR-0010）。分块只在 `RebuildEmbyItems` 里现读，改完下一次重建即生效、不用重启；改 N 会重排全库对外集号，旧合并 uid 随即 404（分片缓存靠 LRU 过期，不主动清） |
+| `merge_chunk_size` | `10` | 1–500 | 即时（每次列举/播放现读） | 每 N 集并成 1 条对外剧集（ADR-0010 + ADR-0014）。分块在每次读时现算，改完下一次访问即生效、不用重启；改 N 会重排全库对外集号，旧 uid 随即 404（分片缓存靠 LRU 过期，不主动清） |
 | `webdav_user` / `webdav_pass` | 必填 | 非空字符串 | 即时（每请求） | WebDAV Basic 认证 |
 | `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 非空路径 | 即时（每次读写） | 本地缓存根目录：海报 `cover/`、分片 `seg/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`）；三个目录在启动时预先建出 |
 | `cache_max_mb` | `8192` | 0–1048576 | ≤5 分钟（下一轮淘汰） | 分片缓存上限（MB）；`0` = 不按大小淘汰 |
@@ -231,15 +232,16 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
 - 生产方是 vfs 的 `.strm` 渲染（`cmd` 注入 `stream.ID`），校验方是 `/video`
   （`stream.ParseID`）：两侧同一个实现，不各写一份 HMAC 拼接。
 - 单集 `uid` 只依赖 `episode.id`；合并集 `uid` 只依赖 `(dramaID, 块内集号区间)`，不含
-  自增主键。两者在「集集合与 N 不变」的前提下都不随同步、重建派生表、重启、改目录而漂 →
+  自增主键（ADR-0014：没有派生表，没有自增主键可挂）。两者在「集集合与 N 不变」的前提下
+  都不随同步、重启、改目录而漂 →
   URL 不漂、分片缓存不废；换 `stream_secret` 后所有 URL 失效（ADR-0003 的既定后果）。
   secret 每请求读一次，不缓存（硬约束 5）。
 - 分隔符是 `_` 不是 `-`：播放 id 是 `<uid>-<签名>`，`stream.ParseID` 按首个 `-` 切；
   uid 里带 `-` 会把「uid 不存在」的 404 顶成「签名不对」的 401。
-- **播放单元的合法性由 `emby_item` 派生表判定**（`store.EmbyItemByUID`）：`e<id>` 只在
-  它是一条现存单集时有效；改 `merge_chunk_size` 后某集被并进块、或块的成员变了，它的
+- **播放单元的合法性由当前分块判定**（`store.EmbyItemByUID` 现算并返回成员集）：`e<id>`
+  只在它此刻是一条单集时有效；改 `merge_chunk_size` 后某集被并进块、或块的成员变了，它的
   旧 uid 立即 404 —— 这是契约「不飘移」第 3 条，也是 401（签名不对）与 404
-  （播放单元不存在）的分界。
+  （播放单元不存在）的分界。没有派生表可查，判定就是「当前 N 下算出来的 uid 里有没有它」。
 - 状态码矩阵里没有 302、没有过期时间、没有 token 表。
 
 ### 时长探测（按需）
@@ -257,9 +259,9 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
   503 + `Retry-After: 5`（`httpx.ErrUnavailable`），不出半截时间轴。
 - **失败不写**：探测失败不写任何东西（`duration_sec` 保持 0、也没有 `segment` 行）。
 - **回填**：探测到的源时长回填 `episode.duration_sec`
-  （`store.BackfillEpisodeDuration`：只填 0、不覆盖非零值，非正时长视为探测失败），并在
-  同一事务内重建该剧 `emby_item` —— `runtime_sec` 单集取本集时长、合并集取组内之和，
-  只有一个派生实现。`.nfo` 的 `<runtime>` 取 `runtime_sec / 60`，回填后当次即为真实值；
+  （`store.BackfillEpisodeDuration`：只填 0、不覆盖非零值，非正时长视为探测失败）。
+  对外剧集的 runtime 读时现算（单集取本集时长、合并集取块内之和，ADR-0014），所以
+  写进 `episode` 后下一次读就是真实值。`.nfo` 的 `<runtime>` 取 `runtime / 60`；
   没播过的集仍是 0，`.nfo` 照常渲染（`<runtime>0</runtime>`，Emby 视为未知）。
 - **整数秒**：时长按整数秒写库（每集 ≤ 0.5 s 误差，合并 10 集最多累计 ~5 s 显示差），
   不为它加 float 列（第二份真值）。
@@ -273,7 +275,7 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
 | 正常 | 200 + `application/vnd.apple.mpegurl` | 200 + `video/mp4` + `Content-Length` + `Cache-Control` |
 | id 签名不对 / 缺 `-` | 401（`httpx.ErrUnauthorized`） | 401 |
 | 路径不是 `.m3u8` | 404 | — |
-| `uid` 不在派生表 / seq 越界 / 分片名非法 | 404（`httpx.ErrNotFound`） | 404 |
+| `uid` 不在当前分块 / seq 越界 / 分片名非法 | 404（`httpx.ErrNotFound`） | 404 |
 | 解析不到直链（`ErrNoStream` 等） | 502（`httpx.ErrUpstream`） | 502 |
 | 时长探测超时 | 503 + `Retry-After: 5` | 503 + `Retry-After: 5` |
 | secret 读失败 | 500（响应体与日志都不含 secret） | 500 |
@@ -382,7 +384,7 @@ DISCONTINUITY 表达，不再需要 `-output_ts_offset` 平移 PTS。分片端�
 插件只做「上游字节 → 领域值」：不写库、不开事务、不保存状态（不存游标、不缓存直链、
 不缓存解密 key —— key 随 `Resolve` 的返回值一次性交给框架，见 `docs/PLUGIN-CONTRACT.md`
 「加密切片与 Key」）。
-写库、事务、`emby_item` 重建在 `internal/sync`；刷新调度与游标在 `internal/scheduler`
+写库与事务在 `internal/sync`；刷新调度与游标在 `internal/scheduler`
 （S4，MKACG-606）：本包只提供「按一个作品写一次库」这个幂等动作，调度器按源调它。
 
 ### 红果插件的上游成本
@@ -537,8 +539,9 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
   `<基准名> [<provider>-<provider_id>]`，后缀是 `provider_id` 原文、不截断；不冲突的
   成员保持基准名。
 - 剧目录 `<剧名> (<年份>)`：年份来自 `drama.year`；`year=0` 显式写成 `(<0>)`，不省略。
-- 季目录恒为 `Season 01`（`emby_item.season` 恒为 1）。
-- 集号 `S%02dE%02d`：**对外集号取 `emby_item.ep_no`**（硬约束 6），不是 `episode.ep_no`。
+- 季目录恒为 `Season 01`（对外剧集的 Season 恒为 1）。
+- 集号 `S%02dE%02d`：**对外集号取 `store.ListEmbyItems` 现算的块序号**（硬约束 6），
+  不是 `episode.ep_no`。
 - `<标签>` = `embyLabel`：单集取源集标题、空则 `第<源集号>集`（不是对外集号：
   自动分块后第 3 块可能只装源第 21 集，标题应是「第21集」）；**合并集取
   `第 A-B 集`**（A/B 是块内最小/最大源集号，A==B 时退化为 `第 A 集`）。
@@ -546,9 +549,9 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
   非法字符集）：分类名转义是 S8 / PL 2026-10-30 的裁决，见下「含路径分隔符的分类名」。
 - 路径以 `/` 分隔、相对 vfs 根、无前导 `/`；`""` 与 `短剧` 都表示根。
 
-**数据源是 `emby_item` 派生表**（`store.ListEmbyItems`），不是 `episode`：一个合并块
-在树里只产出 1 条文件对，Emby 因此显示为 1 集、对外集号连续（硬约束 6）。改 N 只重建
-派生表，`drama` / `episode` 原始数据不动。
+**数据源是 `store.ListEmbyItems`**（原始集 + 现读的 `merge_chunk_size` 现算，ADR-0014），
+不是直接读 `episode`：一个合并块在树里只产出 1 条文件对，Emby 因此显示为 1 集、对外集号
+连续（硬约束 6）。改 N 后下一次列举就是新集号，`drama` / `episode` 原始数据不动。
 
 ### 列举成本（一个目录一次查询）
 
@@ -559,7 +562,7 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
 | `""`（根） | 分类目录 | 1 次 `SELECT DISTINCT genre`（覆盖索引全扫，唯一 O(行数) 的一条） |
 | `<分类>` | 剧目录 | 1–2 次 genre 存在性点查（`GenreExists`）+ 1 次 `WHERE genre IN (…) ORDER BY title` |
 | `<剧目录>` | `tvshow.nfo`（+ 有封面时的 `poster.jpg`）+ `Season 01` | 1 次剧目点查 + 1 次封面行点查（目录名被 sanitize 时再加 1–2 次 genre 存在性点查） |
-| `<剧目录>/Season 01` | 集文件对 | 同上 + 1 次 `ListEmbyItems` |
+| `<剧目录>/Season 01` | 集文件对 | 同上 + 1 次 `ListEmbyItems`（内部是现读 N + 列 `episode`，常数 2 条，ADR-0014） |
 
 两类查询都走索引（`idx_drama_genre_title` / `idx_drama_title`），由
 `internal/store` 的 `TestDirectoryQueryPlans` 用 `EXPLAIN ANALYZE` 钉住。
@@ -614,7 +617,8 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
 ```
 
 - `id = uid + "-" + hex(HMAC-SHA256(stream_secret, uid))[:12]`（`stream.ID`），
-  `uid` 取 `emby_item.uid`：单集 `e<episode.id>`、合并集 `m<dramaID>_<epFrom>_<epTo>`。
+  `uid` 由当前分块现算（生成规则在 `internal/store`）：单集 `e<episode.id>`、
+  合并集 `m<dramaID>_<epFrom>_<epTo>`。
   **单集与合并集没有区别**，对外统一是 HLS 播放列表（`docs/PLAYBACK-CONTRACT.md`）。
 - 签名算法在 `internal/stream`（rank 20）：vfs（rank 30）可以 import 它，但仍在装配根
   注入 `vfs.IDFunc`（`cmd` 传 `stream.ID`），让 vfs 只依赖「一个纯函数」这条缝。
@@ -628,7 +632,7 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
 
 | 文件 | 根元素 | 字段 | 说明 |
 |---|---|---|---|
-| 集 `.nfo` | `episodedetails` | `title` / `season` / `episode` / `runtime` | 字段全部取自 `emby_item`：`episode` 是**对外集号**，`runtime` 单位是**分钟**（`runtime_sec / 60` 向下取整）；写秒会被 Emby 放大 60 倍 |
+| 集 `.nfo` | `episodedetails` | `title` / `season` / `episode` / `runtime` | 字段全部取自 `store.EmbyItem`（现算）：`episode` 是**对外集号**，`runtime` 单位是**分钟**（`RuntimeSec / 60` 向下取整）；写秒会被 Emby 放大 60 倍 |
 | `tvshow.nfo` | `tvshow` | `title` / `year` / `plot` / `thumb` | `plot` 来自 `drama.plot`；`thumb` 见下「poster.jpg」 |
 
 `aired` 不写：库里的时间只有采集时间，没有播出日期。
@@ -847,7 +851,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/api/dramas` | GET | 剧目列表：drama 行 + `episodes` / `emby_items` 计数 |
+| `/api/dramas` | GET | 剧目列表：drama 行 + `episodes` / `emby_items` 计数（`emby_items` = `ceil(集数 / N)` 现算） |
 | `/api/dramas` | POST | 新增剧目：`{"series_id":"<上游剧 id 或 /player/ 链接>"}`，同步入库后返回整份列表：**库里新建了行 → 201，这部剧已存在（这次只更新）→ 200** |
 | `/api/dramas/{id}` | DELETE | 删剧目（级联删集与对外集号），204；不存在 404 |
 | `/api/dramas/{id}/episodes` | GET | 该剧全部集（`ep_no` 升序）；只回库里的字段（直链不落库，没有 `has_play_url`） |

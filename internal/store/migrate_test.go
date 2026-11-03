@@ -102,7 +102,7 @@ func TestMigrateToLatest(t *testing.T) {
 	}
 
 	want := []string{
-		"artifact", "drama", "emby_item", "episode",
+		"artifact", "drama", "episode",
 		"schema_migrations", "segment", "settings", "source_state",
 	}
 	if got := tableNames(t, db); !reflect.DeepEqual(got, want) {
@@ -111,6 +111,8 @@ func TestMigrateToLatest(t *testing.T) {
 }
 
 // AC（升级路径，MKACG-649）：0005 删表时顺手清掉新代码读不动的旧合并派生行。
+//
+// 只迁到 0005：0008 会把 emby_item 整张表删掉（ADR-0014），继续迁到最新就查不到行。
 //
 // 旧版本把合并集 uid 写成 `m<merge_group.id>`，新的形态真值（store.ParseMergedUID）
 // 解不了它 —— 留着会让该剧 Season 01 的列举直接报错（vfs → webdav PROPFIND 失败），
@@ -140,8 +142,8 @@ func TestMigrate0005DropsLegacyMergedRows(t *testing.T) {
 		t.Fatalf("插入 emby_item: %v", err)
 	}
 
-	if _, err := migrateFiles(ctx, db, files); err != nil {
-		t.Fatalf("迁移到最新: %v", err)
+	if _, err := migrateFiles(ctx, db, files[:5]); err != nil {
+		t.Fatalf("迁移到 0005: %v", err)
 	}
 
 	rows, err := db.QueryContext(ctx,

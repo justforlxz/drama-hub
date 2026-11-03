@@ -28,7 +28,7 @@ var (
 // Syncer 是一个源的写库编排（生产实现是 *sync.Syncer）。
 //
 // 接口定义在消费方（docs/DEV-STANDARDS.md「代码组织」）：本包只调这一个动作，
-// 不 import internal/sync，也不关心事务、派生表与海报。
+// 不 import internal/sync，也不关心事务与海报。
 //
 // Name 是写库用的 drama.provider（= 插件名）。调度本身用 map 的键，不需要它；但同一个
 // *sync.Syncer 也交给 internal/web 当建剧依赖，那边要靠 provider 名判断这次同步是

@@ -786,7 +786,7 @@ func TestConcurrentBackfillAndSync(t *testing.T) {
 
 	const rounds = 10
 	errCh := make(chan error, 2)
-	// 写路径 A：与 sync.SyncSeries 同序的同步事务（先锁 drama，再逐集写，最后重建）。
+	// 写路径 A：与 sync.SyncSeries 同序的同步事务（先锁 drama，再逐集写）。
 	go func() {
 		for r := 0; r < rounds; r++ {
 			err := st.InTx(ctx, func(tx *Store) error {
@@ -802,8 +802,7 @@ func TestConcurrentBackfillAndSync(t *testing.T) {
 						return err
 					}
 				}
-				_, err := tx.RebuildEmbyItems(ctx, dramaID)
-				return err
+				return nil
 			})
 			if err != nil {
 				errCh <- fmt.Errorf("同步第 %d 轮: %w", r, err)
@@ -812,7 +811,7 @@ func TestConcurrentBackfillAndSync(t *testing.T) {
 		}
 		errCh <- nil
 	}()
-	// 写路径 B：首播回填（先锁 drama，再改集、重建）。
+	// 写路径 B：首播回填（先锁 drama，再改集）。
 	go func() {
 		for r := 0; r < rounds; r++ {
 			for _, id := range ids {
@@ -849,11 +848,11 @@ func TestConcurrentBackfillAndSync(t *testing.T) {
 	seen := make(map[int]bool, len(items))
 	for _, it := range items {
 		if seen[it.EpNo] {
-			t.Fatalf("派生表出现重复对外集号 %d", it.EpNo)
+			t.Fatalf("对外剧集出现重复集号 %d", it.EpNo)
 		}
 		seen[it.EpNo] = true
 	}
 	if len(items) != episodes {
-		t.Fatalf("派生表条目 = %d, 期望 %d", len(items), episodes)
+		t.Fatalf("对外剧集条目 = %d, 期望 %d", len(items), episodes)
 	}
 }

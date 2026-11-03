@@ -138,8 +138,8 @@ func (s *Server) handleCreateDrama(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, dramaList{Dramas: views})
 }
 
-// handleDeleteDrama 处理 DELETE /api/dramas/{id}：删剧连带删集与派生表
-// （schema 的 ON DELETE CASCADE）。不存在返回 404。
+// handleDeleteDrama 处理 DELETE /api/dramas/{id}：删剧连带删集（schema 的
+// ON DELETE CASCADE）；对外剧集是现算的，没有派生行要清。不存在返回 404。
 func (s *Server) handleDeleteDrama(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {

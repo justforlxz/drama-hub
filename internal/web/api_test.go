@@ -54,8 +54,7 @@ func (f *fakeSyncer) SyncSeries(ctx context.Context, st *store.Store, sid string
 			return err
 		}
 	}
-	_, err = st.RebuildEmbyItems(ctx, id)
-	return err
+	return nil
 }
 
 // fakeSchedule 是调度依赖的替身：状态页要显示的调度现状由用例直接给定，
@@ -160,9 +159,6 @@ func seedDrama(t *testing.T, st *store.Store, providerID, title string, vids []s
 		if _, err := st.UpsertEpisode(ctx, ep); err != nil {
 			t.Fatalf("UpsertEpisode: %v", err)
 		}
-	}
-	if _, err := st.RebuildEmbyItems(ctx, id); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
 	return id
 }

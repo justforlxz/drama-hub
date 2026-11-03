@@ -37,8 +37,8 @@ type configView struct {
 	CacheDir     string `json:"cache_dir"`
 	CacheMaxMB   int    `json:"cache_max_mb"`
 	CacheLRUDays int    `json:"cache_lru_days"`
-	// MergeChunkSize 是「几集并一条对外剧集」（docs/adr/0010）；改完下一次重建
-	// （同步完成 / 首播回填）生效。
+	// MergeChunkSize 是「几集并一条对外剧集」（docs/adr/0014）；对外剧集在每次
+	// 读到时现算，改完下一次访问生效。
 	MergeChunkSize  int  `json:"merge_chunk_size"`
 	StreamSecretSet bool `json:"stream_secret_set"`
 	WebDAVUserSet   bool `json:"webdav_user_set"`

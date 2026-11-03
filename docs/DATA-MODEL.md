@@ -244,8 +244,8 @@ CREATE INDEX IF NOT EXISTS idx_drama_genre_title ON drama (genre, title);
   → 契约上这是**允许留零值**（`docs/PLUGIN-CONTRACT.md` `Episode` 注释），
   实现上不许为此逐集抓。
   → 首次播放该集（`duration_sec` 仍为 0）时用 `ffprobe` 只取 `format=duration` 回填
-  （`store.BackfillEpisodeDuration`：只填 0、不覆盖非零值），并同事务重建该剧
-  `emby_item`，让 `.nfo` 的 `<runtime>` 当次就变成真实值；没播过的集仍是 0
+  （`store.BackfillEpisodeDuration`：只填 0、不覆盖非零值），对外剧集的 runtime 读时
+  现算（ADR-0014），所以 `.nfo` 的 `<runtime>` 下一次读就是真实值；没播过的集仍是 0
   （见 `docs/DEV-STANDARDS.md`「时长探测」）。
   → 刷新（`UpsertEpisode`）携带上游的 0 时不清零已回填的值，上游真给了非零值才覆盖。
   → NFO 的 `<title>` 因此回落到 `第 N 集`（`internal/vfs/tree.go:embyLabel` 已这么写）。
@@ -254,18 +254,24 @@ CREATE INDEX IF NOT EXISTS idx_drama_genre_title ON drama (genre, title);
 
 ### 合并数据（自动分块，ADR-0010）
 
-- 合并集**没有自己的表**：分块是纯派生，结果只活在 `emby_item` 里。原手工编排的
-  `merge_group` / `merge_item` 已由迁移 `0005` 删除。
+- 合并集**没有表**：分块是纯函数，结果只在读到时存在（ADR-0014）。原手工编排的
+  `merge_group` / `merge_item` 由迁移 `0005` 删除，落库的派生表 `emby_item` 由迁移
+  `0008` 删除。库里只有 `episode` + `settings.merge_chunk_size`。
 - 分块规则：取该剧 `episode`（`ORDER BY ep_no`）按 `settings.merge_chunk_size`
   （默认 10）切**连续列表切片**（不是 `ep_no` 数值区间，缺号不产生空位），第 i 块 →
-  `emby_item.ep_no = i`；对外集数 = `ceil(集数 / N)`，0 集 → 0 行、不留空组。
+  对外集号 i；对外集数 = `ceil(集数 / N)`，0 集 → 0 条、不留空组。
 - 块内 1 集 → `kind=single`、`uid=e<episode.id>`；≥2 集 → `kind=merged`、
   `uid=m<dramaID>_<epFrom>_<epTo>`、`runtime_sec = Σ成员时长`。
-- 改 N 后**下一次重建**生效：旧 uid 从派生表消失，`/video/{oldid}` 走既有 404 分支。
-- **刷新不冲掉分块语义**：刷新只做 `UpsertDrama` / `UpsertEpisode` / `RebuildEmbyItems`，
-  重建读的是 `episode` + 现读的 N，所以集集合与 N 不变时 uid 逐字符不变。
-- 需要 Review 的一条：任何新的刷新代码 MUST NOT `DELETE FROM emby_item`（那是
-  `RebuildEmbyItems` 的职责，它整体替换但按当前 N 重算）。
+- **改 N 立即生效**：下一次读取（目录列举、`.nfo`、`.strm`、`/video`）就是新分块，
+  不需要同步、不需要重建、不需要重启；旧 uid 不在当前分块里，`/video/{oldid}` 走既有
+  404 分支（签名仍合法）。
+- **查询次数常数**：`store.ListEmbyItems` = 现读 N 一次 + 列 `episode` 一次；
+  `store.EmbyItemByUID` 同样两次（单集 uid 多一次 `episode` 点查取 `drama_id`），
+  并一并返回成员集，播放面不再自己反解区间。与集数无关，不随集数增长。
+- **刷新不冲掉分块语义**：刷新只做 `UpsertDrama` / `UpsertEpisode`；分块读的是
+  `episode` + 现读的 N，所以集集合与 N 不变时 uid 逐字符不变。
+- 需要 Review 的一条：任何新的刷新代码 MUST NOT 把分块结果写进库（那会重新造出
+  「两份真值 + 什么时候对齐」的问题，见 ADR-0014）。
 
 ### 播放入口（直链不落库）
 

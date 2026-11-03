@@ -46,7 +46,7 @@ const (
 	// 该更早放弃，因此单独一项，不跟插件超时走（MKACG-620）。
 	KeyCoverTimeoutSec SettingKey = "cover_timeout_sec"
 	// KeyMergeChunkSize 是「几集并成一条对外剧集」（默认 10，范围 1–500）。分块是
-	// 纯派生：重建 emby_item 时现读本值，改完下一次重建即生效（docs/adr/0010）。
+	// 纯派生：每次读对外剧集时现读本值，改完下一次访问即生效（docs/adr/0014）。
 	KeyMergeChunkSize SettingKey = "merge_chunk_size"
 	// 刷新调度的三项（范围与语义见 docs/SCHEDULER-MODEL.md「配置」）。
 	KeyRefreshIntervalSec SettingKey = "refresh_interval_sec"
@@ -304,8 +304,8 @@ func (s *Settings) value(ctx context.Context, key SettingKey) (any, error) {
 
 // settingValue 读取 key 的类型化值：库中有行则 JSON 解码，无行则取默认值或报缺。
 //
-// 接受 dbtx 而不是 *sql.DB：派生表重建在事务里跑，它也要现读 merge_chunk_size，
-// 而事务内的 Store 只有一个 dbtx。校验与默认值仍然只有 specFor + parseSetting 一份。
+// 接受 dbtx 而不是 *sql.DB：事务内的 Store 只有一个 dbtx，而它也要能现读配置
+// （如 merge_chunk_size）。校验与默认值仍然只有 specFor + parseSetting 一份。
 func settingValue(ctx context.Context, db dbtx, key SettingKey) (any, error) {
 	spec, ok := specFor(key)
 	if !ok {

@@ -11,8 +11,8 @@
 //     （`ServeSegment`），单集与合并集同一路径形态。
 //  2. 时长：`episode.duration_sec` 是唯一真值。第一次播放某个 uid 时 `probeDuration`
 //     现 `ffprobe` 一次取源时长并回填（`store.BackfillEpisodeDuration`，只填 0），
-//     同事务重建该剧 `emby_item`，`.nfo` 的 `<runtime>` 与 playlist 的 EXTINF 因此
-//     变成真实值。整体 30 s 硬上限，超时 503。
+//     下一次读即生效（ADR-0014：对外剧集不落库），`.nfo` 的 `<runtime>` 与 playlist
+//     的 EXTINF 因此变成真实值。整体 30 s 硬上限，超时 503。
 //  3. 时间轴映射：`Timeline` 把有序的成员集拼成连续 seq 空间。每集一片，所以
 //     `seq` 就是成员下标（合并集播放的 O(1) 定位）。
 //  4. 播放列表生成：`BuildPlaylist` 把时间轴渲成 VOD m3u8，集边界插
@@ -22,7 +22,7 @@
 //     single-flight 合并并发生成）。每集只生成一次，与它出现在单集还是合并集无关。
 //
 // 边界：直链不在本包解析（`ResolveFunc` 由装配根注入 `stream.Resolver`），也不落库
-// ——0004 已删 episode.play_url；分块与派生表重建属 internal/store。
+// ——0004 已删 episode.play_url；分块（含合并集的现算）属 internal/store。
 // 出站身份同理：ffmpeg / ffprobe 的 `-headers` 由装配根从插件常量注入（`NewCutter`
 // 的 headers），本包不认识任何源，也不提供默认 UA（MKACG-624）。身份按通道两份
 // （`Headers`），用哪一份由本次解析出的直链决定 —— 判据就是本包既有的 `channelOf`

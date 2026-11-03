@@ -190,10 +190,6 @@ func newFixtureWith(t *testing.T, cover *coverFixture) fixture {
 		}
 		epIDs = append(epIDs, id)
 	}
-	// vfs 树只认 emby_item 派生表（硬约束 6）：等价于生产里「同步完成」的重建。
-	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
-	}
 
 	// 海报缓存与 cmd 的装配方式一致：同步（真实部署里由 scheduler 触发）与 poster.jpg
 	// 的按需回源共用一份实例。

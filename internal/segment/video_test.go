@@ -373,10 +373,7 @@ func (r *rig) addEpisode(t *testing.T, epNo, seconds int) store.Episode {
 		t.Fatalf("UpsertEpisode: %v", err)
 	}
 	r.cdn[id] = newFakeCDN(t, body)
-	// 播放单元只认 emby_item 派生表（硬约束 6），等价于生产里同步完成后的重建。
-	if _, err := r.st.RebuildEmbyItems(ctx, r.dramaID); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
-	}
+	// 对外剧集在每次读时按当前 merge_chunk_size 现算（ADR-0014），写入即生效。
 	ep, err := r.st.EpisodeByID(ctx, id)
 	if err != nil {
 		t.Fatalf("EpisodeByID: %v", err)

@@ -16,8 +16,8 @@ const IDLen = 12
 //
 //	id = uid + "-" + hex(HMAC-SHA256(stream_secret, uid))[:12]
 //
-// uid 取 emby_item.uid（单集 `e<episode.id>`、合并集 `m<dramaID>_<epFrom>_<epTo>`）。
-// 纯函数：只由 uid 与 secret 决定，因此同步、重建派生表、改目录、重启都不改变
+// uid 取对外剧集句柄（单集 `e<episode.id>`、合并集 `m<dramaID>_<epFrom>_<epTo>`，
+// 生成规则在 internal/store）。纯函数：只由 uid 与 secret 决定，因此同步、改目录、重启都不改变
 // 它，缓存键不会漂（ADR-0003 的不变量）。换 stream_secret 后所有 id 失效。
 //
 // 生产方是 vfs 的 strm 渲染（经 cmd 注入），校验方是 `/video` 端点；

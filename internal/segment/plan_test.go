@@ -24,32 +24,6 @@ func TestParseSeqFile(t *testing.T) {
 	}
 }
 
-// TestEpisodeUID 覆盖单集 uid 的双向形态：`e<id>` 与 episodeUID 互逆，
-// 合并集 uid 必须不匹配（DESIGN D3）。
-func TestEpisodeUID(t *testing.T) {
-	for _, id := range []int64{0, 1, 42, 9007199254740993} {
-		uid := episodeUID(id)
-		got, valid := parseEpisodeUID(uid)
-		if !valid || got != id {
-			t.Errorf("parseEpisodeUID(episodeUID(%d)) = (%d, %v)", id, got, valid)
-		}
-	}
-
-	ok := map[string]int64{"e1": 1, "e42": 42, "e9007199254740993": 9007199254740993}
-	for uid, want := range ok {
-		got, valid := parseEpisodeUID(uid)
-		if !valid || got != want {
-			t.Errorf("parseEpisodeUID(%q) = (%d, %v), 期望 (%d, true)", uid, got, valid, want)
-		}
-	}
-	bad := []string{"", "e", "42", "E42", "e1x", "e-1", "m1", "e99999999999999999999", "e 1"}
-	for _, uid := range bad {
-		if got, valid := parseEpisodeUID(uid); valid {
-			t.Errorf("parseEpisodeUID(%q) = (%d, true), 期望 false", uid, got)
-		}
-	}
-}
-
 // TestSafeHost 锁定「日志不落完整直链」：只保留 host。
 func TestSafeHost(t *testing.T) {
 	cases := map[string]string{

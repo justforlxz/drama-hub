@@ -122,8 +122,8 @@ const ensureDeadline = 30 * time.Second
 // ensureDuration 返回某集的时长（秒）。
 //
 // episode.duration_sec 是唯一真值（ADR-0011 D2）：非 0 直接用它；为 0（插件恒给 0，
-// 这一集还没人播过）时现 ffprobe 一次并回填 —— 回填只填 0、同事务重建 emby_item，
-// 之后 playlist 的 EXTINF、TARGETDURATION 与 .nfo 的 <runtime> 都用这一个值。
+// 这一集还没人播过）时现 ffprobe 一次并回填 —— 回填只填 0，对外剧集读时现算
+// （ADR-0014），之后 playlist 的 EXTINF、TARGETDURATION 与 .nfo 的 <runtime> 都用这一个值。
 //
 // 探测失败不写任何东西；超时（ensureDeadline）返回 httpx.ErrUnavailable，边界包据此
 // 回 503 + Retry-After，不出半截时间轴。

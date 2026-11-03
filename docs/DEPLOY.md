@@ -92,7 +92,7 @@ SQL
 
 ```bash
 podman exec -i <pg容器> psql -U drama -d drama -c \
-  'TRUNCATE drama, episode, emby_item, segment RESTART IDENTITY CASCADE;'
+  'TRUNCATE drama, episode, segment RESTART IDENTITY CASCADE;'
 ```
 
 跑起来之后（第二轮起）关调度就是普通的 PATCH，立即生效：
@@ -140,7 +140,7 @@ curl -sS http://127.0.0.1:8080/api/dramas | python3 -m json.tool | head -20
 rclone config create dramahub webdav url http://127.0.0.1:8080/webdav vendor other \
   user emby pass '<密码>'
 rclone lsf --max-depth 4 dramahub:/       # <分类>/<剧>/Season 01/{.strm,.nfo}
-rclone lsf --files-only -R dramahub:/ | wc -l    # = emby_item×2 + 每剧 1 个 tvshow.nfo
+rclone lsf --files-only -R dramahub:/ | wc -l    # = 对外集数×2 + 每剧 1 个 tvshow.nfo
 rclone mount dramahub:/ /mnt/dramahub --dir-cache-time 30s
 ```
 
@@ -247,14 +247,15 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 - F 段默认实播 60 秒（`PLAY_SECONDS`），并用 ffmpeg 的 `out_time` 证明**真的拉了 60 秒内容**
   ——只看退出码 0 不行：10 秒的 playlist 也会正常结束。
 
-## 升级须知（含 0005 / 0006 / 0007 的版本）
+## 升级须知（含 0005 / 0006 / 0007 / 0008 的版本）
 
 - `0005` 删掉手工编排的 `merge_group` / `merge_item`，并清掉 `emby_item` 里新代码读不动
-  的旧合并行（uid 形如 `m<组 id>`）。**派生表不迁移数据**：升级后、下一次重建之前，
-  曾手工建过合并组的剧只显示单集（不会报错、扫不出来的是那些旧合并集）；等一轮同步
-  或首播回填按当前 `merge_chunk_size` 重建后恢复。
-- 从本版起合并是自动的：改 `merge_chunk_size`（默认 10）后，下一次重建生效，对外集号
-  重排、旧合并 id 立即 404。
+  的旧合并行（uid 形如 `m<组 id>`）。
+- `0008` 直接删掉 `emby_item` 表（ADR-0014）：对外剧集改成读时现算，库里只留原始集。
+  升级后不需要任何重建动作 —— 下一次目录列举/播放就是按当前 `merge_chunk_size` 算出来的
+  结果，旧合并 id 在该 N 下照旧有效（uid 形态未变）。
+- 合并是自动的：改 `merge_chunk_size`（默认 10）**下一次访问即生效**，对外集号重排、
+  与该 N 不一致的旧 id 立即 404。
 - `0006` 把 `segment` 表收窄成「每集的播放身份」`(episode_id, channel)`，并清空整张表
   （切点/时长/关键帧/编码签名/mode 五个概念都消失）；`artifact` 去掉 `index` kind，
   `settings` 里「分片目标时长」那一项已删除、不再是合法配置项。**旧缓存不迁移**：`.ts` 分片因为
@@ -291,7 +292,7 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 | 现象 | 事实 |
 |---|---|
 | 首启后 PATCH 关调度，库还在涨 | 第一轮在启动后约 0.15 秒已派出，PATCH 只拦下一轮；本轮会跑到 `refresh_timeout_sec`（默认 900 秒）。见 3.1 |
-| `rclone lsf -R` 文件数 ≠ `emby_item×2 + 剧数` | 若首轮仍在灌库，清单与库是两个时刻的快照。等 `/api/status` 的 `running=false` 再比 |
+| `rclone lsf -R` 文件数 ≠ `对外集数×2 + 剧数` | 若首轮仍在灌库，清单与库是两个时刻的快照。等 `/api/status` 的 `running=false` 再比 |
 | App 通道连续几分钟全是 `/video` 502，日志 `App 取流 … "bytes":0` + `reason:"ErrSchema"` | 上游端点 `200 + 空响应体`。实测连续 25 分钟后自行恢复（同期同一 vid 之前是 18 KB 正常体）。按契约回 502 且不回落预览是正确行为；重试即可，不要当代码缺陷 |
 
 `docs/SCHEDULER-MODEL.md` 把「首启立刻跑一轮」写成既定行为；本文件的 3.1 只讲怎么在验收时

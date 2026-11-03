@@ -41,9 +41,9 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 
 - 形如 `e1234-9f3a1c02b7d4`（约 17 字符），对外是一个不透明 id。
 - **稳定**：单集 `uid` 只依赖 `episode.id`；合并集 `uid` 只依赖
-  `(dramaID, 块内集号区间)`，不含 `emby_item` 的自增主键。→ 集集合与 `merge_chunk_size`
-  不变时，同一集/同一块在 `emby_item` 整体重建后 URL 逐字符不变，缓存键不会漂
-  （ADR-0003 与 ADR-0010 的不变量在这里继续成立）。
+  `(dramaID, 块内集号区间)`，不含任何自增主键（对外剧集读时现算，没有派生表，ADR-0014）。
+  → 集集合与 `merge_chunk_size` 不变时，同一集/同一块在任意次同步、重启、改目录后
+  URL 逐字符不变，缓存键不会漂（ADR-0003 与 ADR-0014 的不变量在这里继续成立）。
 - **分隔符**：合并集 uid 用 `_` 分段，**不含 `-`**。id 是 `<uid>-<签名>`，
   `stream.ParseID` 按首个 `-` 切；uid 里带 `-` 会把 404 顶成 401。
 - **无状态**：不查表、不落库、不过期。校验 = 拆出 `uid`、重算 HMAC、常数时间比较。
@@ -52,7 +52,7 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 
 **D1 已定（lxz 2026-10-30）**：「可以不用 UUID，只要保证不飘移即可」。因此就是上面这个方案。
 
-**为什么不是 RFC-4122 UUID**：真 UUID 要么落库（`emby_item` 整体重建会换值 → URL 飘 →
+**为什么不是 RFC-4122 UUID**：真 UUID 要么落库（任何一次重建/重算都会换值 → URL 飘 →
 缓存全废），要么挂到 `episode` / 新建一张块表（各加一列 + 一次迁移），换来的只是
 「看起来像 UUID」。而「不飘移」这个真正的要求，签名 id 用一条恒等式就满足了：
 `id` 只由 `uid` 与 `stream_secret` 决定，`uid` 只由 `episode.id` / `(dramaID, 集号区间)`
@@ -62,10 +62,10 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 
 ```
 1. 同一集连续 GET /video/{id}.m3u8 两次 → 两次的 {id} 逐字符相同
-2. 触发一次全量刷新（UpsertEpisode + RebuildEmbyItems）后再取 → {id} 仍然相同
-3. 改 `merge_chunk_size` 并重建，使某集在 single 与 merged 之间转换 → 该集 old id 返回
-   **404**（`e<id>` 已不在 `emby_item` 里，签名仍然有效所以要区分 401 与 404）、
-   new id 稳定；**未受影响的其它集 id 一个都不变**
+2. 触发一次全量刷新（UpsertEpisode）后再取 → {id} 仍然相同
+3. 改 `merge_chunk_size`（不触发任何同步/重建），使某集在 single 与 merged 之间转换 →
+   该集 old id 返回 **404**（`e<id>` 已不在当前分块里，签名仍然有效所以要区分 401 与
+   404）、new id 稳定；**未受影响的其它集 id 一个都不变**
 4. 重启进程（settings 不变）→ 所有 {id} 不变
 ```
 
@@ -124,9 +124,9 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 **禁止批量预建**：L1 规模下可播集数量是「每部剧 1 集」，但库里 `episode` 有 2847 万行，
 对全库 ffprobe 是不可完成的任务（`docs/L1-CORPUS-SCOPE.md` 取证 D/E）。
 
-探测到的源时长会回填 `episode.duration_sec`（只填 0，不覆盖非零值）并重建该剧
-`emby_item`，`.nfo` 的 `<runtime>` 与 playlist 的 `#EXTINF` 因此变成真实值；没播过的集
-仍是 0。细节见 `docs/DEV-STANDARDS.md`「时长探测」。
+探测到的源时长会回填 `episode.duration_sec`（只填 0，不覆盖非零值）；对外剧集的
+runtime 读时现算（ADR-0014），`.nfo` 的 `<runtime>` 与 playlist 的 `#EXTINF` 下一次读
+就是真实值；没播过的集仍是 0。细节见 `docs/DEV-STANDARDS.md`「时长探测」。
 
 ## `GET /video/{id}/{seq}.m4s`
 
@@ -182,7 +182,7 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 | 现有 | 处置 |
 |---|---|
 | `segment.BuildPlaylist` / `Timeline` / `Cutter` / `segment` 表 | **保留**，`Timeline` / `Slice` 收敛成「一集一片」，`segment` 表收窄成 `(episode_id, channel)`（0006） |
-| `emby_item.uid`（`e<id>` / `m<id>`） | **保留**，是 `/{id}` 里 `uid` 段的来源 |
+| 对外剧集 uid（`e<id>` / `m<id>`） | **保留**，是 `/{id}` 里 `uid` 段的来源；改由 `store.ListEmbyItems` / `EmbyItemByUID` 读时现算（ADR-0014） |
 | `stream.Server` 的单集 MP4 透传端点（`/s/{token}/e/{uid}`） | **退休**。字节中继 + Range 透传能力留给分片路径复用，不再对外暴露单集 MP4 |
 | `stream.Verify` | 保留算法，移到 `/video` 的 id 校验 |
 | `webdav.MountPath = "/dav/"` | 改成 `"/webdav/"`；`PROPFIND` 的 href 由该常量生成，无需另改 |

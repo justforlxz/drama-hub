@@ -34,8 +34,8 @@ func baseURLFrom(ctx context.Context) string {
 // renderStrm 渲染 strm 内容：一行 URL + 尾换行。
 //
 // 形态 `{strm_prefix}/video/{id}.m3u8\n`（docs/PLAYBACK-CONTRACT.md「.strm 的内容」）：
-// 单集与合并集没有区别，对外统一是 HLS 播放列表。uid 取 emby_item.uid（单集
-// `e<episode.id>`、合并集 `m<group.id>`），派生表的 uid 是唯一真值（硬约束 6）。
+// 单集与合并集没有区别，对外统一是 HLS 播放列表。uid 由当前分块现算（单集
+// `e<episode.id>`、合并集 `m<dramaID>_<epFrom>_<epTo>`），生成规则只有 store 一处（硬约束 6）。
 // id 由注入的 IDFunc 计算，`/video` 端点本身属 S8。strm_prefix 与 stream_secret
 // 每次现读，改值即时生效（硬约束 5）。缺 stream_secret 时透传 store.ErrSettingMissing。
 //
@@ -89,7 +89,7 @@ type showThumb struct {
 
 // renderItemNFO 渲染集 NFO：根 episodedetails，字段 title/season/episode/runtime。
 //
-// 字段全部来自 emby_item 派生表：title 与文件名共用 embyLabel，episode 是对外
+// 字段全部来自 store.ListEmbyItems：title 与文件名共用 embyLabel，episode 是对外
 // 集号（合并集也是 1 集），runtime 取 runtime_sec/60 向下取整（短于 60 秒为 0，
 // Emby 视为未知，由探测媒体文件补）。
 func renderItemNFO(item store.EmbyItem) ([]byte, error) {

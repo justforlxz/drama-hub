@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// seedZeroDurationDrama 建一部有 n 集的剧，时长全部是入库时的 0（上游批量拿不到），
-// 并重建派生表 —— 与生产「同步完成 → 首播建索引」的起始状态一致。
+// seedZeroDurationDrama 建一部有 n 集的剧，时长全部是入库时的 0（上游批量拿不到）
+// —— 与生产「同步完成 → 首播建索引」的起始状态一致。
 func seedZeroDurationDrama(t *testing.T, st *Store, n int) (int64, []int64) {
 	t.Helper()
 	ctx := context.Background()
@@ -24,9 +24,6 @@ func seedZeroDurationDrama(t *testing.T, st *Store, n int) (int64, []int64) {
 		}
 		ids[i] = id
 	}
-	if _, err := st.RebuildEmbyItems(ctx, did); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
-	}
 	return did, ids
 }
 
@@ -40,10 +37,9 @@ func episodeDuration(t *testing.T, st *Store, id int64) int {
 	return ep.DurationSec
 }
 
-// TestBackfillEpisodeDuration_FillsZeroAndRebuildsRuntime 覆盖 AC「首播建索引回填」：
-// 0 → 实测值，且同事务重建派生表，单集的 runtime_sec 立刻跟上（.nfo 的 <runtime>
-// 就取它）。
-func TestBackfillEpisodeDuration_FillsZeroAndRebuildsRuntime(t *testing.T) {
+// TestBackfillEpisodeDuration_FillsZero 覆盖 AC「首播建索引回填」：
+// 0 → 实测值，下一次读到的对外剧集 runtime_sec 立刻跟上（.nfo 的 <runtime> 取它）。
+func TestBackfillEpisodeDuration_FillsZero(t *testing.T) {
 	ctx := context.Background()
 	st := NewStore(newCRUDTestDB(t).DB)
 	did, eps := seedZeroDurationDrama(t, st, 3)
@@ -75,7 +71,7 @@ func TestBackfillEpisodeDuration_FillsZeroAndRebuildsRuntime(t *testing.T) {
 }
 
 // TestBackfillEpisodeDuration_KeepsNonZero 覆盖 AC「回填不覆盖已有非零值」：
-// 库里已有实测/上游值时，重复播放与索引重建都不许改写它，也不许动派生表。
+// 库里已有实测/上游值时，重复播放与索引重建都不许改写它。
 func TestBackfillEpisodeDuration_KeepsNonZero(t *testing.T) {
 	ctx := context.Background()
 	st := NewStore(newCRUDTestDB(t).DB)
@@ -85,10 +81,6 @@ func TestBackfillEpisodeDuration_KeepsNonZero(t *testing.T) {
 		DramaID: did, EpNo: 1, DurationSec: 77, Source: "web", Vid: "v",
 	}); err != nil {
 		t.Fatalf("UpsertEpisode 非零时长: %v", err)
-	}
-	// 与生产一致：刷新写完集后在同一个同步事务末尾重建派生表。
-	if _, err := st.RebuildEmbyItems(ctx, did); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
 	changed, err := st.BackfillEpisodeDuration(ctx, eps[0], 30)
 	if err != nil {
@@ -125,8 +117,8 @@ func TestBackfillEpisodeDuration_KeepsNonZero(t *testing.T) {
 	}
 }
 
-// TestBackfillEpisodeDuration_MergedRuntimeSum 钉住「派生表必须整体重算」这条：
-// 合并块的 runtime_sec 是块内时长之和，回填其中一个成员后必须跟着变。
+// TestBackfillEpisodeDuration_MergedRuntimeSum：合并块的 runtime_sec 是块内时长之和，
+// 回填其中一个成员后下一次读必须跟着变（读时现算，ADR-0014）。
 func TestBackfillEpisodeDuration_MergedRuntimeSum(t *testing.T) {
 	ctx := context.Background()
 	st := NewStore(newCRUDTestDB(t).DB)

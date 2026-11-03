@@ -542,16 +542,9 @@ func TestPlaybackFullEpisode(t *testing.T) {
 		}
 		return dramaID, epID
 	}
-	protectedDrama, protectedEp1 := addEpisode("受保护剧", e2eSIDProtected, 1)
+	_, protectedEp1 := addEpisode("受保护剧", e2eSIDProtected, 1)
 	_, protectedEp2 := addEpisode("受保护剧", e2eSIDProtected, 2)
-	openDrama, openEp4 := addEpisode("非保护剧", e2eSIDOpen, 4)
-	// 播放单元只认派生表（硬约束 6）：等价于一次同步完成后的重建。
-	for _, id := range []int64{protectedDrama, openDrama} {
-		if _, err := st.RebuildEmbyItems(ctx, id); err != nil {
-			t.Fatalf("RebuildEmbyItems %d: %v", id, err)
-		}
-	}
-
+	_, openEp4 := addEpisode("非保护剧", e2eSIDOpen, 4)
 	// ---- 真插件 + 本地 origin 适配器 + 装配根 ----
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))

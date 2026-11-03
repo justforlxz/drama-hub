@@ -200,7 +200,7 @@ func TestStatusPageSettingsForm(t *testing.T) {
 		"set-strm-prefix":      "即时",
 		"set-cache-max-mb":     "5 分钟",
 		"set-cache-lru-days":   "5 分钟",
-		"set-merge-chunk-size": "下次重建",
+		"set-merge-chunk-size": "即时",
 		"set-refresh-interval": "60 秒",
 	}
 	labels := map[string]string{}

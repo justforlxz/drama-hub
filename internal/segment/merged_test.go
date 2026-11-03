@@ -20,7 +20,7 @@ import (
 )
 
 // mergedRig 在基础测试台上放两集（每集 seconds 秒），并把 merge_chunk_size 调成 10，
-// 于是两集并成一个合并块（addEpisode 每次都会重建派生表，等价于生产里同步后的重建）。
+// 于是两集并成一个合并块（对外剧集读时现算，ADR-0014）。
 // uid 形态的真值在 store：m<dramaID>_<epFrom>_<epTo>。
 func mergedRig(t *testing.T, seconds int) (*rig, string, float64) {
 	t.Helper()
@@ -38,6 +38,16 @@ func mergedRig(t *testing.T, seconds int) (*rig, string, float64) {
 	}
 	// uid 形态的真值在 store（m<dramaID>_<epFrom>_<epTo>）。
 	return r, fmt.Sprintf("m%d_1_2", r.dramaID), sum
+}
+
+// blockMembers 取 uid 当前的成员集：播放面与断言共用同一个入口（store 现算当前分块）。
+func blockMembers(t *testing.T, r *rig, uid string) []store.Episode {
+	t.Helper()
+	_, members, err := r.st.EmbyItemByUID(context.Background(), uid)
+	if err != nil {
+		t.Fatalf("EmbyItemByUID(%q): %v", uid, err)
+	}
+	return members
 }
 
 // TestBuildPlaylist_TimelineAndDiscontinuity 覆盖 playlist 的纯函数形态：
@@ -150,16 +160,12 @@ func TestPlaylist_MergedEndToEnd(t *testing.T) {
 // 越界 seq 与非法合并 uid 都是 404。
 func TestMergedSlice_PerEpisode(t *testing.T) {
 	r, uid, _ := mergedRig(t, 6)
-	ctx := context.Background()
 	// 先请求 playlist：合并块每个成员的时长与通道行由这次请求补齐。
 	if rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+".m3u8"); rec.Code != http.StatusOK {
 		t.Fatalf("playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
 	}
 
-	members, err := r.st.ListEpisodesInRange(ctx, r.dramaID, 1, 2)
-	if err != nil {
-		t.Fatalf("ListEpisodesInRange: %v", err)
-	}
+	members := blockMembers(t, r, uid)
 	if len(members) != 2 {
 		t.Fatalf("合并块成员数 = %d, 期望 2", len(members))
 	}
@@ -200,10 +206,7 @@ func TestMergedChannelRowMissing(t *testing.T) {
 		t.Fatalf("首次 playlist 状态码 = %d, 期望 200", rec.Code)
 	}
 
-	members, err := r.st.ListEpisodesInRange(ctx, r.dramaID, 1, 2)
-	if err != nil {
-		t.Fatalf("ListEpisodesInRange: %v", err)
-	}
+	members := blockMembers(t, r, uid)
 	// 模拟「行丢了」：直接删掉该成员的通道行。
 	cleared := members[1].ID
 	if _, err := r.db.ExecContext(ctx, `DELETE FROM segment WHERE episode_id = $1`, cleared); err != nil {
@@ -353,10 +356,7 @@ func TestMergedPlaylist_DecodesEveryFrame(t *testing.T) {
 	}
 
 	// 缓存文件仍是 0 基：字节只由（集, 通道）决定，平移是出站时才做的。
-	eps, err := r.st.ListEpisodesInRange(ctx, r.dramaID, 1, 2)
-	if err != nil {
-		t.Fatalf("ListEpisodesInRange: %v", err)
-	}
+	eps := blockMembers(t, r, uid)
 	key := cache.SegmentKey(episodeUID(eps[1].ID), channelWeb)
 	row, err := r.st.ArtifactByKey(ctx, store.ArtifactKindSegment, key)
 	if err != nil {
@@ -387,10 +387,7 @@ func TestSegmentDirectRequestFillsDuration(t *testing.T) {
 	r, uid, _ := mergedRig(t, 6) // 两集各 6 秒；此时还没取过 playlist，时长都还是 0
 	ctx := context.Background()
 
-	members, err := r.st.ListEpisodesInRange(ctx, r.dramaID, 1, 2)
-	if err != nil {
-		t.Fatalf("ListEpisodesInRange: %v", err)
-	}
+	members := blockMembers(t, r, uid)
 	for _, m := range members {
 		if m.DurationSec != 0 {
 			t.Fatalf("前置条件不成立：ep%d duration_sec = %d, 期望 0（还没取过 playlist）",

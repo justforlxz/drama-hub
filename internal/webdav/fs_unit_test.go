@@ -48,6 +48,9 @@ func (f *fakeTree) List(_ context.Context, dir string) ([]vfs.Node, error) {
 	return nodes, nil
 }
 
+// Revision 返回固定的树结构版本号：fakeTree 的数据不会变。
+func (f *fakeTree) Revision() uint64 { return 0 }
+
 // Render 返回静态字节；未登记路径与 vfs.Tree 一致返回 ErrNotFound。
 func (f *fakeTree) Render(_ context.Context, p string) ([]byte, error) {
 	f.renders++

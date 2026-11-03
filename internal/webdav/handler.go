@@ -24,12 +24,14 @@ const MountPath = "/webdav/"
 type Handler struct {
 	settings *store.Settings
 	inner    *xwebdav.Handler
+	tree     Tree
+	propfind *propfindCache
 }
 
 // NewHandler 装配 WebDAV 端点。settings 不可为 nil；logger 只用于协议层错误
 // （正常请求不产生第二条日志——访问日志归装配根的 httpx.RequestLogger）。
 func NewHandler(tree Tree, settings *store.Settings, logger *slog.Logger) *Handler {
-	h := &Handler{settings: settings}
+	h := &Handler{settings: settings, tree: tree, propfind: newPropfindCache()}
 	h.inner = &xwebdav.Handler{
 		Prefix:     MountPath,
 		FileSystem: NewFS(tree),
@@ -57,7 +59,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// B1：.strm 在 strm_prefix 为空时要写出绝对地址，基地址只能从请求里来。
 	ctx := vfs.WithBaseURL(r.Context(), requestBaseURL(r))
-	h.inner.ServeHTTP(w, r.WithContext(withSnapshot(ctx)))
+	r = r.WithContext(withSnapshot(ctx))
+	// PROPFIND 是本服务最热的请求（Jellyfin 扫库几乎全是它）：命中响应缓存时
+	// 整块回放，未命中才走协议层。放在认证之后，缓存不绕过认证。
+	if r.Method == methodPropfind {
+		h.servePropfind(w, r)
+		return
+	}
+	h.inner.ServeHTTP(w, r)
 }
 
 // authorized 校验 Basic 凭据。

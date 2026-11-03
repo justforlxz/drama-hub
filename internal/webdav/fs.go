@@ -22,6 +22,9 @@ import (
 type Tree interface {
 	List(ctx context.Context, dir string) ([]vfs.Node, error)
 	Render(ctx context.Context, path string) ([]byte, error)
+	// Revision 返回树结构版本号：任何影响结构/文件长度的写入都会递增它，
+	// PROPFIND 响应缓存据此整体失效（docs/adr/0015）。
+	Revision() uint64
 }
 
 // FS 把 Tree 适配为 x/net/webdav.FileSystem。只读：任何写操作都失败。

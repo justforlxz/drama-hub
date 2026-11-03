@@ -58,6 +58,10 @@ type dbtx interface {
 type Store struct {
 	db   dbtx
 	root *sql.DB // 只有根 Store 非 nil；InTx 用它开事务
+
+	// dirty 记录事务内是否发生过「可能改树结构」的写入；只有事务内的 Store 用它，
+	// 由 InTx 在提交成功后递增版本号（见 changed 与 docs/adr/0015）。
+	dirty bool
 }
 
 // NewStore 构造 Store。
@@ -78,14 +82,31 @@ func (s *Store) InTx(ctx context.Context, fn func(tx *Store) error) error {
 	if err != nil {
 		return fmt.Errorf("开启事务: %w", err)
 	}
-	if err := fn(&Store{db: tx}); err != nil {
+	txStore := &Store{db: tx}
+	if err := fn(txStore); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交事务: %w", err)
 	}
+	if txStore.dirty {
+		bumpTreeRevision()
+	}
 	return nil
+}
+
+// changed 标记「树结构可能已变」。
+//
+// 根 Store（自动提交）的写入落库即生效，立即递增版本号；事务内的 Store 只打标记，
+// 由 InTx 在提交成功后递增 —— 提交前递增会把「提交前读到的旧数据」存到新版本号下，
+// 变成永久旧值（docs/adr/0015「失效模型」）。
+func (s *Store) changed() {
+	if s.root != nil {
+		bumpTreeRevision()
+		return
+	}
+	s.dirty = true
 }
 
 // dramaColumns 是 drama 表的显式列清单，顺序必须与 scanDrama 的 Scan 顺序一致。
@@ -139,6 +160,7 @@ func (s *Store) UpsertDrama(ctx context.Context, d Drama) (int64, error) {
 	if err != nil {
 		return 0, wrapWriteErr("写入剧目", err)
 	}
+	s.changed()
 	return id, nil
 }
 
@@ -277,6 +299,7 @@ func (s *Store) UpsertEpisode(ctx context.Context, e Episode) (int64, error) {
 	if err != nil {
 		return 0, wrapWriteErr("写入集", err)
 	}
+	s.changed()
 	return id, nil
 }
 
@@ -324,6 +347,7 @@ func (s *Store) BackfillEpisodeDuration(ctx context.Context, episodeID int64, du
 			return nil // 已有非零值或该集已被删：都不动
 		}
 		changed = true
+		tx.changed()
 		return nil
 	})
 	if err != nil {

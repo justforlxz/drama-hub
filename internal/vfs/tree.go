@@ -14,7 +14,9 @@ import (
 
 // Tree 是虚拟文件树的中枢：List 列出一个目录的直接子项，Render 渲染文件字节。
 //
-// 无状态、无缓存：每次请求现算，一次请求内完成（AGENTS.md 硬约束 3）。
+// 结构（目录列举结果）在内存里按目录分片缓存，按树结构版本号整体失效；文件字节仍然
+// 每次现渲染（硬约束 3：Content-Length 必须精确）。缓存不落盘，进程重启后从空开始
+// （AGENTS.md 硬约束 1、4；docs/adr/0015）。
 // 由装配根（cmd）构造并单例持有；webdav 通过 List/Render 消费本树。
 type Tree struct {
 	st       Store
@@ -22,6 +24,7 @@ type Tree struct {
 	id       IDFunc
 	covers   Coverer
 	logger   *slog.Logger
+	cache    *dirCache
 }
 
 // Coverer 是树需要的封面能力（生产实现：*cache.CoverCache）。
@@ -49,6 +52,9 @@ type Store interface {
 	DramaByTitleYear(ctx context.Context, title string, year int) (store.Drama, error)
 	DramaByProviderID(ctx context.Context, provider, providerID string) (store.Drama, error)
 	ListEmbyItems(ctx context.Context, dramaID int64) ([]store.EmbyItem, error)
+	// TreeRevision 返回树结构版本号：任何影响结构或文件长度的写入成功后都会递增，
+	// 目录缓存据此整体失效（docs/adr/0015）。只读，不参与列举查询。
+	TreeRevision() uint64
 }
 
 // IDFunc 由装配根注入，把 (stream_secret, uid) 算成对外播放 id。
@@ -60,7 +66,7 @@ type IDFunc func(secret, uid string) string
 // NewTree 构造 Tree。id 与 logger 不可为 nil（渲染 strm 与报告「分类名转义后同名」必需）。
 // covers 为 nil 等价于「这个库没有封面」：poster.jpg 永远不出现（单测可以用它省掉缓存）。
 func NewTree(st Store, settings *store.Settings, id IDFunc, covers Coverer, logger *slog.Logger) *Tree {
-	return &Tree{st: st, settings: settings, id: id, covers: covers, logger: logger}
+	return &Tree{st: st, settings: settings, id: id, covers: covers, logger: logger, cache: newDirCache()}
 }
 
 // Node 是 List 输出的一个条目：相对 vfs 根（无前导 /）的路径与其类型。
@@ -89,8 +95,9 @@ const (
 // List 返回某个目录的直接子项，不返回孙子及以下。
 //
 // dir 是相对 vfs 根的目录路径（`""` 与 `"短剧"` 都表示根）；不存在的目录返回
-// ErrNotFound。层与层的成本（docs/DIRECTORY-CONTRACT.md「MUST：目录列举必须是
-// 「一个目录一次查询」」）：
+// ErrNotFound。列举结果按目录缓存在内存里（版本号一致即命中，见 cache.go），下面
+// 的成本是「未命中时」一次计算的成本（docs/DIRECTORY-CONTRACT.md「MUST：目录列举
+// 必须是「一个目录一次查询」」）：
 //
 //	根        1 次 DISTINCT genre
 //	分类       1–2 次 genre 存在性点查 + 1 次 WHERE genre IN (…) ORDER BY title
@@ -103,6 +110,19 @@ func (t *Tree) List(ctx context.Context, dir string) ([]Node, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
+	// 版本号在计算之前取：计算期间发生的写入会递增版本号，于是结果只会被存到
+	// 旧版本下（后续读不到），而不会把旧数据存进新版本（docs/adr/0015）。
+	rev := t.st.TreeRevision()
+	return t.cache.load(ctx, strings.Join(segs, "/"), rev, func(ctx context.Context) ([]Node, error) {
+		return t.list(ctx, segs)
+	})
+}
+
+// Revision 返回当前树结构版本号：webdav 用它给 PROPFIND 响应缓存打版本。
+func (t *Tree) Revision() uint64 { return t.st.TreeRevision() }
+
+// list 是 List 的现算实现：按目录层级分派，结果由调用方写入缓存。
+func (t *Tree) list(ctx context.Context, segs []string) ([]Node, error) {
 	switch len(segs) {
 	case 0:
 		return t.listGenres(ctx)

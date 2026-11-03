@@ -950,6 +950,9 @@ func (c *countingStore) ListEmbyItems(ctx context.Context, dramaID int64) ([]sto
 	return c.inner.ListEmbyItems(ctx, dramaID)
 }
 
+// TreeRevision 直接转发、不计数：它不是一次查询，计数要只反映「查了什么」。
+func (c *countingStore) TreeRevision() uint64 { return c.inner.TreeRevision() }
+
 // AC（阻断 2 的回归）：只有根目录列举需要「全部分类」，其余层只做存在性判断。
 //
 // 这条数的是 **store 方法调用**（不是 SQL 文本）：上一轮把点查写成死代码、

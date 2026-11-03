@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -163,35 +164,74 @@ func TestPropfindDirectoryScale(t *testing.T) {
 	}
 
 	// 2) 真 handler 的 PROPFIND Depth:1：墙钟 + 响应体字节 + VmHWM 增量。
+	//    同一请求连发两次：第一次必然未命中（进程里还没有这份结构），第二次走缓存。
+	//    MKACG-669 的验收口径就是「命中 ≤50ms」，所以两段都要有数字。
+	propfindURL := srv.URL + "/webdav/" + "剧情"
+
 	hwmBefore := vmHWM()
+	coldStatus, coldBytes, coldHead, coldElapsed := runPropfind(ctx, srv.Config.Handler, propfindURL)
+	hwmAfter := vmHWM()
+	warmStatus, warmBytes, _, warmElapsed := runPropfind(ctx, srv.Config.Handler, propfindURL)
+
+	if coldStatus != http.StatusMultiStatus || warmStatus != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND 状态码 = %d / %d, 期望两者都是 207", coldStatus, warmStatus)
+	}
+	// 响应体必须是合法 multistatus：前 4 KB 里能看到根元素（整份不进内存）。
+	if !strings.Contains(string(coldHead), "<D:multistatus") && !strings.Contains(string(coldHead), "<multistatus") {
+		t.Fatalf("响应体开头不像 multistatus：%q", coldHead)
+	}
+	// 命中必须回放同一份字节，而不是重新序列化出「差不多」的结果。
+	if coldBytes != warmBytes {
+		t.Fatalf("命中响应体 %d 字节 != 未命中 %d 字节", warmBytes, coldBytes)
+	}
+
+	// 命中分布的 P50/P99：能进响应缓存（单条 ≤16MB）时连发 50 次取分位；
+	// 超过上限的大响应本来就不缓存，这里只报「未命中」与「结构命中」两段。
+	p50, p99 := time.Duration(-1), time.Duration(-1)
+	if coldBytes <= propfindCacheMaxEntry {
+		const samples = 50
+		lats := make([]time.Duration, 0, samples)
+		for i := 0; i < samples; i++ {
+			_, n, _, d := runPropfind(ctx, srv.Config.Handler, propfindURL)
+			if n != coldBytes {
+				t.Fatalf("第 %d 次命中响应体 %d 字节 != 未命中 %d 字节", i+1, n, coldBytes)
+			}
+			lats = append(lats, d)
+		}
+		slices.Sort(lats)
+		p50 = lats[len(lats)/2]
+		p99 = lats[len(lats)*99/100]
+	}
+
+	t.Logf("BENCH max_genre=%-7d genres=%-3d total=%-7d | 灌库 %v | DB 全列 %v (alloc %.0f MB, heap peak %.0f MB) | DB 窄列 %v (alloc %.0f MB, heap peak %.0f MB) | PROPFIND 未命中 %v / 命中 %v (P50 %v, P99 %v) | body %.1f MB | VmHWM %.0f → %.0f MB (Δ%.0f MB) | Render(脏标题) %v",
+		maxDramas, genres, total, seedElapsed.Round(time.Millisecond),
+		dbElapsed.Round(time.Millisecond), float64(dbAlloc)/1e6, float64(dbPeak)/1e6,
+		narrowElapsed.Round(time.Millisecond), float64(narrowAlloc)/1e6, float64(narrowPeak)/1e6,
+		coldElapsed.Round(time.Microsecond), warmElapsed.Round(time.Microsecond), p50.Round(time.Microsecond), p99.Round(time.Microsecond),
+		float64(coldBytes)/1e6,
+		float64(hwmBefore)/1024, float64(hwmAfter)/1024, float64(hwmAfter-hwmBefore)/1024,
+		renderElapsed.Round(time.Millisecond))
+}
+
+// runPropfind 对真 handler 发一次 PROPFIND Depth:1，返回状态码、body 字节数、
+// 前 4 KB 与墙钟。连发两次即可比较未命中与命中。
+func runPropfind(ctx context.Context, h http.Handler, url string) (int, int64, []byte, time.Duration) {
 	w := &countingWriter{header: http.Header{}}
-	req, err := http.NewRequestWithContext(ctx, "PROPFIND", srv.URL+"/webdav/"+"剧情", http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, methodPropfind, url, http.NoBody)
 	if err != nil {
-		t.Fatalf("构造请求: %v", err)
+		return 0, 0, nil, 0
 	}
 	req.SetBasicAuth("bench", "bench")
 	req.Header.Set("Depth", "1")
 
 	start := time.Now()
-	srv.Config.Handler.ServeHTTP(w, req)
+	h.ServeHTTP(w, req)
 	elapsed := time.Since(start)
-	hwmAfter := vmHWM()
-
-	if w.status != http.StatusMultiStatus {
-		t.Fatalf("PROPFIND 状态码 = %d, 期望 207", w.status)
+	status := w.status
+	if status == 0 {
+		status = http.StatusOK
 	}
-	// 响应体必须是合法 multistatus：前 4 KB 里能看到根元素（整份不进内存）。
-	if !strings.Contains(string(w.head), "<D:multistatus") && !strings.Contains(string(w.head), "<multistatus") {
-		t.Fatalf("响应体开头不像 multistatus：%q", w.head)
-	}
-
-	t.Logf("BENCH max_genre=%-7d genres=%-3d total=%-7d | 灌库 %v | DB 全列 %v (alloc %.0f MB, heap peak %.0f MB) | DB 窄列 %v (alloc %.0f MB, heap peak %.0f MB) | PROPFIND wall %v | body %.1f MB | VmHWM %.0f → %.0f MB (Δ%.0f MB) | Render(脏标题) %v",
-		maxDramas, genres, total, seedElapsed.Round(time.Millisecond),
-		dbElapsed.Round(time.Millisecond), float64(dbAlloc)/1e6, float64(dbPeak)/1e6,
-		narrowElapsed.Round(time.Millisecond), float64(narrowAlloc)/1e6, float64(narrowPeak)/1e6,
-		elapsed.Round(time.Millisecond), float64(w.n)/1e6,
-		float64(hwmBefore)/1024, float64(hwmAfter)/1024, float64(hwmAfter-hwmBefore)/1024,
-		renderElapsed.Round(time.Millisecond))
+	return status, w.n, w.head, elapsed
 }
 
 // measureList 跑一次列表查询，返回耗时、累计分配、堆峰值与行数。

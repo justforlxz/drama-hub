@@ -21,6 +21,7 @@ internal/cache 20
 internal/stream 20
 internal/plugin 10
 internal/store 10
+internal/lru 5
 internal/pgtest 5"
 
 mod=github.com/justforlxz/drama-hub

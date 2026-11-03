@@ -960,6 +960,9 @@ func (c *countingTree) Render(ctx context.Context, p string) ([]byte, error) {
 	return c.inner.Render(ctx, p)
 }
 
+// Revision 转发给真实树：缓存键必须跟着真实结构版本走。
+func (c *countingTree) Revision() uint64 { return c.inner.Revision() }
+
 // reset 清空计数（一次请求前调用）。
 func (c *countingTree) reset() {
 	c.lists, c.renders, c.dirs = 0, 0, map[string]int{}

@@ -71,6 +71,11 @@ func (s *Store) PutArtifact(ctx context.Context, a Artifact) error {
 	); err != nil {
 		return wrapWriteErr("写入缓存资产 "+a.Kind+"/"+a.Key, err)
 	}
+	if a.Kind == ArtifactKindCover {
+		// 封面行同时是「这部剧有封面」的真值：写/删/释放都会改变剧目录里的
+		// poster.jpg 是否出现，必须让结构缓存失效。分片不影响树形。
+		s.changed()
+	}
 	return nil
 }
 
@@ -112,6 +117,9 @@ func (s *Store) DeleteArtifact(ctx context.Context, kind, key string) error {
 	if n == 0 {
 		return fmt.Errorf("删除缓存资产 %s/%s: %w", kind, key, ErrNotFound)
 	}
+	if kind == ArtifactKindCover {
+		s.changed()
+	}
 	return nil
 }
 
@@ -139,6 +147,9 @@ func (s *Store) ReleaseArtifact(ctx context.Context, kind, key, at string) error
 	}
 	if n == 0 {
 		return fmt.Errorf("释放缓存资产 %s/%s: %w", kind, key, ErrNotFound)
+	}
+	if kind == ArtifactKindCover {
+		s.changed()
 	}
 	return nil
 }

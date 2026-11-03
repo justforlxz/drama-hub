@@ -139,6 +139,9 @@ func (s *Settings) Set(ctx context.Context, key SettingKey, raw string) error {
 	); err != nil {
 		return fmt.Errorf("写入配置 %s: %w", key, err)
 	}
+	// 配置可能改变树结构或虚拟文件长度（merge_chunk_size、strm_prefix……）：
+	// 一律让结构缓存整体失效，宁可多失效一次也不读旧结构（docs/adr/0015）。
+	bumpTreeRevision()
 	return nil
 }
 
@@ -194,6 +197,7 @@ func (s *Settings) SetMany(ctx context.Context, values map[SettingKey]string) (m
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("提交配置写入: %w", err)
 	}
+	bumpTreeRevision()
 	return parsed, nil
 }
 
@@ -222,6 +226,9 @@ func (s *Settings) SetIfAbsent(ctx context.Context, key SettingKey, raw string) 
 	n, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("统计配置 %s 的写入结果: %w", key, err)
+	}
+	if n == 1 {
+		bumpTreeRevision()
 	}
 	return n == 1, nil
 }

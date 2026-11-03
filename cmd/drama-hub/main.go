@@ -79,12 +79,13 @@ func main() {
 	jellyfinMgr := jellyfin.New(
 		func(ctx context.Context) (jellyfin.Config, error) { return readJellyfinConfig(ctx, settings) },
 		tree.CategoryDirs,
+		st.DisabledJellyfinCategories,
 		logger,
 	)
 	// 轮末钩子：每轮同步收尾后跑一次 reconcile（幂等）。Start 只派 goroutine，不延长这一轮；
 	// 撞车（上一轮还在跑）或未配置时静默跳过。
 	sched := scheduler.New(st, settings, sourcePlugins, syncers, logger, func(ctx context.Context) {
-		_ = jellyfinMgr.Start(ctx, false)
+		_ = jellyfinMgr.Start(ctx)
 	})
 
 	// 本地缓存（海报/分片/索引）与播放面的直链解析都只有一份实例：请求路径与

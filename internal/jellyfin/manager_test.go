@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -12,12 +13,14 @@ import (
 
 // harness 把 Manager 与假 Jellyfin 装在一起：一轮跑完用 Wait，之后断言状态与请求。
 type harness struct {
-	t       *testing.T
-	ff      *fakeJellyfin
-	cfg     Config
-	manager *Manager
-	cats    []string
-	catsErr error
+	t           *testing.T
+	ff          *fakeJellyfin
+	cfg         Config
+	manager     *Manager
+	cats        []string
+	catsErr     error
+	disabled    []string
+	disabledErr error
 }
 
 func newHarness(t *testing.T, libs []Library, categories []string) *harness {
@@ -28,16 +31,17 @@ func newHarness(t *testing.T, libs []Library, categories []string) *harness {
 	h.manager = New(
 		func(context.Context) (Config, error) { return h.cfg, nil },
 		func(context.Context) ([]string, error) { return h.cats, h.catsErr },
+		func(context.Context) ([]string, error) { return h.disabled, h.disabledErr },
 		slog.New(slog.DiscardHandler),
 	)
 	return h
 }
 
 // run 触发一轮并等它收尾：Start 只派 goroutine，断言前必须先 Wait（否则读的是半轮状态）。
-func (h *harness) run(prune bool) {
+func (h *harness) run() {
 	h.t.Helper()
-	if err := h.manager.Start(context.Background(), prune); err != nil {
-		h.t.Fatalf("Start(prune=%v): %v", prune, err)
+	if err := h.manager.Start(context.Background()); err != nil {
+		h.t.Fatalf("Start: %v", err)
 	}
 	h.manager.Wait()
 }
@@ -64,7 +68,7 @@ func (h *harness) waitForState(what string, cond func(State) bool) State {
 // POST，库名带前缀、路径是 <root>/<分类>，末尾恰好一次扫描。
 func TestManagerCreatesOneLibraryPerCategory(t *testing.T) {
 	h := newHarness(t, nil, []string{"都市", "爱情", "科幻"})
-	h.run(false)
+	h.run()
 
 	writes := h.ff.writes()
 	if len(writes) != 4 {
@@ -111,7 +115,7 @@ func TestManagerCreatesOneLibraryPerCategory(t *testing.T) {
 // TestManagerIdempotent 锁定「再点一次 0 新增、0 写请求」（AC-3）。
 func TestManagerIdempotent(t *testing.T) {
 	h := newHarness(t, nil, []string{"都市", "爱情"})
-	h.run(false)
+	h.run()
 
 	// 第二轮前把库「建好」：假 Jellyfin 现在返回这两个自管库，与真实状态一致。
 	h.ff.libraries = []Library{
@@ -119,7 +123,7 @@ func TestManagerIdempotent(t *testing.T) {
 		{Name: "短剧 - 爱情", Locations: []string{h.cfg.LibraryRoot + "/爱情"}, CollectionType: "tvshows"},
 	}
 	before := len(h.ff.seen())
-	h.run(false)
+	h.run()
 
 	// 第一轮 = 2 建库 + 1 扫描；第二轮 0 写。
 	if writes := h.ff.writes(); len(writes) != 3 {
@@ -137,19 +141,19 @@ func TestManagerIdempotent(t *testing.T) {
 	}
 }
 
-// TestManagerReportsOrphanWithoutDeleting 锁定「只增不删」：分类消失只报告孤儿库，
-// 不产生任何 DELETE（AC-9 的默认路径）。
+// TestManagerReportsOrphanWithoutDeleting 锁定「分类消失只报告」：没有对应的开关行时
+// 不产生任何 DELETE（删除只由显式关闭的开关触发，MKACG-668）。
 func TestManagerReportsOrphanWithoutDeleting(t *testing.T) {
 	root := "/data/video/dramahub"
 	h := newHarness(t, []Library{
 		{Name: "短剧 - 都市", Locations: []string{root + "/都市"}},
 		{Name: "短剧 - 已下架", Locations: []string{root + "/已下架"}},
 	}, []string{"都市"})
-	h.run(false)
+	h.run()
 
 	for _, req := range h.ff.writes() {
 		if req.method == http.MethodDelete {
-			t.Errorf("默认不该删库，实际发了 DELETE %q", req.query.Get("name"))
+			t.Errorf("分类消失不该删库，实际发了 DELETE %q", req.query.Get("name"))
 		}
 	}
 	state := h.state()
@@ -161,18 +165,19 @@ func TestManagerReportsOrphanWithoutDeleting(t *testing.T) {
 	}
 }
 
-// TestManagerPruneOnlyOwnOrphans 锁定 prune 的边界（AC-9）：只删「带前缀 + 路径在 root
-// 下一层 + 分类已不存在」的库，别人的库一个都不碰。
-func TestManagerPruneOnlyOwnOrphans(t *testing.T) {
+// TestManagerDeletesOnlyDisabledOwnLibraries 锁定删除边界（MKACG-668）：关掉的分类对应的
+// 自管库删掉；别人的库、带前缀但路径不对的库、root 下没前缀的库一个都不碰。
+func TestManagerDeletesOnlyDisabledOwnLibraries(t *testing.T) {
 	root := "/data/video/dramahub"
 	h := newHarness(t, []Library{
-		{Name: "短剧 - 都市", Locations: []string{root + "/都市"}},            // 分类还在：不动
-		{Name: "短剧 - 已下架", Locations: []string{root + "/已下架"}},          // 自管孤儿：删
+		{Name: "短剧 - 都市", Locations: []string{root + "/都市"}},            // 开着：不动
+		{Name: "短剧 - 爱情", Locations: []string{root + "/爱情"}},            // 关着：删
 		{Name: "Movies", Locations: []string{"/data/video/movies"}},     // 别人的库：不动
 		{Name: "短剧 - 别处", Locations: []string{"/data/video/elsewhere"}}, // 前缀但不是我们的路径：不动
 		{Name: "合集", Locations: []string{root + "/合集"}},                 // root 下但没前缀：不动
-	}, []string{"都市"})
-	h.run(true)
+	}, []string{"都市", "爱情"})
+	h.disabled = []string{"爱情"}
+	h.run()
 
 	var deleted []string
 	for _, req := range h.ff.writes() {
@@ -180,11 +185,136 @@ func TestManagerPruneOnlyOwnOrphans(t *testing.T) {
 			deleted = append(deleted, req.query.Get("name"))
 		}
 	}
-	if len(deleted) != 1 || deleted[0] != "短剧 - 已下架" {
-		t.Fatalf("DELETE 的库 = %v, 期望只有 [短剧 - 已下架]", deleted)
+	if len(deleted) != 1 || deleted[0] != "短剧 - 爱情" {
+		t.Fatalf("DELETE 的库 = %v, 期望只有 [短剧 - 爱情]", deleted)
 	}
+	state := h.state()
+	if state.Created != 0 || state.Removed != 1 {
+		t.Errorf("created = %d / removed = %d, 期望 0 / 1", state.Created, state.Removed)
+	}
+	if state.LastError != "" || state.LastOKAt.IsZero() {
+		t.Errorf("删库成功：last_error = %q（期望空）/ last_ok_at = %v（期望非零）",
+			state.LastError, state.LastOKAt)
+	}
+	if got := len(h.ff.libraries); got != 4 {
+		t.Errorf("假 Jellyfin 剩下 %d 个库, 期望 4（只删了 短剧 - 爱情）", got)
+	}
+	for _, lib := range h.ff.libraries {
+		if lib.Name == "短剧 - 爱情" {
+			t.Error("短剧 - 爱情 应该已经被删掉")
+		}
+	}
+}
+
+// TestManagerAllDisabledDeletesAll 锁定全关（MKACG-668 AC-5）：一轮把托管库全删、
+// 不报错，用户自己建的库仍在。
+func TestManagerAllDisabledDeletesAll(t *testing.T) {
+	root := "/data/video/dramahub"
+	h := newHarness(t, []Library{
+		{Name: "短剧 - 都市", Locations: []string{root + "/都市"}},
+		{Name: "短剧 - 爱情", Locations: []string{root + "/爱情"}},
+		{Name: "Movies", Locations: []string{"/data/video/movies"}},
+	}, []string{"都市", "爱情"})
+	h.disabled = []string{"都市", "爱情"}
+	h.run()
+
+	state := h.state()
+	if state.Removed != 2 || state.Created != 0 {
+		t.Errorf("removed = %d / created = %d, 期望 2 / 0", state.Removed, state.Created)
+	}
+	if state.LastError != "" {
+		t.Errorf("全关是正常结局，last_error = %q, 期望空", state.LastError)
+	}
+	if got := len(h.ff.libraries); got != 1 || h.ff.libraries[0].Name != "Movies" {
+		t.Errorf("假 Jellyfin 剩下的库 = %+v, 期望只剩用户手建的 Movies", h.ff.libraries)
+	}
+}
+
+// TestManagerReenableRebuilds 锁定「重新开启 → 下一轮重建」（AC-4）：不需要重启，
+// 开关只是下一轮读到的输入。
+func TestManagerReenableRebuilds(t *testing.T) {
+	root := "/data/video/dramahub"
+	h := newHarness(t, []Library{
+		{Name: "短剧 - 都市", Locations: []string{root + "/都市"}},
+	}, []string{"都市", "爱情"})
+	h.disabled = []string{"爱情"}
+	h.run() // 爱情还关着：不建
+
 	if state := h.state(); state.Created != 0 {
-		t.Errorf("State.Created = %d, 期望 0", state.Created)
+		t.Fatalf("关闭的分类不该建库，created = %d", state.Created)
+	}
+
+	h.disabled = nil
+	before := len(h.ff.writes())
+	h.run()
+	writes := h.ff.writes()[before:]
+	if len(writes) != 2 {
+		t.Fatalf("重新开启后的写请求 = %d, 期望 1 建库 + 1 扫描：%+v", len(writes), writes)
+	}
+	if got := writes[0].query.Get("name"); got != "短剧 - 爱情" {
+		t.Errorf("重建的库 = %q, 期望 短剧 - 爱情", got)
+	}
+	if state := h.state(); state.Created != 1 || state.LastError != "" {
+		t.Errorf("created = %d / last_error = %q, 期望 1 / 空", state.Created, state.LastError)
+	}
+}
+
+// TestManagerDeleteFailureVisibleAndRetried 锁定删库失败不静默、不放弃（AC-6）：
+// 一次 500 只让这一项进结果面（last_error 点名 + delete_failed），下一轮自动重试成功。
+func TestManagerDeleteFailureVisibleAndRetried(t *testing.T) {
+	root := "/data/video/dramahub"
+	h := newHarness(t, []Library{
+		{Name: "短剧 - 爱情", Locations: []string{root + "/爱情"}},
+	}, []string{"爱情"})
+	h.disabled = []string{"爱情"}
+	h.ff.deleteFail = map[string]bool{"短剧 - 爱情": true}
+
+	h.run()
+
+	state := h.state()
+	if state.Removed != 0 {
+		t.Errorf("删库失败时 removed = %d, 期望 0", state.Removed)
+	}
+	if len(state.DeleteFailed) != 1 || state.DeleteFailed[0] != "爱情" {
+		t.Errorf("State.DeleteFailed = %v, 期望 [爱情]（结果面要点名）", state.DeleteFailed)
+	}
+	if !strings.Contains(state.LastError, "爱情") || !strings.Contains(state.LastError, "重试") {
+		t.Errorf("State.LastError = %q, 期望点名失败的分类并说明下一轮重试", state.LastError)
+	}
+	if !state.LastOKAt.IsZero() {
+		t.Error("期望状态没达到：last_ok_at 不该前进")
+	}
+
+	// 下一轮：Jellyfin 恢复正常，同一项自动重试成功。
+	h.ff.mu.Lock()
+	h.ff.deleteFail = nil
+	h.ff.mu.Unlock()
+	h.run()
+	if state := h.state(); state.Removed != 1 || len(state.DeleteFailed) != 0 || state.LastError != "" {
+		t.Errorf("重试后 removed = %d / delete_failed = %v / last_error = %q, 期望 1 / 空 / 空",
+			state.Removed, state.DeleteFailed, state.LastError)
+	}
+}
+
+// TestManagerDeleteIdempotent 锁定删除幂等（AC-8）：删库回 500 但库里已经没有它了
+// （服务端删成了、客户端没收到 204），这一项算完成，不报错。
+func TestManagerDeleteIdempotent(t *testing.T) {
+	root := "/data/video/dramahub"
+	h := newHarness(t, []Library{
+		{Name: "短剧 - 爱情", Locations: []string{root + "/爱情"}},
+	}, []string{"爱情"})
+	h.disabled = []string{"爱情"}
+	h.ff.deleteVanish = map[string]bool{"短剧 - 爱情": true}
+
+	h.run()
+
+	state := h.state()
+	if state.Removed != 1 {
+		t.Errorf("removed = %d, 期望 1（目标库已不存在 = 这一项完成）", state.Removed)
+	}
+	if len(state.DeleteFailed) != 0 || state.LastError != "" {
+		t.Errorf("delete_failed = %v / last_error = %q, 期望都为空（幂等不报错）",
+			state.DeleteFailed, state.LastError)
 	}
 }
 
@@ -194,7 +324,7 @@ func TestManagerConflictSkips(t *testing.T) {
 	h := newHarness(t, []Library{
 		{Name: "短剧 - 都市", Locations: []string{"/data/video/other/都市"}},
 	}, []string{"都市"})
-	h.run(false)
+	h.run()
 
 	if writes := h.ff.writes(); len(writes) != 0 {
 		t.Errorf("冲突时不该有任何写请求，实际 %+v", writes)
@@ -218,7 +348,7 @@ func TestManagerJellyfinDownIsolated(t *testing.T) {
 	h.ff.status = http.StatusInternalServerError
 	h.ff.failList = true
 	h.ff.body = `{"message":"unauthorized: ` + h.cfg.APIKey + `"}`
-	h.run(false)
+	h.run()
 
 	state := h.state()
 	if state.LastError == "" {
@@ -242,7 +372,7 @@ func TestManagerJellyfinDownIsolated(t *testing.T) {
 func TestManagerCategoriesError(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	h.catsErr = errors.New("库连接断了")
-	h.run(false)
+	h.run()
 
 	if state := h.state(); !strings.Contains(state.LastError, "列分类") {
 		t.Errorf("State.LastError = %q, 期望说明是列分类失败（原因 %v）", state.LastError, h.catsErr)
@@ -252,16 +382,57 @@ func TestManagerCategoriesError(t *testing.T) {
 	}
 }
 
+// TestManagerCategories 锁定分类列表与开关状态的合并（MKACG-668 AC-1）：
+// 每一行都来自 vfs 的分类口径，enabled = 不在关闭集合里；读开关失败原样上报。
+func TestManagerCategories(t *testing.T) {
+	h := newHarness(t, nil, []string{"都市", "爱情"})
+	h.disabled = []string{"爱情"}
+
+	got, err := h.manager.Categories(context.Background())
+	if err != nil {
+		t.Fatalf("Categories: %v", err)
+	}
+	want := []CategoryState{{Name: "都市", Enabled: true}, {Name: "爱情", Enabled: false}}
+	if !slices.Equal(got, want) {
+		t.Errorf("Categories = %v, 期望 %v", got, want)
+	}
+
+	h.disabledErr = errors.New("库连接断了")
+	if _, err := h.manager.Categories(context.Background()); err == nil {
+		t.Error("读开关失败应上报错误，而不是编一个全开的列表")
+	}
+}
+
+// TestManagerDisabledErrorAborts 锁定开关表读失败时整轮中止：宁可这一轮不动，
+// 也不要把「读不到开关」当成「全部关闭」去删库。
+func TestManagerDisabledErrorAborts(t *testing.T) {
+	root := "/data/video/dramahub"
+	h := newHarness(t, []Library{
+		{Name: "短剧 - 都市", Locations: []string{root + "/都市"}},
+	}, []string{"都市"})
+	h.disabledErr = errors.New("库连接断了")
+	h.run()
+
+	if state := h.state(); !strings.Contains(state.LastError, "分类开关") {
+		t.Errorf("State.LastError = %q, 期望说明读分类开关失败", state.LastError)
+	}
+	for _, req := range h.ff.writes() {
+		if req.method == http.MethodDelete {
+			t.Errorf("读不到开关时不该删库，实际发了 DELETE %q", req.query.Get("name"))
+		}
+	}
+}
+
 // TestManagerBusy 锁定单飞：一轮还在跑时第二次触发返回 ErrBusy，不排队、不重复建库。
 func TestManagerBusy(t *testing.T) {
 	block := make(chan struct{})
 	h := newHarness(t, nil, []string{"都市"})
 	h.ff.block = block
 
-	if err := h.manager.Start(context.Background(), false); err != nil {
+	if err := h.manager.Start(context.Background()); err != nil {
 		t.Fatalf("第一次 Start: %v", err)
 	}
-	if err := h.manager.Start(context.Background(), false); !errors.Is(err, ErrBusy) {
+	if err := h.manager.Start(context.Background()); !errors.Is(err, ErrBusy) {
 		t.Fatalf("撞车时 Start = %v, 期望 ErrBusy", err)
 	}
 	close(block)
@@ -288,7 +459,7 @@ func TestManagerNotConfigured(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			h := newHarness(t, nil, []string{"都市"})
 			c.mutate(&h.cfg)
-			err := h.manager.Start(context.Background(), false)
+			err := h.manager.Start(context.Background())
 			if !errors.Is(err, ErrNotConfigured) {
 				t.Fatalf("Start = %v, 期望 ErrNotConfigured", err)
 			}
@@ -343,7 +514,7 @@ func TestManagerTimeoutBounded(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = h.manager.Start(context.Background(), false)
+		_ = h.manager.Start(context.Background())
 		h.manager.Wait()
 	}()
 	select {
@@ -392,7 +563,7 @@ func TestManagerRoundCoversAllCreates(t *testing.T) {
 	h.cfg.Timeout = 500 * time.Millisecond
 	h.ff.writeDelay = 250 * time.Millisecond
 
-	h.run(false)
+	h.run()
 
 	state := h.state()
 	if state.Created != len(categories) {
@@ -415,7 +586,7 @@ func TestManagerCreateTimeoutMarksUncertain(t *testing.T) {
 	h.cfg.Timeout = 20 * time.Millisecond
 	h.ff.writeDelay = 200 * time.Millisecond // 服务端会建成，客户端先超时
 
-	h.run(false)
+	h.run()
 
 	state := h.state()
 	if state.Created != 0 {
@@ -437,7 +608,7 @@ func TestManagerCreateTimeoutMarksUncertain(t *testing.T) {
 	h.ff.mu.Unlock()
 	h.ff.libraries = []Library{{Name: "短剧 - 都市", Locations: []string{h.cfg.LibraryRoot + "/都市"}}}
 	before := len(h.ff.writes())
-	h.run(false)
+	h.run()
 	if got := len(h.ff.writes()) - before; got != 0 {
 		t.Errorf("结果未知后的下一轮发了 %d 个写请求, 期望 0（幂等接管已建成的库）", got)
 	}
@@ -457,7 +628,7 @@ func TestManagerBadPathDoesNotAbort(t *testing.T) {
 	h := newHarness(t, nil, []string{"都市", "坏分类", "科幻"})
 	h.ff.badPaths = map[string]bool{"/data/video/dramahub/坏分类": true}
 
-	h.run(false)
+	h.run()
 
 	state := h.state()
 	if state.Created != 2 {
@@ -482,7 +653,7 @@ func TestManagerBadPathDoesNotAbort(t *testing.T) {
 		{Name: "短剧 - 科幻", Locations: []string{h.cfg.LibraryRoot + "/科幻"}},
 	}
 	before := len(h.ff.writes())
-	h.run(false)
+	h.run()
 	writes := h.ff.writes()[before:]
 	if len(writes) != 2 { // 1 建库（坏分类补上）+ 1 扫描
 		t.Fatalf("第二轮写请求 = %d, 期望 2（1 建库 + 1 扫描）：%+v", len(writes), writes)
@@ -503,7 +674,7 @@ func TestManagerStateReportsProgress(t *testing.T) {
 	h := newHarness(t, nil, categories)
 	h.ff.writeDelay = 200 * time.Millisecond // 让建库阶段的窗口足够长，能稳定读到中间态
 
-	if err := h.manager.Start(context.Background(), false); err != nil {
+	if err := h.manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	mid := h.waitForState("建库阶段的进度", func(st State) bool {
@@ -547,7 +718,7 @@ func TestManagerStateReportsUnchanged(t *testing.T) {
 		{Name: "短剧 - 都市", Locations: []string{root + "/都市"}},
 		{Name: "短剧 - 爱情", Locations: []string{root + "/爱情"}},
 	}, []string{"都市", "爱情"})
-	h.run(false)
+	h.run()
 
 	state := h.state()
 	if state.Created != 0 {
@@ -557,7 +728,7 @@ func TestManagerStateReportsUnchanged(t *testing.T) {
 		t.Errorf("unchanged = %d, 期望 2（两个分类都已建好、这一轮什么都没动）", state.Unchanged)
 	}
 	if state.Removed != 0 {
-		t.Errorf("removed = %d, 期望 0（prune=false）", state.Removed)
+		t.Errorf("removed = %d, 期望 0（没有关闭的分类）", state.Removed)
 	}
 	if state.LastOKAt.IsZero() {
 		t.Error("幂等命中不算失败：last_ok_at 应前进")
@@ -570,7 +741,7 @@ func TestManagerProgressClearedOnFailure(t *testing.T) {
 	h := newHarness(t, nil, []string{"都市"})
 	h.ff.failList = true
 	h.ff.status = http.StatusInternalServerError
-	h.run(false)
+	h.run()
 
 	state := h.state()
 	if state.Running {

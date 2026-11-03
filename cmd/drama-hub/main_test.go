@@ -62,6 +62,7 @@ func newAssembly(logger *slog.Logger, st *store.Store, settings *store.Settings,
 	jellyfinMgr := jellyfin.New(
 		func(ctx context.Context) (jellyfin.Config, error) { return readJellyfinConfig(ctx, settings) },
 		tree.CategoryDirs,
+		st.DisabledJellyfinCategories,
 		logger,
 	)
 	return newHandler(logger, st, settings, syncer, schedule, jellyfinMgr, sources,

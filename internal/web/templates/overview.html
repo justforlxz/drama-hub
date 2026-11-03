@@ -21,8 +21,11 @@
     </header>
     <div class="card-body">
       <p class="notice" id="jellyfin-progress"></p>
+      <div class="switch-list" id="jellyfin-categories" aria-label="按分类启用的媒体库">
+        <p class="state" data-state="loading">读取中…</p>
+      </div>
       <div class="issues" id="jellyfin-issues"></div>
-      <p class="hint">一分类一库；只增不删，分类消失只在这里列成「孤儿库」。</p>
+      <p class="hint">一分类一库；关掉的分类会在下一轮同步时删掉对应的库（点「同步媒体库」则当场删）。分类消失只列成「孤儿库」，不会删。</p>
     </div>
     <footer class="card-foot">
       <button type="button" class="btn primary" id="jellyfin-sync">同步媒体库</button>

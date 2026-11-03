@@ -131,6 +131,7 @@ function initOverview() {
   const jfProgress = document.getElementById('jellyfin-progress');
   const jfBtn = document.getElementById('jellyfin-sync');
   const jfHint = document.getElementById('jellyfin-hint');
+  const jfCategories = document.getElementById('jellyfin-categories');
   const dramaForm = document.getElementById('drama-form');
   const dramaInput = document.getElementById('series-id');
   const dramaBtn = document.getElementById('drama-submit');
@@ -242,6 +243,66 @@ function initOverview() {
     return text;
   }
 
+  // ---- 分类开关（MKACG-668）----
+  //
+  // 开关只是一个 PATCH：只改库、不碰 Jellyfin。关掉的分类在下一轮同步（周期或
+  // 「同步媒体库」）里删库，所以这里的文案一律说「下一轮」，不说「已删除」。
+
+  function categoryRow(item) {
+    const input = el('input', {
+      type: 'checkbox', class: 'switch',
+      'aria-label': item.name + ' 同步到 Jellyfin',
+    });
+    input.checked = item.enabled;
+    const stateText = el('span', { class: 'switch-state', text: item.enabled ? '已开启' : '已关闭' });
+    input.addEventListener('change', () => toggleCategory(item.name, input, stateText));
+    return el('div', { class: 'switch-row', 'data-enabled': String(item.enabled) },
+      el('label', {}, input, el('span', { class: 'switch-name', text: item.name })),
+      stateText);
+  }
+
+  function renderCategories(categories) {
+    if (!categories || categories.length === 0) {
+      jfCategories.replaceChildren(el('p', { class: 'state', 'data-state': 'empty',
+        text: '还没有分类；库里先有剧集才会出现分类。' }));
+      return;
+    }
+    jfCategories.replaceChildren(...categories.map(categoryRow));
+    updateCategoryWritable();
+  }
+
+  async function loadCategories() {
+    try {
+      const data = await api('GET', '/api/jellyfin/categories');
+      renderCategories(data.categories);
+    } catch (err) {
+      jfCategories.replaceChildren(el('p', { class: 'state', 'data-state': 'error', text: err.message }));
+    }
+  }
+
+  async function toggleCategory(name, input, stateText) {
+    const enabled = input.checked;
+    input.disabled = true;
+    try {
+      await api('PATCH', '/api/jellyfin/categories', { name, enabled });
+      stateText.textContent = enabled ? '已开启' : '已关闭';
+      input.closest('.switch-row').dataset.enabled = String(enabled);
+      say(enabled
+        ? '已开启「' + name + '」：下一轮同步会重建它的媒体库'
+        : '已关闭「' + name + '」：下一轮同步会删掉它的媒体库', 'ok');
+    } catch (err) {
+      input.checked = !enabled; // 库里的状态没变，输入框跟着回滚
+      fail(err);
+    } finally {
+      input.disabled = !canWrite();
+    }
+  }
+
+  function updateCategoryWritable() {
+    const ready = canWrite();
+    for (const input of jfCategories.querySelectorAll('input')) input.disabled = !ready;
+  }
+
   // 664：运行中显示阶段与进度；收尾后显示上次同步时间与结果。
   function renderJellyfinProgress(j) {
     if (j.running) {
@@ -321,6 +382,7 @@ function initOverview() {
     }
     jfBtn.disabled = !ready || status.jellyfin.running;
     dramaBtn.disabled = !ready;
+    updateCategoryWritable();
     for (const button of sourcesBox.querySelectorAll('button[data-refresh]')) {
       button.disabled = !ready;
       if (status.sources.some((src) => src.name === button.dataset.refresh && (!src.enabled || src.running))) {
@@ -330,8 +392,8 @@ function initOverview() {
     jfHint.textContent = !status.jellyfin.configured
       ? '还缺 ' + status.jellyfin.missing.join('、') + '；地址 / API key / 媒体库根三项都非空才启用。'
       : ready
-        ? '只增不删：分类消失只在这里列成「孤儿库」。'
-        : '同步媒体库是写操作，需要先在顶栏填管理令牌。';
+        ? '关掉的分类在下一轮同步时删库；孤儿库（分类已消失）只报告，不删。'
+        : '同步媒体库与分类开关都是写操作，需要先在顶栏填管理令牌。';
   }
 
   async function load() {
@@ -350,6 +412,8 @@ function initOverview() {
     renderJellyfin(status.jellyfin);
     renderJellyfinProgress(status.jellyfin);
     updateWritable();
+    // 分类开关是独立的一次读：只在页面打开 / 每轮 load 时取，不进每秒的进度轮询。
+    loadCategories();
     // 刷新 / 首次打开时这一轮可能还在跑：接着看，不必等用户再点一次。
     if (status.jellyfin.running) followJellyfin();
   }

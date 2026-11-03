@@ -196,9 +196,18 @@ curl -sS -H "Authorization: MediaBrowser Token=\"<Jellyfin API key>\"" \
 ```
 
 - **幂等**：再点一次是 0 新增、0 写请求（`created` 回到 0）。
-- **只增不删**：分类消失只列在 `orphans[]`，不删库。确认要删时显式带 `prune`：
-  `curl -X POST -H "X-Admin-Token: $TOKEN" -d '{"prune":true}' …/api/jellyfin/libraries`。
-  只删「名字带前缀 + 路径在库根下一层 + 分类已不存在」的库。
+- **分类开关**：概览卡片的「Jellyfin 媒体库」里一行一个分类，默认全开。关掉一个分类 =
+  下一轮同步时删掉它对应的自管库（拨开关本身不发请求）；点「同步媒体库」则当场删。
+  重新打开后下一轮同步会重建。等价 API：
+
+  ```bash
+  curl -sS -X PATCH -H "X-Admin-Token: $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"name":"都市","enabled":false}' http://127.0.0.1:8080/api/jellyfin/categories
+  ```
+
+  删除只对自管库执行（名字带前缀 + 只有一个 Location + 位于库根下一层），用户手建的库
+  永远不删；失败会出现在 `delete_failed[]` 与 `last_error`，下一轮自动重试。
+- **孤儿库**：分类从树里整个消失时只列在 `orphans[]`，不删（没有可关的开关行）。
 - **失败隔离**：Jellyfin 停机时同步、WebDAV、播放都不受影响，原因只出现在
   `/api/status` 的 `jellyfin.last_error` 与日志里。
 - **API key 不外泄**：`/api/status` 只给 `api_key_set`，日志与错误文本里没有 key。

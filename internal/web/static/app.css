@@ -209,6 +209,32 @@ h1 { margin: 0; font-size: var(--f-xl); font-weight: 600; line-height: 1.25; let
 .issue ul { margin: var(--s1) 0 0; padding-left: var(--s4); display: grid; gap: var(--s1); font-size: var(--f-sm); }
 .issue li { overflow-wrap: anywhere; }
 
+/* ---- 分类开关（MKACG-668）---- */
+
+.switch-list {
+  display: grid; gap: 0;
+  margin: 0 0 var(--s3);
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+.switch-row {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
+  min-height: 40px; padding: var(--s1) var(--s3);
+  border-top: 1px solid var(--line);
+}
+.switch-row:first-child { border-top: 0; }
+.switch-row label { display: flex; align-items: center; gap: var(--s2); min-width: 0; cursor: pointer; }
+.switch-row .switch-name { font-size: var(--f-sm); overflow-wrap: anywhere; }
+.switch-row input[type="checkbox"] {
+  width: 18px; min-width: 18px; min-height: 18px; height: 18px;
+  margin: 0; padding: 0; accent-color: var(--accent); cursor: pointer;
+}
+.switch-row .switch-state {
+  flex: none; font-size: var(--f-xs); color: var(--ink-3);
+}
+.switch-row[data-enabled="true"] .switch-state { color: var(--ok); }
+.switch-row[data-enabled="false"] .switch-state { color: var(--ink-3); }
+.switch-row input:disabled { cursor: not-allowed; }
+
 /* ---- 状态占位（读取中 / 空 / 错误） ---- */
 
 .state { margin: 0; font-size: var(--f-sm); color: var(--ink-3); }

@@ -59,13 +59,15 @@ type Server struct {
 	mux        *http.ServeMux
 }
 
-// Jellyfin 是 Jellyfin 媒体库维护的依赖：触发一轮，以及状态页要显示的现状。
-// 生产实现是 *jellyfin.Manager；测试注入假实现。
+// Jellyfin 是 Jellyfin 媒体库维护的依赖：触发一轮、状态页要显示的现状，以及分类
+// 开关列表（MKACG-668）。生产实现是 *jellyfin.Manager；测试注入假实现。
 //
-// 接口定义在消费方：本包只要这两个动作，不关心差异算法、单飞锁与内存状态。
+// 接口定义在消费方：本包只要这三个动作，不关心差异算法、单飞锁与内存状态；开关的
+// 落库由本包直接写 store（写是管理面的职责，Manager 只读）。
 type Jellyfin interface {
-	Start(ctx context.Context, prune bool) error
+	Start(ctx context.Context) error
 	State(ctx context.Context) jellyfin.State
+	Categories(ctx context.Context) ([]jellyfin.CategoryState, error)
 }
 
 // Schedule 是刷新调度的依赖：手动触发一轮，以及状态页要显示的调度现状。
@@ -117,6 +119,10 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 	s.mux.HandleFunc("POST /api/jellyfin/libraries", s.handleJellyfinLibraries)
 	// 同一条路径的读：页面轮询进度与上次结果（MKACG-664），不碰 drama 表。
 	s.mux.HandleFunc("GET /api/jellyfin/libraries", s.handleJellyfinLibrariesState)
+	// 分类开关（MKACG-668）：GET 列全部分类 + 开关状态，PATCH 改一个。
+	// PATCH 是写操作，令牌闸门同上。
+	s.mux.HandleFunc("GET /api/jellyfin/categories", s.handleJellyfinCategories)
+	s.mux.HandleFunc("PATCH /api/jellyfin/categories", s.handleJellyfinCategoryToggle)
 	return s
 }
 

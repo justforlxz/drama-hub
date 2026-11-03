@@ -45,6 +45,7 @@ func TestAPI_JellyfinSyncFlow(t *testing.T) {
 	mgr := jellyfin.New(
 		func(context.Context) (jellyfin.Config, error) { return cfg, nil },
 		func(context.Context) ([]string, error) { return []string{"都市", "爱情", "科幻", "乡村"}, nil },
+		func(context.Context) ([]string, error) { return nil, nil },
 		slog.New(slog.DiscardHandler),
 	)
 	t.Cleanup(mgr.Wait)

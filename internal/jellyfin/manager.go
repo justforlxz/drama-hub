@@ -23,10 +23,10 @@ var (
 // 计数（Processed / Total）只在建库与删库两个阶段有意义。空串 = 没在跑。
 const (
 	PhaseList       = "list"       // 读取 Jellyfin 现有媒体库
-	PhaseCategories = "categories" // 列分类目录
+	PhaseCategories = "categories" // 列分类目录与分类开关
 	PhaseDiff       = "diff"       // 比对现有库与分类
 	PhaseCreate     = "create"     // 创建缺的库（Processed / Total）
-	PhasePrune      = "prune"      // 删除孤儿库（Processed / Total）
+	PhaseDelete     = "delete"     // 删除已关闭分类的库（Processed / Total）
 	PhaseScan       = "scan"       // 触发一次扫描
 )
 
@@ -34,7 +34,7 @@ const (
 // + 这一轮进行中的进度。
 //
 // 只存在内存里，不落库、不加表：reconcile 本身幂等，跨重启不需要接续；重启后显示
-// 「未运行」是可接受的（prune 的判定也完全不依赖历史）。页面刷新不影响它 ——
+// 「未运行」是可接受的（每轮都从列库与开关表重新判定）。页面刷新不影响它 ——
 // 结果本来就随 GET /api/jellyfin/libraries 读回（MKACG-664 的「刷新后仍可见」）。
 type State struct {
 	Configured    bool
@@ -54,8 +54,14 @@ type State struct {
 	// 已存在的库一律不改（不重命名、不改路径、不同步 libraryOptions）—— 所以本服务
 	// 没有「更新」这个动作，这个计数就是「上次同步有没有白跑」最直接的答案。
 	Unchanged int
-	// Removed 是这一轮 prune 删掉的自管孤儿库数（prune=false 时恒 0）。
+	// Removed 是这一轮删掉的自管库数：分类被关掉的那些（MKACG-668）。开关只改库，
+	// 删除发生在下一轮同步（周期或手动）里。
 	Removed int
+	// Disabled 是当前关闭的分类：reconcile 每轮开始时写入本轮读到的值，State() 每次
+	// 现读开关表覆盖它（读失败时沿用这份内存值）。页面用它把开关画对。
+	Disabled []string
+	// DeleteFailed 是这一轮删库失败、下一轮要重试的分类名（点名前缀已去掉）。
+	DeleteFailed []string
 	// DurationMS 是上一轮从 Start 到收尾的耗时；只在有上一轮时有意义。
 	DurationMS int64
 
@@ -89,15 +95,20 @@ type Result struct {
 	Uncertain int
 	Failed    []string
 	Removed   int
-	Refreshed bool
-	Orphans   []string
-	Conflicts []string
+	// DeleteFailed 是删失败、下一轮要重试的分类名（点名前缀已去掉）。
+	DeleteFailed []string
+	// DeleteError 是删库失败的原因（第一条），写进 last_error 让人看见。
+	DeleteError string
+	Refreshed   bool
+	Orphans     []string
+	Conflicts   []string
 }
 
 // Manager 维护「一分类一库」，并在内存里保存上一次的结果。
 type Manager struct {
 	load       LoadConfig
 	categories Categories
+	disabled   Disabled
 	logger     *slog.Logger
 
 	// flight 是单飞锁：手动端点撞上就回 409，轮末钩子撞上就静默跳过（只记 debug）。
@@ -108,13 +119,14 @@ type Manager struct {
 	wg    sync.WaitGroup
 }
 
-// New 构造 Manager。load / categories 不可为 nil（装配根接上，漏接是装配 bug）。
-func New(load LoadConfig, categories Categories, logger *slog.Logger) *Manager {
+// New 构造 Manager。load / categories / disabled 不可为 nil（装配根接上，漏接是装配 bug）。
+func New(load LoadConfig, categories Categories, disabled Disabled, logger *slog.Logger) *Manager {
 	return &Manager{
 		load:       load,
 		categories: categories,
+		disabled:   disabled,
 		logger:     logger,
-		state:      State{Missing: []string{}, Orphans: []string{}, Conflicts: []string{}},
+		state:      State{Missing: []string{}, Orphans: []string{}, Conflicts: []string{}, Disabled: []string{}, DeleteFailed: []string{}},
 	}
 }
 
@@ -124,8 +136,12 @@ func New(load LoadConfig, categories Categories, logger *slog.Logger) *Manager {
 // D4）。所以这一轮的上下文是 `context.WithoutCancel` + 整体超时，寿命归 Manager 所有
 // （关闭时用 Wait 等它收尾）。
 //
+// 删除不再由参数决定：分类开关就是删除开关（MKACG-668）—— 每轮开始现读开关表，
+// 关掉的分类对应的自管库在这一轮删掉。周期触发与手动触发走同一条路径，所以
+// 「关掉后点立即同步」当场生效，而拨开关本身不发任何请求。
+//
 // 未配置 / 前缀为空 → ErrNotConfigured；已在跑 → ErrBusy。
-func (m *Manager) Start(ctx context.Context, prune bool) error {
+func (m *Manager) Start(ctx context.Context) error {
 	cfg, err := m.load(ctx)
 	if err != nil {
 		return fmt.Errorf("读 jellyfin 配置: %w", err)
@@ -134,7 +150,7 @@ func (m *Manager) Start(ctx context.Context, prune bool) error {
 		return fmt.Errorf("%w: 缺少 %s", ErrNotConfigured, strings.Join(missing, "、"))
 	}
 	if cfg.Prefix == "" {
-		// 只有库被手改成空前缀时到这里：空前缀会让所有库都算自管，prune 可能删到别人的库。
+		// 只有库被手改成空前缀时到这里：空前缀会让所有库都算自管，删库可能删到别人的库。
 		return fmt.Errorf("%w: jellyfin_library_prefix 为空，拒绝执行", ErrNotConfigured)
 	}
 	if !m.flight.TryLock() {
@@ -152,7 +168,7 @@ func (m *Manager) Start(ctx context.Context, prune bool) error {
 		// 不在这里定整轮预算：请求数要列库 + 算差异之后才知道，预算在 reconcile
 		// 里按实际请求数给（固定倍数会在库多的部署上必然中途放弃，见 roundBudget）。
 		runCtx := context.WithoutCancel(ctx)
-		m.reconcile(runCtx, cfg, prune)
+		m.reconcile(runCtx, cfg)
 	}()
 	return nil
 }
@@ -178,8 +194,21 @@ func (m *Manager) State(ctx context.Context) State {
 		TimeoutSec:    int(cfg.Timeout / time.Second),
 	}
 
+	// 开关现读：拨完开关页面立刻能读到新状态（不用等下一轮），且状态面与下一轮执行
+	// 的判定同源（都读这张表）。读失败只降级到内存里的上次值，不让状态页 500。
+	disabled, derr := m.disabled(ctx)
+	if derr != nil {
+		m.logger.Warn("读 jellyfin 分类开关失败，状态面沿用上次的值", "err", derr)
+		disabled = nil
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if derr == nil {
+		out.Disabled = nonNil(disabled)
+	} else {
+		out.Disabled = nonNil(m.state.Disabled)
+	}
 	out.Running = m.state.Running
 	out.LastRunAt = m.state.LastRunAt
 	out.LastOKAt = m.state.LastOKAt
@@ -196,7 +225,34 @@ func (m *Manager) State(ctx context.Context) State {
 	out.Failed = m.state.Failed
 	out.Orphans = m.state.Orphans
 	out.Conflicts = m.state.Conflicts
+	out.DeleteFailed = m.state.DeleteFailed
 	return out
+}
+
+// Categories 返回全部分类与各自的开关状态（MKACG-668 的「分类列表 + 每行一个开关」）。
+//
+// 分类口径来自 vfs（与建库同一处），开关来自 store 的分类开关表；两者都现读，
+// 页面每次打开 / 拨完开关重读它就能与真实同步状态一致。列分类失败原样上报（500），
+// 不在这里编一个空列表 —— 空列表会让页面误以为「没有分类」。
+func (m *Manager) Categories(ctx context.Context) ([]CategoryState, error) {
+	categories, err := m.categories(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("列分类: %w", err)
+	}
+	disabled, err := m.disabled(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("读 jellyfin 分类开关: %w", err)
+	}
+	off := make(map[string]struct{}, len(disabled))
+	for _, category := range disabled {
+		off[category] = struct{}{}
+	}
+	out := make([]CategoryState, 0, len(categories))
+	for _, category := range categories {
+		_, isOff := off[category]
+		out = append(out, CategoryState{Name: category, Enabled: !isOff})
+	}
+	return out, nil
 }
 
 // roundBudget 给一轮 reconcile 的整轮预算：单请求超时 × (请求数 + 1)。
@@ -236,15 +292,19 @@ func isRejected(err error) bool {
 	return se.code >= 400 && se.code < 500
 }
 
-// reconcile 跑一轮差异：列库 → 建缺的 → （prune 时）删孤儿 → 有变化就触发一次扫描。
+// reconcile 跑一轮差异：列库 → 读分类与开关 → 建缺的 → 删关掉的 → 有变化就触发一次扫描。
 //
-// 中止策略：list 失败或 create/delete 返回非超时错误即整轮中止，记一条 last_error。
-// 不做逐项重试 —— 下一轮从列库重新开始，本来就更便宜，也不会在半个配置上叠加失败。
+// 中止策略：list / 列分类 / 读开关失败，或建库返回非超时非 4xx 错误即整轮中止，记一条
+// last_error。不做逐项重试 —— 下一轮从列库重新开始，本来就更便宜，也不会在半个配置上
+// 叠加失败。
+//
+// 两类单项失败不中止整轮：建库被 Jellyfin 明确拒绝（4xx，跳过这个分类继续建其余的）、
+// 删库失败（记进结果面，下一轮列库重新判断、开关还关着就自然进重试集合）。
 //
 // 唯一例外是请求超时：那时 Jellyfin 侧结果未知（可能已经建成），中止整轮会让库多的
 // 部署永远收不了口（实测 58 个库时一次点击只建 15 个），所以计数后继续，下一轮列库
 // 幂等收口。整轮预算按剩余请求数给，见 roundBudget。
-func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result, error) {
+func (m *Manager) reconcile(ctx context.Context, cfg Config) (Result, error) {
 	res := Result{}
 	client := NewClient(cfg, nil)
 
@@ -258,21 +318,27 @@ func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result
 	if err != nil {
 		return m.record(res, fmt.Errorf("列分类: %w", err))
 	}
+	disabled, err := m.disabled(ctx)
+	if err != nil {
+		return m.record(res, fmt.Errorf("读 jellyfin 分类开关: %w", err))
+	}
+	m.setDisabled(disabled)
 
 	m.progress(PhaseDiff, 0, 0)
-	plan := Diff(existing, categories, cfg.LibraryRoot, cfg.Prefix)
+	plan := Diff(existing, categories, disabled, cfg.LibraryRoot, cfg.Prefix)
 	res.Orphans = plan.Orphans
 	res.Conflicts = plan.Conflicts
-	// 一个分类一种结局：已有自管库（不动） / 名字被别人占着（冲突） / 要新建。
-	// 剩下的是「幂等命中」—— 这一轮确实白跑的那部分，状态页要能看出它有多大。
-	res.Unchanged = len(categories) - len(plan.Create) - len(plan.Conflicts)
-
-	// 剩余请求数 = 建库 + （prune 时）删库 + 1 次扫描。整轮预算按它给：固定预算
-	// 在库多的部署上必然中途放弃（58 个分类 × 实测 1.1s/次 远大于旧的 2×timeout）。
-	pending := len(plan.Create) + 1
-	if prune {
-		pending += len(plan.Orphans)
+	// 一个启用分类一种结局：已有自管库（不动） / 名字被别人占着（冲突） / 要新建。
+	// 关掉的分类不参与（它们的库在下面删），所以先扣掉。
+	enabled := len(categories) - disabledCount(categories, disabled)
+	res.Unchanged = enabled - len(plan.Create) - len(plan.Conflicts)
+	if res.Unchanged < 0 {
+		res.Unchanged = 0
 	}
+
+	// 剩余请求数 = 建库 + 删库 + 1 次扫描。整轮预算按它给：固定预算在库多的部署上
+	// 必然中途放弃（58 个分类 × 实测 1.1s/次 远大于旧的 2×timeout）。
+	pending := len(plan.Create) + len(plan.Delete) + 1
 	ctx, cancel := context.WithTimeout(ctx, roundBudget(pending, cfg.Timeout))
 	defer cancel()
 	if len(plan.Create) > 0 {
@@ -304,18 +370,33 @@ func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result
 		}
 		m.progress(PhaseCreate, i+1, len(plan.Create))
 	}
-	if prune {
-		if len(plan.Orphans) > 0 {
-			m.progress(PhasePrune, 0, len(plan.Orphans))
-		}
-		for i, name := range plan.Orphans {
-			if err := client.DeleteLibrary(ctx, name); err != nil {
-				return m.record(res, err)
-			}
-			res.Removed++
-			m.progress(PhasePrune, i+1, len(plan.Orphans))
-		}
+
+	// 删除只发生在开关关掉的分类上（MKACG-668）：拨开关当时什么都不做，删除落地在
+	// 下一轮周期同步；点「立即同步」本来就是立刻跑一轮，所以当场删。
+	//
+	// 单项失败不中止整轮：其余库照删，失败的记进结果面（last_error 点名），下一轮
+	// 从列库重新开始、开关仍然关着 → 这一项自然进重试集合。
+	if len(plan.Delete) > 0 {
+		m.progress(PhaseDelete, 0, len(plan.Delete))
 	}
+	for i, name := range plan.Delete {
+		err := client.DeleteLibrary(ctx, name)
+		if err == nil {
+			res.Removed++
+		} else if gone, listErr := deletedAlready(client, ctx, name); listErr == nil && gone {
+			// 幂等：目标库已经不在了（Jellyfin 对不存在的名字可能直接回 500，也可能
+			// 上一次请求其实已经落成、只是客户端超时）。这一项算完成，不报错。
+			res.Removed++
+		} else {
+			res.DeleteFailed = append(res.DeleteFailed, strings.TrimPrefix(name, cfg.Prefix))
+			if res.DeleteError == "" {
+				res.DeleteError = err.Error()
+			}
+			m.logger.Warn("删库失败，下一轮同步会重试", "library", name, "err", err)
+		}
+		m.progress(PhaseDelete, i+1, len(plan.Delete))
+	}
+
 	// 0 变化时一个写请求都不发（这就是「再点一次」幂等的可验证点，AC-3）。
 	// Uncertain 也算「可能有变化」：超时的那次建库很可能已经在 Jellyfin 侧落成，
 	// 不扫描它就一直是个空库。
@@ -327,6 +408,44 @@ func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result
 		res.Refreshed = true
 	}
 	return m.record(res, nil)
+}
+
+// libraryExists 报告列库里是否还有这个名字（删库失败后的幂等收口用）。
+func libraryExists(libs []Library, name string) bool {
+	for _, lib := range libs {
+		if lib.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// deletedAlready 在删库失败后重新列库确认目标是不是已经不在了。
+//
+// 「不再列库里」就是「删成功了」：Jellyfin 12.1 对不存在的名字回 500（不能当存在性
+// 探测），所以只能反过来看列库结果。列库本身失败时返回错误，调用方按「未确认」处理。
+func deletedAlready(client *Client, ctx context.Context, name string) (bool, error) {
+	libs, err := client.ListLibraries(ctx)
+	if err != nil {
+		return false, err
+	}
+	return !libraryExists(libs, name), nil
+}
+
+// disabledCount 统计 disabled 里真正出现在 categories 中的条数：其余是「分类已消失
+// 但开关还留着」的行，不参与本轮分类计数。
+func disabledCount(categories, disabled []string) int {
+	present := make(map[string]struct{}, len(categories))
+	for _, category := range categories {
+		present[category] = struct{}{}
+	}
+	count := 0
+	for _, category := range disabled {
+		if _, ok := present[category]; ok {
+			count++
+		}
+	}
+	return count
 }
 
 // record 把一轮结果写进内存状态并记一条日志。
@@ -352,11 +471,23 @@ func (m *Manager) record(res Result, err error) (Result, error) {
 	m.state.Failed = nonNil(res.Failed)
 	m.state.Orphans = res.Orphans
 	m.state.Conflicts = res.Conflicts
+	m.state.DeleteFailed = nonNil(res.DeleteFailed)
 	m.state.LastError = ""
 	if err != nil {
 		m.state.LastError = err.Error()
 	} else {
 		switch {
+		case len(res.DeleteFailed) > 0:
+			// 删库失败 = 期望状态没达到：last_ok_at 不前进，原因写清楚，下一轮重试
+			// （开关还关着，库还在，所以下一轮自然又会进删除集合）。
+			msg := "删除这些分类的媒体库失败：" + strings.Join(res.DeleteFailed, "、")
+			if res.DeleteError != "" {
+				msg += "（" + res.DeleteError + "）"
+			}
+			if len(res.Failed) > 0 {
+				msg += "；另有 Jellyfin 拒绝建库的分类：" + strings.Join(res.Failed, "、")
+			}
+			m.state.LastError = msg + "；下一轮同步会重试"
 		case len(res.Failed) > 0:
 			// 部分失败：其余分类照建了，所以这不算整轮失败（last_ok_at 前进），但必须
 			// 点名是哪几个分类被拒——Jellyfin 的原文是「路径不存在」，人要看得到。
@@ -390,11 +521,19 @@ func (m *Manager) record(res Result, err error) (Result, error) {
 		"created", res.Created,
 		"failed", len(res.Failed),
 		"removed", res.Removed,
+		"delete_failed", len(res.DeleteFailed),
 		"refreshed", res.Refreshed,
 		"orphans", len(res.Orphans),
 		"conflicts", len(res.Conflicts),
 		"err", err)
 	return res, err
+}
+
+// setDisabled 记下本轮读到的分类开关，状态面在开关表读失败时沿用它。
+func (m *Manager) setDisabled(disabled []string) {
+	m.mu.Lock()
+	m.state.Disabled = nonNil(disabled)
+	m.mu.Unlock()
 }
 
 // begin 记下这一轮的开始时刻并置为「正在跑」。

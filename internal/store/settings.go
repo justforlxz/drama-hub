@@ -442,7 +442,7 @@ func specFor(key SettingKey) (settingSpec, bool) {
 		return settingSpec{kind: kindPath}, true
 	case KeyJellyfinLibraryPrefix:
 		// 库名前缀：既用于命名，也是「哪些库归本服务管」的第一条判定。不接受空串 ——
-		// 空前缀会让所有库都算自管，prune 时可能删到别人的库。
+		// 空前缀会让所有库都算自管，删库时可能删到别人的库。
 		return settingSpec{kind: kindString, def: "短剧 - "}, true
 	case KeyJellyfinTimeoutSec:
 		// 单次出站超时。http.Client 不设全局 Timeout，超时靠每次请求的 ctx（internal/jellyfin）。

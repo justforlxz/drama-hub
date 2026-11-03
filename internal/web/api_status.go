@@ -103,15 +103,19 @@ type jellyfinView struct {
 	LastError string `json:"last_error"`
 	Created   int    `json:"created"`
 	// Unchanged / Removed / DurationMS 是本轮「做了什么」的其余部分（MKACG-664）：
-	// 已存在且没动的条数、prune 删掉的条数、整轮耗时。本服务不改已存在的库，
+	// 已存在且没动的条数、删掉的条数、整轮耗时。本服务不改已存在的库，
 	// 所以没有「更新」这个计数。
 	Unchanged  int      `json:"unchanged"`
 	Removed    int      `json:"removed"`
 	DurationMS int64    `json:"duration_ms"`
 	Uncertain  int      `json:"uncertain"`
 	Failed     []string `json:"failed"`
-	Orphans    []string `json:"orphans"`
-	Conflicts  []string `json:"conflicts"`
+	// DeleteFailed 是删库失败、下一轮会重试的分类名（MKACG-668）：删除失败不能静默，
+	// 结果面要能点名是哪几个、原因见 last_error。
+	DeleteFailed []string `json:"delete_failed"`
+	Disabled     []string `json:"disabled"`
+	Orphans      []string `json:"orphans"`
+	Conflicts    []string `json:"conflicts"`
 
 	// 进行中的进度（MKACG-664）：页面轮询本块，按 started_at + phase_label + processed/total
 	// 显示「正在跑 · 跑到哪一步 · 已处理几项」。phase 是稳定标识（空 = 没在跑），
@@ -129,7 +133,7 @@ var jellyfinPhaseLabels = map[string]string{
 	jellyfin.PhaseCategories: "列分类",
 	jellyfin.PhaseDiff:       "比对现有库",
 	jellyfin.PhaseCreate:     "创建媒体库",
-	jellyfin.PhasePrune:      "删除孤儿库",
+	jellyfin.PhaseDelete:     "删除已关闭分类的库",
 	jellyfin.PhaseScan:       "触发扫描",
 }
 
@@ -168,6 +172,8 @@ func jellyfinViewOf(state jellyfin.State) jellyfinView {
 		DurationMS:    state.DurationMS,
 		Uncertain:     state.Uncertain,
 		Failed:        nonNilStrings(state.Failed),
+		DeleteFailed:  nonNilStrings(state.DeleteFailed),
+		Disabled:      nonNilStrings(state.Disabled),
 		Orphans:       nonNilStrings(state.Orphans),
 		Conflicts:     nonNilStrings(state.Conflicts),
 		StartedAt:     formatTime(state.StartedAt),

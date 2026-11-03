@@ -62,9 +62,12 @@ type Action struct {
 
 // Plan 是一次 reconcile 的差异。
 type Plan struct {
-	// Create 是分类里还没有对应自管库的那些。
+	// Create 是启用且还没有对应自管库的分类。
 	Create []Action
-	// Orphans 是自管库里有、分类里已经没有的库名（默认只报告，prune 时才删）。
+	// Delete 是分类被关掉的自管库名：这一轮就要删（MKACG-668 的「关闭即删库」）。
+	// 只出现在下一轮同步里，拨开关的瞬间不动手。
+	Delete []string
+	// Orphans 是自管库里有、分类里已经没有的库名（只报告，不删）。
 	Orphans []string
 	// Conflicts 是「名字被一个非自管库占着」的库名：不建、不删、不接管，只报告。
 	Conflicts []string
@@ -82,7 +85,11 @@ type Plan struct {
 //
 // 已匹配的自管库一律不动：不重命名、不改路径、不同步 libraryOptions —— 那些都会
 // 制造「第二次触发又改了东西」，与幂等直接冲突。
-func Diff(existing []Library, categories []string, root, prefix string) Plan {
+//
+// disabled 是分类开关（MKACG-668）：被关掉的分类不建库，已有的自管库进 Delete。
+// 分类整个消失（不在 categories 里）仍然只算孤儿 —— 删除只由显式关闭的开关触发，
+// 树里一次读不到某个分类不会顺手把库删掉。
+func Diff(existing []Library, categories, disabled []string, root, prefix string) Plan {
 	var out Plan
 	// managed 记「自管库名 → 名字去掉前缀后的分类」。
 	managed := make(map[string]string, len(existing))
@@ -94,7 +101,19 @@ func Diff(existing []Library, categories []string, root, prefix string) Plan {
 		}
 	}
 
+	off := make(map[string]struct{}, len(disabled))
+	for _, category := range disabled {
+		if category != "" {
+			off[category] = struct{}{}
+		}
+	}
+
+	present := make(map[string]struct{}, len(categories))
 	for _, category := range categories {
+		present[category] = struct{}{}
+		if _, isOff := off[category]; isOff {
+			continue
+		}
 		name := prefix + category
 		if _, ok := managed[name]; ok {
 			continue
@@ -106,15 +125,16 @@ func Diff(existing []Library, categories []string, root, prefix string) Plan {
 		out.Create = append(out.Create, Action{Name: name, Path: path.Join(path.Clean(root), category)})
 	}
 
-	wanted := make(map[string]struct{}, len(categories))
-	for _, category := range categories {
-		wanted[category] = struct{}{}
-	}
 	for name, category := range managed {
-		if _, ok := wanted[category]; !ok {
+		if _, isOff := off[category]; isOff {
+			out.Delete = append(out.Delete, name)
+			continue
+		}
+		if _, ok := present[category]; !ok {
 			out.Orphans = append(out.Orphans, name)
 		}
 	}
+	sort.Strings(out.Delete)
 	sort.Strings(out.Orphans)
 	return out
 }
@@ -150,3 +170,15 @@ type LoadConfig func(ctx context.Context) (Config, error)
 // 口径必须与虚拟文件树的根目录完全一致（转义规则 + 「其他」兜底），否则库指向一个
 // 不存在的目录；所以这条能力只能从 vfs 来，本包不自己读 drama.genre。
 type Categories func(ctx context.Context) ([]string, error)
+
+// Disabled 列被关掉的分类（装配根接到 store 的分类开关表，MKACG-668）。
+//
+// 行不存在 = 启用，所以这里给出的就是「关掉的那些」。每轮开始时现读：拨开关不触发
+// 同步，下一轮（周期或手动）从库里读到新状态后才执行删除。
+type Disabled func(ctx context.Context) ([]string, error)
+
+// CategoryState 是分类开关列表的一行：分类名 + 当前是否同步到 Jellyfin。
+type CategoryState struct {
+	Name    string
+	Enabled bool
+}

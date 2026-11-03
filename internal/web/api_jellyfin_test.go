@@ -16,12 +16,12 @@ import (
 )
 
 // TestAPI_JellyfinLibraries 覆盖 POST /api/jellyfin/libraries 的三种结局（AC-11）：
-// 202 已派出 / 409 上一轮还在跑 / 400 未配置且指出缺哪个键；prune 只由请求体给。
+// 202 已派出 / 409 上一轮还在跑 / 400 未配置且指出缺哪个键。请求体不再有参数：
+// 删不删库由分类开关决定（MKACG-668）。
 func TestAPI_JellyfinLibraries(t *testing.T) {
 	t.Run("202 已派出", func(t *testing.T) {
 		jf := &fakeJellyfin{}
 		srv, _, _ := newTestServerWith(t, jf)
-		// 请求体可省：curl 不带 body 也要能触发，按 prune=false 处理。
 		rec := do(t, srv, http.MethodPost, "/api/jellyfin/libraries", "")
 		if rec.Code != http.StatusAccepted {
 			t.Fatalf("状态码 = %d, 期望 202（body=%s）", rec.Code, rec.Body.String())
@@ -29,20 +29,8 @@ func TestAPI_JellyfinLibraries(t *testing.T) {
 		if got := decode[jellyfinLibrariesResponse](t, rec); !got.Started {
 			t.Errorf("响应 = %+v, 期望 started=true", got)
 		}
-		if jf.calls != 1 || jf.prune {
-			t.Errorf("触发 %d 次, prune=%v, 期望 1 次且 prune=false", jf.calls, jf.prune)
-		}
-	})
-
-	t.Run("prune 由请求体给", func(t *testing.T) {
-		jf := &fakeJellyfin{}
-		srv, _, _ := newTestServerWith(t, jf)
-		rec := do(t, srv, http.MethodPost, "/api/jellyfin/libraries", `{"prune":true}`)
-		if rec.Code != http.StatusAccepted {
-			t.Fatalf("状态码 = %d, 期望 202（body=%s）", rec.Code, rec.Body.String())
-		}
-		if !jf.prune {
-			t.Error("prune=true 没有传到 Manager")
+		if jf.calls != 1 {
+			t.Errorf("触发 %d 次, 期望 1 次", jf.calls)
 		}
 	})
 
@@ -66,18 +54,87 @@ func TestAPI_JellyfinLibraries(t *testing.T) {
 			t.Errorf("响应体 = %s, 期望指出缺哪个键", body)
 		}
 	})
+}
 
-	t.Run("400 请求体不是合法 JSON", func(t *testing.T) {
-		jf := &fakeJellyfin{}
-		srv, _, _ := newTestServerWith(t, jf)
-		rec := do(t, srv, http.MethodPost, "/api/jellyfin/libraries", `{"prune":`)
+// TestAPI_JellyfinCategories 覆盖分类开关的读写面（MKACG-668）：
+// GET 列出全部分类与开关状态；PATCH 关掉一个 → 落库（下一次 GET 仍是关着）；
+// 重新打开 → 行删除；缺 name / enabled、空分类名 → 400。
+func TestAPI_JellyfinCategories(t *testing.T) {
+	jf := &fakeJellyfin{categories: []jellyfin.CategoryState{
+		{Name: "都市", Enabled: true},
+		{Name: "爱情", Enabled: true},
+	}}
+	srv, _, _ := newTestServerWith(t, jf)
+
+	rec := do(t, srv, http.MethodGet, "/api/jellyfin/categories", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	got := decode[jellyfinCategoriesResponse](t, rec)
+	if len(got.Categories) != 2 || got.Categories[0] != (jellyfinCategoryView{Name: "都市", Enabled: true}) {
+		t.Fatalf("分类列表 = %+v", got.Categories)
+	}
+
+	// 关掉一个：只写库，必须 200 且回显同值。
+	rec = do(t, srv, http.MethodPatch, "/api/jellyfin/categories", `{"name":"爱情","enabled":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	if got := decode[jellyfinCategoryView](t, rec); got.Name != "爱情" || got.Enabled {
+		t.Errorf("PATCH 响应 = %+v, 期望 name=爱情 enabled=false", got)
+	}
+	if jf.calls != 0 {
+		t.Errorf("拨开关触发了 %d 轮同步，期望 0（删除只在下一轮同步里发生）", jf.calls)
+	}
+	// 真的落库了：把 Manager 的开关读到的最新状态换掉，再从 store 读回来的值才是真值。
+	disabled, err := srv.st.DisabledJellyfinCategories(t.Context())
+	if err != nil {
+		t.Fatalf("DisabledJellyfinCategories: %v", err)
+	}
+	if len(disabled) != 1 || disabled[0] != "爱情" {
+		t.Errorf("库里的关闭项 = %v, 期望 [爱情]", disabled)
+	}
+
+	// 重新打开：删行，GET 回到开启。
+	rec = do(t, srv, http.MethodPatch, "/api/jellyfin/categories", `{"name":"爱情","enabled":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("重新开启状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	if disabled, err := srv.st.DisabledJellyfinCategories(t.Context()); err != nil || len(disabled) != 0 {
+		t.Errorf("重新开启后关闭项 = %v, %v，期望空", disabled, err)
+	}
+
+	// 参数缺失 / 空分类名：400，且不落库。
+	for _, body := range []string{
+		`{"name":"都市"}`,
+		`{"enabled":false}`,
+		`{"name":"","enabled":false}`,
+		`{"name":"都市","enabled":`,
+	} {
+		rec := do(t, srv, http.MethodPatch, "/api/jellyfin/categories", body)
 		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("状态码 = %d, 期望 400", rec.Code)
+			t.Errorf("PATCH %s 状态码 = %d, 期望 400（body=%s）", body, rec.Code, rec.Body.String())
 		}
-		if jf.calls != 0 {
-			t.Errorf("请求体非法时不该触发，实际触发了 %d 次", jf.calls)
-		}
-	})
+	}
+	if disabled, err := srv.st.DisabledJellyfinCategories(t.Context()); err != nil || len(disabled) != 0 {
+		t.Errorf("非法请求后关闭项 = %v, %v，期望仍是空", disabled, err)
+	}
+}
+
+// TestAPI_JellyfinCategoriesNeedsToken 锁定 PATCH 是写操作：没有令牌一律 401，
+// 且不改库。
+func TestAPI_JellyfinCategoriesNeedsToken(t *testing.T) {
+	srv, _, _ := newTestServerWith(t, &fakeJellyfin{})
+	req := newRequest(http.MethodPatch, "/api/jellyfin/categories", `{"name":"都市","enabled":false}`)
+	req.Header.Del(AdminTokenHeader)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("无令牌状态码 = %d, 期望 401", rec.Code)
+	}
+	if disabled, err := srv.st.DisabledJellyfinCategories(t.Context()); err != nil || len(disabled) != 0 {
+		t.Errorf("未授权请求改了库：%v, %v", disabled, err)
+	}
 }
 
 // TestAPI_JellyfinLibrariesNeedsToken 锁定写操作鉴权对新增端点同样生效：

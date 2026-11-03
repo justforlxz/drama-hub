@@ -29,7 +29,12 @@ type fakeJellyfin struct {
 	// badPaths 里的路径在「建库」时回 400：复刻 12.1 的
 	// `ArgumentException: The specified path does not exist: <path>`。
 	badPaths map[string]bool
-	requests []recorded
+	// deleteFail 里的库名在「删库」时回 500（且库仍然存在）。
+	deleteFail map[string]bool
+	// deleteVanish 里的库名在「删库」时回 500，但库里已经没有它了：
+	// 复刻「服务端删成了、客户端没收到 204」（Jellyfin 也可能对不存在的名字回 500）。
+	deleteVanish map[string]bool
+	requests     []recorded
 }
 
 type recorded struct {
@@ -89,7 +94,35 @@ func (f *fakeJellyfin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 删库要真的从库里拿掉：重试与幂等的断言看的就是「下一次列库还在不在」。
+	if r.Method == http.MethodDelete && r.URL.Path == pathLibraries {
+		name := r.URL.Query().Get("name")
+		f.mu.Lock()
+		fail := f.deleteFail[name]
+		vanish := f.deleteVanish[name]
+		if vanish {
+			f.removeLocked(name)
+		} else if !fail {
+			f.removeLocked(name)
+		}
+		f.mu.Unlock()
+		if fail || vanish {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// removeLocked 从假 Jellyfin 的库列表里去掉一个名字（调用方持锁）。
+func (f *fakeJellyfin) removeLocked(name string) {
+	kept := f.libraries[:0]
+	for _, lib := range f.libraries {
+		if lib.Name != name {
+			kept = append(kept, lib)
+		}
+	}
+	f.libraries = kept
 }
 
 // seen 返回已收到的请求快照（handler 在自己的 goroutine 里跑，读也要加锁）。

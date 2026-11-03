@@ -102,23 +102,27 @@ func newTestServerWith(t *testing.T, jellyfinMgr Jellyfin) (*Server, *store.Stor
 		testAdminToken, slog.New(slog.DiscardHandler)), st, syncer
 }
 
-// fakeJellyfin 是媒体库维护依赖的替身：记下触发次数与 prune 标志，现状由用例给定。
+// fakeJellyfin 是媒体库维护依赖的替身：记下触发次数，现状与分类开关由用例给定。
 // 真实的差异算法、HTTP 客户端与单飞锁由 internal/jellyfin 自己覆盖（plan_test /
 // manager_test 打 httptest 假 Jellyfin），这里只关心管理面「触发后回了什么码」。
 type fakeJellyfin struct {
-	state    jellyfin.State
-	startErr error
-	calls    int
-	prune    bool
+	state         jellyfin.State
+	startErr      error
+	calls         int
+	categories    []jellyfin.CategoryState
+	categoriesErr error
 }
 
-func (f *fakeJellyfin) Start(_ context.Context, prune bool) error {
+func (f *fakeJellyfin) Start(context.Context) error {
 	f.calls++
-	f.prune = prune
 	return f.startErr
 }
 
 func (f *fakeJellyfin) State(context.Context) jellyfin.State { return f.state }
+
+func (f *fakeJellyfin) Categories(context.Context) ([]jellyfin.CategoryState, error) {
+	return f.categories, f.categoriesErr
+}
 
 // testAdminToken 是测试里的管理令牌：写操作（非 GET/HEAD/OPTIONS）要带它，
 // 与生产里 DRAMA_HUB_ADMIN_TOKEN 的作用相同。

@@ -838,7 +838,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 | 路径 | 页面 | 能干的事 |
 |---|---|---|
-| `/` | 概览（`data-page=overview`） | 摘要条（剧/集/对外集计数与最近同步时间）；每个播放源一张卡片：状态徽标（已启用/已停用/正在刷新）、上次运行/上次成功/下次计划（`title` 给完整 ISO）、仅非空时出现的上次错误、停用原因与「重启后生效」提示、页脚「立即刷新」；Jellyfin 卡片：状态徽标（未配置/已启用/正在同步/上次失败 + 缺哪几项）、上次同步时间、664 的进度与结果行、孤儿/冲突/被拒分类（空则整段不出）、页脚「同步媒体库」；默认收起的「补录 / 查一部剧」（`POST /api/dramas`，201 新建 / 200 只更新） |
+| `/` | 概览（`data-page=overview`） | 摘要条（剧/集/对外集计数与最近同步时间）；每个播放源一张卡片：状态徽标（已启用/已停用/正在刷新）、上次运行/上次成功/下次计划（`title` 给完整 ISO）、仅非空时出现的上次错误、停用原因与「重启后生效」提示、页脚「立即刷新」；Jellyfin 卡片：状态徽标（未配置/已启用/正在同步/上次失败 + 缺哪几项）、上次同步时间、664 的进度与结果行、分类开关列表（MKACG-668，一行一个分类）、孤儿/冲突/被拒分类（空则整段不出）、页脚「同步媒体库」；默认收起的「补录 / 查一部剧」（`POST /api/dramas`，201 新建 / 200 只更新） |
 | `/settings` | 设置（`data-page=settings`） | 单表单、单「保存」：访问（WebDAV 用户/密码、`strm_prefix`）、同步与刷新（`refresh_interval_sec`）、合并与对外集号（`merge_chunk_size`）、缓存（`cache_max_mb` / `cache_lru_days`）、Jellyfin（地址 / API key / 媒体库根 / 库名前缀 / 单次超时）；每项带生效时机徽标，只提交改动过的项；底部可折叠「只读运行参数」（`cache_dir` / `refresh_batch` / `refresh_timeout_sec` / 密钥与凭据是否已设置） |
 
 剧目的查看/删除入口已在 MKACG-665 删除（对外集号由 `emby_item` 派生并按
@@ -870,10 +870,12 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | `/api/dramas` | GET | 剧目列表：drama 行 + `episodes` / `emby_items`（对外集数，运行时派生）计数 |
 | `/api/dramas` | POST | 新增剧目：`{"series_id":"<上游剧 id 或 /player/ 链接>"}`，同步入库后返回整份列表：**库里新建了行 → 201，这部剧已存在（这次只更新）→ 200** |
 | `/api/refresh` | POST | 手动跑一轮：`{"source":"web"}` → 202 已启动 / 404 无此源或未启用 / 409 该源正在跑（与定时共用单飞锁） |
-| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `cache_dir` / `merge_chunk_size` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」）+ `jellyfin` 块 = 媒体库维护现状（`configured` / `missing[]` / `url` / `library_root` / `library_prefix` / `api_key_set` / `timeout_sec` / `running` / `last_run_at` / `last_ok_at` / `last_error` / `created` / `unchanged` / `removed` / `duration_ms` / `uncertain` / `orphans[]` / `conflicts[]`，运行中另有 `started_at` / `phase` / `phase_label` / `processed` / `total` 进度字段；**api key 永不出现在响应里**，只给 `api_key_set`） |
+| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `cache_dir` / `merge_chunk_size` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」）+ `jellyfin` 块 = 媒体库维护现状（`configured` / `missing[]` / `url` / `library_root` / `library_prefix` / `api_key_set` / `timeout_sec` / `running` / `last_run_at` / `last_ok_at` / `last_error` / `created` / `unchanged` / `removed` / `duration_ms` / `uncertain` / `failed[]` / `delete_failed[]` / `disabled[]` / `orphans[]` / `conflicts[]`，运行中另有 `started_at` / `phase` / `phase_label` / `processed` / `total` 进度字段；**api key 永不出现在响应里**，只给 `api_key_set`） |
 | `/api/settings` | PATCH | 按 key 批量写配置：`{"settings":{"<key>":"<原始值>",…}}` → 200 + **归一化后的值**（`strm_prefix` 去尾 `/`；`webdav_pass` / `stream_secret` 回 `null`，不回显）。未知键 / 非法值 → 400 且**整批一行不写**；`{"settings":{}}` → 400。值一律写成字符串（数字/布尔也写成 `"4096"` / `"false"`），校验只有服务端那一份。写操作要令牌，见下「写操作鉴权」 |
-| `/api/jellyfin/libraries` | POST | 手动跑一轮媒体库同步（一分类一库，ADR-0012）：body 可省或 `{"prune":true}` → 202 `{"started":true}` 已派出 / 409 上一轮还在跑（与同步轮末钩子共用单飞锁）/ 400 三项配置没配齐（body 点名缺哪个键）。`prune` 只在显式给 `true` 时删自管孤儿库，默认只报告；结果不在响应里，看下面的 GET |
-| `/api/jellyfin/libraries` | GET | 一轮媒体库同步的现状与进度（MKACG-664），页面在派发后**每秒轮询它**直到 `running:false`：运行中给 `started_at` / `phase` / `phase_label`（`list` 列现有库 / `categories` 列分类 / `diff` 比对 / `create` 建库 / `prune` 删孤儿 / `scan` 扫描）/ `processed` / `total`；收尾后给 `created` / `unchanged`（已存在且未改动）/ `removed` / `duration_ms` / `last_error`。与 `/api/status` 的 `jellyfin` 块同一份视图，但**不读 drama / episode 表**，所以轮询用它 |
+| `/api/jellyfin/libraries` | POST | 手动跑一轮媒体库同步（一分类一库，ADR-0012）：无请求体参数 → 202 `{"started":true}` 已派出 / 409 上一轮还在跑（与同步轮末钩子共用单飞锁）/ 400 三项配置没配齐（body 点名缺哪个键）。删不删库由分类开关决定（MKACG-668）：这一轮读到哪个分类关着就删它对应的自管库，没有 `prune` 参数；结果不在响应里，看下面的 GET |
+| `/api/jellyfin/libraries` | GET | 一轮媒体库同步的现状与进度（MKACG-664），页面在派发后**每秒轮询它**直到 `running:false`：运行中给 `started_at` / `phase` / `phase_label`（`list` 列现有库 / `categories` 列分类 / `diff` 比对 / `create` 建库 / `delete` 删已关闭分类的库 / `scan` 扫描）/ `processed` / `total`；收尾后给 `created` / `unchanged`（已存在且未改动）/ `removed` / `duration_ms` / `delete_failed[]` / `last_error`。与 `/api/status` 的 `jellyfin` 块同一份视图，但**不读 drama / episode 表**，所以轮询用它 |
+| `/api/jellyfin/categories` | GET | 全部分类 + 开关状态（MKACG-668）：`{"categories":[{"name":"都市","enabled":true},…]}`。分类口径与建库同源（vfs 根目录），开关来自 `jellyfin_category_switch` 表（行不存在 = 启用）；未配置 Jellyfin 时也可读 |
+| `/api/jellyfin/categories` | PATCH | 开关一个分类：`{"name":"都市","enabled":false}` → 200 回显同值 / 400 `name` 为空、缺 `enabled` 或 body 非法。**只写库，不碰 Jellyfin**：删除发生在下一轮同步（周期或「同步媒体库」）里 |
 
 - **「增剧目」的唯一入口是数据源同步**：剧目与集的真值在上游，手工插空剧只会得到一条
   永远没有集的记录。`series_id` 只接受纯数字或 `/player/<id>` 链接 —— 归一后的值会拼进
@@ -915,8 +917,10 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 - **自管集合 = 三条同时成立**：名字带前缀、`Locations` 只有一个、那个位置正好是 root 的
   直接子目录。判定在 `jellyfin.Diff`（纯函数，表驱动测试覆盖三类「不算自管」）。
-- **只增不删**：分类消失只进 `orphans[]`（概览卡片 + 日志），删除只走
-  `POST /api/jellyfin/libraries {"prune":true}`，且只删自管孤儿。prune 不进页面 UI。
+- **开关即删除开关**（MKACG-668）：页面一行一个分类的开关，默认全开；关掉的分类不建库，
+  已有的自管库在下一轮同步里删（`Plan.Delete`），拨开关本身不发请求。删除失败进
+  `delete_failed[]` 与 `last_error`、下一轮重试；目标库已不存在算这一项完成（幂等）。
+  分类从树里消失且没有开关行，仍然只进 `orphans[]`（概览卡片 + 日志），不删。
 - **触发**：手动端点 + `scheduler.runRound` 的轮末钩子（`afterRound`，`saveState` 之后、
   一轮一次）。两者共用一把单飞锁；`Start` 只派 goroutine（`context.WithoutCancel`），
   不延长同步轮的寿命。
@@ -932,7 +936,8 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 - **扫描**：`created > 0 || removed > 0 || uncertain > 0` 才在末尾调一次
   `POST /Library/Refresh`；0 变化时一个写请求都不发（幂等的可验证点）。
 - **状态只在内存**：`created` / `uncertain` / `failed` / `last_*` / 孤儿库不落库，重启后
-  回到「未运行」；不加表也不加迁移。
+  回到「未运行」。唯一的落库状态是分类开关（`jellyfin_category_switch`，MKACG-668）：
+  关掉的分类必须跨重启保持，否则重启后下一轮同步会把库悄悄重建。
 - **与 MKACG-651 的合入顺序**：库内「剧目录成为 Series」以 651（去掉分片层）为前提 ——
   分片层还在时库根的直接子目录是分片目录，Jellyfin 会把 `00` 认成 Series、真剧目录仍是
   普通目录（12.1 实测复现）。654 对 `internal/vfs` 的增量只有 `categories.go` 一个文件，

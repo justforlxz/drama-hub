@@ -21,7 +21,9 @@ func TestDiff(t *testing.T) {
 		name       string
 		existing   []Library
 		categories []string
+		disabled   []string
 		wantCreate []Action
+		wantDelete []string
 		wantOrphan []string
 		wantConf   []string
 	}{
@@ -145,13 +147,72 @@ func TestDiff(t *testing.T) {
 			wantOrphan: []string{prefix + "a", prefix + "b", prefix + "c"},
 			wantConf:   []string{},
 		},
+		{
+			// 开关就是删除开关（MKACG-668）：关掉的分类不建库，已有的自管库进 Delete。
+			name: "关掉的分类：不建库、已有自管库进 Delete",
+			existing: []Library{
+				managed("都市", root+"/都市"),
+				managed("爱情", root+"/爱情"),
+			},
+			categories: []string{"都市", "爱情", "科幻"},
+			disabled:   []string{"爱情", "科幻"},
+			wantCreate: []Action{},
+			wantDelete: []string{prefix + "爱情"},
+			wantOrphan: []string{},
+			wantConf:   []string{},
+		},
+		{
+			// 删除集合只含自管库：别人的库、带前缀但路径不对的库一个都不进。
+			name: "Delete 只含自管库：别人的库与错位库不动",
+			existing: []Library{
+				{Name: "Movies", Locations: []string{"/data/video/movies"}},
+				{Name: prefix + "都市", Locations: []string{"/data/video/elsewhere"}},
+				{Name: prefix + "都市", Locations: []string{root + "/都市", "/data/video/other"}},
+				managed("爱情", root+"/爱情"),
+			},
+			categories: []string{"都市", "爱情"},
+			disabled:   []string{"都市", "爱情"},
+			wantCreate: []Action{},
+			wantDelete: []string{prefix + "爱情"},
+			wantOrphan: []string{},
+			wantConf:   []string{},
+		},
+		{
+			// 开关行还在、分类已经从树里消失：仍然按关闭处理（库删掉）；没有库就是 0 删除。
+			name: "关闭的分类已消失：有库就删，没库就什么都不做",
+			existing: []Library{
+				managed("已下架", root+"/已下架"),
+			},
+			categories: []string{"都市"},
+			disabled:   []string{"已下架"},
+			wantCreate: []Action{{Name: prefix + "都市", Path: root + "/都市"}},
+			wantDelete: []string{prefix + "已下架"},
+			wantOrphan: []string{},
+			wantConf:   []string{},
+		},
+		{
+			// 关掉的分类即使名字被别人的库占着也不算冲突：这一轮根本不会建这个库。
+			name: "关掉的分类不报同名冲突",
+			existing: []Library{
+				{Name: prefix + "都市", Locations: []string{"/data/video/other/都市"}},
+			},
+			categories: []string{"都市"},
+			disabled:   []string{"都市"},
+			wantCreate: []Action{},
+			wantDelete: []string{},
+			wantOrphan: []string{},
+			wantConf:   []string{},
+		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := Diff(c.existing, c.categories, root, prefix)
+			got := Diff(c.existing, c.categories, c.disabled, root, prefix)
 			if !slices.Equal(got.Create, c.wantCreate) {
 				t.Errorf("Create = %v, 期望 %v", got.Create, c.wantCreate)
+			}
+			if !slices.Equal(got.Delete, c.wantDelete) {
+				t.Errorf("Delete = %v, 期望 %v", got.Delete, c.wantDelete)
 			}
 			if !slices.Equal(got.Orphans, c.wantOrphan) {
 				t.Errorf("Orphans = %v, 期望 %v", got.Orphans, c.wantOrphan)
@@ -164,12 +225,12 @@ func TestDiff(t *testing.T) {
 }
 
 // TestDiffPrefixEmpty 锁定空前缀的兜底：名字带空前缀等于「每个库都带前缀」，
-// 若还判定位置，任何落在 root 下的别人的库都会变成自管、进而可被 prune。
+// 若还判定位置，任何落在 root 下的别人的库都会变成自管、进而可能被删除。
 func TestDiffPrefixEmpty(t *testing.T) {
 	got := Diff([]Library{{Name: "都市", Locations: []string{"/data/video/dramahub/都市"}}},
-		[]string{"都市"}, "/data/video/dramahub", "")
-	if len(got.Orphans) != 0 {
-		t.Errorf("空前缀下 Orphans = %v, 期望空（不含任何库）", got.Orphans)
+		[]string{"都市"}, []string{"都市"}, "/data/video/dramahub", "")
+	if len(got.Orphans) != 0 || len(got.Delete) != 0 {
+		t.Errorf("空前缀下 Orphans = %v / Delete = %v, 期望都为空（不含任何库）", got.Orphans, got.Delete)
 	}
 }
 

@@ -1,0 +1,104 @@
+{{define "content"}}
+<section class="page-head">
+  <h1>设置</h1>
+</section>
+<p class="lede">改完点一次「保存」：只提交改动过的项，非法值整批拒绝、库里不动。</p>
+<p class="notice" id="notice" role="status" aria-live="polite"></p>
+
+<form class="form" id="settings-form">
+  <fieldset class="group">
+    <legend>访问</legend>
+    <div class="fields">
+      <label class="field">
+        <span class="field-label">WebDAV 用户 <span class="badge" data-timing="immediate">即时</span></span>
+        <input id="set-webdav-user" name="webdav_user" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        <span class="field-label">WebDAV 密码 <span class="badge" data-timing="immediate">即时</span></span>
+        <input id="set-webdav-pass" name="webdav_pass" type="password"
+               autocomplete="new-password" spellcheck="false">
+      </label>
+      <label class="field wide">
+        <span class="field-label">strm 前缀 <span class="badge" data-timing="immediate">即时</span></span>
+        <input id="set-strm-prefix" name="strm_prefix" autocomplete="off" spellcheck="false"
+               placeholder="空 = 按请求 Host 推导">
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset class="group">
+    <legend>同步与刷新</legend>
+    <div class="fields">
+      <label class="field">
+        <span class="field-label">刷新间隔秒 <span class="badge" data-timing="refresh">≤60 秒</span></span>
+        <input id="set-refresh-interval" name="refresh_interval_sec" inputmode="numeric" autocomplete="off">
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset class="group">
+    <legend>合并与对外集号</legend>
+    <div class="fields">
+      <label class="field">
+        <span class="field-label">合并分块集数 <span class="badge" data-timing="immediate">即时</span></span>
+        <input id="set-merge-chunk-size" name="merge_chunk_size" inputmode="numeric" autocomplete="off">
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset class="group">
+    <legend>缓存</legend>
+    <div class="fields">
+      <label class="field">
+        <span class="field-label">缓存上限 MB <span class="badge" data-timing="evict">≤5 分钟</span></span>
+        <input id="set-cache-max-mb" name="cache_max_mb" inputmode="numeric" autocomplete="off">
+      </label>
+      <label class="field">
+        <span class="field-label">缓存保留天数 <span class="badge" data-timing="evict">≤5 分钟</span></span>
+        <input id="set-cache-lru-days" name="cache_lru_days" inputmode="numeric" autocomplete="off">
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset class="group">
+    <legend>Jellyfin</legend>
+    <div class="fields">
+      <label class="field wide">
+        <span class="field-label">地址 <span class="badge" data-timing="immediate">即时</span></span>
+        <input id="set-jellyfin-url" name="jellyfin_url" autocomplete="off" spellcheck="false"
+               placeholder="空 = 关闭（如 http://jellyfin:8096）">
+      </label>
+      <label class="field wide">
+        <span class="field-label">API key <span class="badge" data-timing="immediate">即时</span></span>
+        <input id="set-jellyfin-api-key" name="jellyfin_api_key" type="password"
+               autocomplete="new-password" spellcheck="false">
+      </label>
+      <label class="field wide">
+        <span class="field-label">媒体库根（Jellyfin 容器内） <span class="badge" data-timing="immediate">即时</span></span>
+        <input id="set-jellyfin-root" name="jellyfin_library_root" autocomplete="off" spellcheck="false"
+               placeholder="空 = 关闭（如 /data/video/dramahub）">
+      </label>
+      <label class="field">
+        <span class="field-label">库名前缀 <span class="badge" data-timing="immediate">即时</span></span>
+        <input id="set-jellyfin-prefix" name="jellyfin_library_prefix" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        <span class="field-label">单次请求超时秒 <span class="badge" data-timing="immediate">即时</span></span>
+        <input id="set-jellyfin-timeout" name="jellyfin_timeout_sec" inputmode="numeric" autocomplete="off">
+      </label>
+    </div>
+  </fieldset>
+
+  <div class="form-foot">
+    <button type="submit" class="btn primary" id="settings-save">保存</button>
+    <p class="hint" id="settings-hint"></p>
+  </div>
+
+  <details class="card">
+    <summary>只读运行参数</summary>
+    <div class="card-body">
+      <dl class="kv" id="readonly"></dl>
+    </div>
+  </details>
+</form>
+{{end}}

@@ -64,16 +64,18 @@ func isElement(n *html.Node, tag string) bool {
 	return n.Type == html.ElementNode && n.Data == tag
 }
 
-// TestPages 覆盖管理界面的契约：200 + text/html + 精确 Content-Length，
-// body[data-page] 与页面一致（JS 靠它分派），导航只剩实际存在的页面且带 aria-current。
-//
-// 剧目页已删除（MKACG-665）：`/` 与 `/status` 都是同步与缓存页，页面上不该再残留
-// 剧目列表的表单与表格元素。
+// byID 找 id 等于给定值的元素。
+func byID(n *html.Node, id string) *html.Node {
+	return findNode(n, func(node *html.Node) bool { return attrOf(node, "id") == id })
+}
+
+// TestPages 覆盖页面集合：200 + text/html + 精确 Content-Length，body[data-page]
+// 与页面一致（JS 靠它分派），导航恰为 / 与 /settings 且只有当前页带 aria-current。
 func TestPages(t *testing.T) {
 	srv, _, _ := newTestServer(t)
-	cases := []struct{ path, page string }{
-		{"/", "status"},
-		{"/status", "status"},
+	cases := []struct{ path, page, current string }{
+		{"/", "overview", "/"},
+		{"/settings", "settings", "/settings"},
 	}
 	for _, c := range cases {
 		t.Run(c.path, func(t *testing.T) {
@@ -97,13 +99,6 @@ func TestPages(t *testing.T) {
 				t.Errorf("body[data-page] = %q, 期望 %q", got, c.page)
 			}
 
-			// 剧目页的列表与表单元素一个都不该留下（AC1）。
-			for _, id := range []string{"drama-form", "dramas", "dramas-empty"} {
-				if findNode(doc, func(n *html.Node) bool { return attrOf(n, "id") == id }) != nil {
-					t.Errorf("页面残留剧目页元素 #%s", id)
-				}
-			}
-
 			nav := findNode(doc, func(n *html.Node) bool { return isElement(n, "nav") && hasClass(n, "tabs") })
 			if nav == nil {
 				t.Fatal("页面没有导航")
@@ -120,20 +115,132 @@ func TestPages(t *testing.T) {
 					current = href
 				}
 			}
-			want := []string{"/status"}
-			if len(hrefs) != len(want) {
+			want := []string{"/", "/settings"}
+			if strings.Join(hrefs, ",") != strings.Join(want, ",") {
 				t.Fatalf("导航链接 = %v, 期望 %v", hrefs, want)
 			}
-			for i := range want {
-				if hrefs[i] != want[i] {
-					t.Errorf("导航第 %d 项 = %q, 期望 %q", i, hrefs[i], want[i])
-				}
-			}
-			if current != "/status" {
-				t.Errorf("当前页高亮 = %q, 期望 %q", current, "/status")
+			if current != c.current {
+				t.Errorf("当前页高亮 = %q, 期望 %q", current, c.current)
 			}
 		})
 	}
+}
+
+// TestNoTables 锁「删表就是移动端策略」：两页的 <table> 计数都是 0
+// （源与媒体库用卡片、键值用 dl）。
+func TestNoTables(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	for _, path := range []string{"/", "/settings"} {
+		doc := parseDoc(t, do(t, srv, http.MethodGet, path, "").Body.Bytes())
+		if table := findNode(doc, func(n *html.Node) bool { return isElement(n, "table") }); table != nil {
+			t.Errorf("GET %s 仍有 <table>：移动端策略是删表，不是横向滚动", path)
+		}
+	}
+}
+
+// TestOverviewPage 锁定概览页的操作落点：摘要、播放源容器、Jellyfin 进度与
+// 同步按钮、补录表单、管理令牌框 —— 少一个，app.js 上对应的动作就静默失效。
+func TestOverviewPage(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	doc := parseDoc(t, do(t, srv, http.MethodGet, "/", "").Body.Bytes())
+
+	for _, id := range []string{"summary", "notice", "sources", "jellyfin-progress", "jellyfin-sync", "drama-form", "series-id", "drama-submit", "admin-token", "write-hint"} {
+		if byID(doc, id) == nil {
+			t.Errorf("概览页缺少 #%s", id)
+		}
+	}
+	if progress := byID(doc, "jellyfin-progress"); progress != nil && !isElement(progress, "p") {
+		t.Errorf("#jellyfin-progress 是 %s, 期望 p（664 的进度行）", progress.Data)
+	}
+	if form := byID(doc, "drama-form"); form != nil && !isElement(form, "form") {
+		t.Errorf("#drama-form 是 %s, 期望 form", form.Data)
+	}
+	if details := byID(doc, "lookup"); details == nil || !isElement(details, "details") {
+		t.Error("概览页缺少 <details id=lookup>：补录入口应该默认收起")
+	}
+}
+
+// TestSettingsPageForm 锁定设置页：一个表单、五个分组、每个可改项都带
+// data-timing（即时 / ≤60 秒 / ≤5 分钟），并保留可折叠的只读运行参数。
+func TestSettingsPageForm(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	doc := parseDoc(t, do(t, srv, http.MethodGet, "/settings", "").Body.Bytes())
+
+	form := byID(doc, "settings-form")
+	if form == nil || !isElement(form, "form") {
+		t.Fatal("/settings 没有 #settings-form 表单")
+	}
+	if byID(doc, "admin-token") == nil {
+		t.Error("设置页没有管理令牌输入框")
+	}
+	if readonly := byID(doc, "readonly"); readonly == nil {
+		t.Error("设置页缺少只读运行参数 #readonly")
+	}
+
+	// 输入框 ↔ 生效时机。data-timing 是机器读的稳定标识，徽标文字是给人看的。
+	fields := map[string]string{
+		"set-webdav-user":      "immediate",
+		"set-webdav-pass":      "immediate",
+		"set-strm-prefix":      "immediate",
+		"set-refresh-interval": "refresh",
+		"set-merge-chunk-size": "immediate",
+		"set-cache-max-mb":     "evict",
+		"set-cache-lru-days":   "evict",
+		"set-jellyfin-url":     "immediate",
+		"set-jellyfin-api-key": "immediate",
+		"set-jellyfin-root":    "immediate",
+		"set-jellyfin-prefix":  "immediate",
+		"set-jellyfin-timeout": "immediate",
+	}
+	for id, timing := range fields {
+		input := byID(doc, id)
+		if input == nil || !isElement(input, "input") {
+			t.Errorf("设置页缺少输入框 #%s", id)
+			continue
+		}
+		field := input.Parent
+		for field != nil && !hasClass(field, "field") {
+			field = field.Parent
+		}
+		badgeNode := findNode(field, func(n *html.Node) bool { return hasClass(n, "badge") })
+		if badgeNode == nil {
+			t.Errorf("#%s 没有生效时机徽标", id)
+			continue
+		}
+		if got := attrOf(badgeNode, "data-timing"); got != timing {
+			t.Errorf("#%s 的 data-timing = %q, 期望 %q", id, got, timing)
+		}
+	}
+
+	// 分组：按「一起改的东西」切，五组一个不少。
+	var legends []string
+	for n := form.FirstChild; n != nil; n = n.NextSibling {
+		if isElement(n, "fieldset") {
+			if legend := findNode(n, func(c *html.Node) bool { return isElement(c, "legend") }); legend != nil {
+				legends = append(legends, strings.TrimSpace(legendText(legend)))
+			}
+		}
+	}
+	want := []string{"访问", "同步与刷新", "合并与对外集号", "缓存", "Jellyfin"}
+	if strings.Join(legends, ",") != strings.Join(want, ",") {
+		t.Errorf("分组 = %v, 期望 %v", legends, want)
+	}
+}
+
+// legendText 取 legend 的纯文本。
+func legendText(n *html.Node) string {
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.TextNode {
+			b.WriteString(node.Data)
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(n)
+	return b.String()
 }
 
 // TestStaticAssets 覆盖内嵌样式与脚本：两种后缀各自的内容类型、精确长度；
@@ -164,124 +271,35 @@ func TestStaticAssets(t *testing.T) {
 	}
 }
 
-// TestUnknownPaths 锁定管理面之外的路径：未登记路径仍是 404（不是 501、不是 200）。
+// TestStyleContract 锁定设计系统的两块不可回归项：深色只覆盖颜色（这里至少
+// 保证有 prefers-color-scheme: dark 媒体查询）与减少动效分支；且样式表里没有
+// 动画关键帧（不做炫技）。
+func TestStyleContract(t *testing.T) {
+	body, err := assets.ReadFile("static/app.css")
+	if err != nil {
+		t.Fatalf("读 app.css: %v", err)
+	}
+	css := string(body)
+	for _, want := range []string{"prefers-color-scheme: dark", "prefers-reduced-motion: reduce", ":root"} {
+		if !strings.Contains(css, want) {
+			t.Errorf("app.css 缺少 %q", want)
+		}
+	}
+	if strings.Contains(css, "@keyframes") {
+		t.Error("app.css 不该有动画关键帧")
+	}
+}
+
+// TestUnknownPaths 锁定管理面之外的路径：未登记路径仍是 404（旧的 /status 不再
+// 是页面），页面只接受 GET。
 func TestUnknownPaths(t *testing.T) {
 	srv, _, _ := newTestServer(t)
-	for _, path := range []string{"/nope", "/merges", "/merges/x", "/status/", "/static"} {
+	for _, path := range []string{"/nope", "/merges", "/merges/x", "/status", "/status/", "/static"} {
 		if rec := do(t, srv, http.MethodGet, path, ""); rec.Code != http.StatusNotFound {
 			t.Errorf("GET %s 状态码 = %d, 期望 404", path, rec.Code)
 		}
 	}
-	// 页面只接受 GET（HEAD 由 GET 模式隐式覆盖）；写方法一律 405。
-	if rec := do(t, srv, http.MethodPost, "/status", ""); rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("POST /status 状态码 = %d, 期望 405", rec.Code)
+	if rec := do(t, srv, http.MethodPost, "/settings", ""); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /settings 状态码 = %d, 期望 405", rec.Code)
 	}
-}
-
-// TestStatusPageSettingsForm 锁定「后台配置」表单与「生效时机」列：页面能改的那几项
-// 与 PATCH /api/settings 的键一一对应，每个字段的标签上写明生效时机（MKACG-617 的
-// 生效性矩阵），顶栏有管理令牌输入框 —— 没有它，页面上的写操作全是 401。
-func TestStatusPageSettingsForm(t *testing.T) {
-	srv, _, _ := newTestServer(t)
-
-	// 顶栏令牌框在 `/` 与 `/status` 两个入口都有（写操作不止发生在 /status）。
-	for _, path := range []string{"/", "/status"} {
-		doc := parseDoc(t, do(t, srv, http.MethodGet, path, "").Body.Bytes())
-		if findNode(doc, func(n *html.Node) bool {
-			return isElement(n, "input") && attrOf(n, "id") == "admin-token"
-		}) == nil {
-			t.Errorf("GET %s 页面没有管理令牌输入框", path)
-		}
-	}
-
-	doc := parseDoc(t, do(t, srv, http.MethodGet, "/status", "").Body.Bytes())
-	form := findNode(doc, func(n *html.Node) bool {
-		return isElement(n, "form") && attrOf(n, "id") == "settings-form"
-	})
-	if form == nil {
-		t.Fatal("/status 没有配置表单")
-	}
-
-	// 表单字段 = PATCH /api/settings 里页面可改的键，每项都标了生效时机。
-	fields := map[string]string{
-		"set-webdav-user":      "即时",
-		"set-webdav-pass":      "即时",
-		"set-strm-prefix":      "即时",
-		"set-cache-max-mb":     "5 分钟",
-		"set-cache-lru-days":   "5 分钟",
-		"set-merge-chunk-size": "即时",
-		"set-refresh-interval": "60 秒",
-	}
-	labels := map[string]string{}
-	for label := form.FirstChild; label != nil; label = label.NextSibling {
-		if !isElement(label, "label") {
-			continue
-		}
-		var text string
-		var inputID string
-		for child := label.FirstChild; child != nil; child = child.NextSibling {
-			if child.Type == html.TextNode {
-				text += child.Data
-			}
-			if isElement(child, "span") && child.FirstChild != nil {
-				text += child.FirstChild.Data
-			}
-			if isElement(child, "input") {
-				inputID = attrOf(child, "id")
-			}
-		}
-		if inputID != "" {
-			labels[inputID] = text
-		}
-	}
-	for id, timing := range fields {
-		text, ok := labels[id]
-		if !ok {
-			t.Errorf("表单缺少字段 %s", id)
-			continue
-		}
-		if !strings.Contains(text, timing) {
-			t.Errorf("字段 %s 的标签 = %q, 期望标出生效时机 %q", id, text, timing)
-		}
-	}
-
-	// 「运行配置」表要有生效时机列（阈值取自 617 的生效性矩阵）。
-	headers := map[string]bool{}
-	for n := doc; n != nil; n = nextNode(n) {
-		if isElement(n, "th") && n.FirstChild != nil {
-			headers[n.FirstChild.Data] = true
-		}
-	}
-	for _, want := range []string{"项", "值", "生效时机", "说明"} {
-		if !headers[want] {
-			t.Errorf("配置表缺少表头 %q（现有 %v）", want, headers)
-		}
-	}
-}
-
-// TestStatusPageJellyfinProgress 锁定页面上的同步进度/结果行（MKACG-664）：
-// app.js 把进度与「上次同步：时间 + 结果」写进 #jellyfin-progress，模板少了这个
-// 元素，点完「同步媒体库」就只剩静默 202。
-func TestStatusPageJellyfinProgress(t *testing.T) {
-	srv, _, _ := newTestServer(t)
-	doc := parseDoc(t, do(t, srv, http.MethodGet, "/status", "").Body.Bytes())
-	if findNode(doc, func(n *html.Node) bool {
-		return isElement(n, "p") && attrOf(n, "id") == "jellyfin-progress"
-	}) == nil {
-		t.Fatal("/status 缺少 #jellyfin-progress：同步进度与上次结果没有地方显示")
-	}
-}
-
-// nextNode 深度优先遍历的下一个节点（含子节点），到末尾返回 nil。
-func nextNode(n *html.Node) *html.Node {
-	if n.FirstChild != nil {
-		return n.FirstChild
-	}
-	for n != nil {
-		if n.NextSibling != nil {
-			return n.NextSibling
-		}
-		n = n.Parent
-	}
-	return nil
 }

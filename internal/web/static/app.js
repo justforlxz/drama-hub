@@ -1,16 +1,11 @@
 'use strict';
-/* drama-hub 管理面脚本。
- *
- * 一套通用请求/渲染小工具 + 单个页面的 init，靠 body[data-page] 分派。
- * 只用原生 DOM API、不引框架、没有构建步骤（ADR-0002）；页面数据一律来自
- * /api/ 下的 JSON 端点，渲染结果与 API 返回一一对应。 */
+/* drama-hub 管理面脚本：通用请求/渲染小工具 + 两个页面的 init，靠 body[data-page] 分派。
+ * 只用原生 DOM、不引框架、没有构建步骤（ADR-0002）；数据一律来自 /api/ 的 JSON。 */
 
 // ---- 通用 ----
 
-// ---- 管理令牌 ----
-// 写操作（非 GET/HEAD/OPTIONS）要带 X-Admin-Token（env DRAMA_HUB_ADMIN_TOKEN）。
-// 令牌只存在 sessionStorage：关掉标签页就没了 —— 改配置是低频动作，不值得长期留在浏览器。
-const TOKEN_KEY = 'drama-hub-admin-token';
+// 写操作带 X-Admin-Token（env DRAMA_HUB_ADMIN_TOKEN）；令牌只存 sessionStorage，关标签页即失效。
+const TOKEN_KEY = 'drama-hub.admin-token';
 const TOKEN_HEADER = 'X-Admin-Token';
 
 /** 当前管理令牌：以顶栏输入框为准（刚打完字、还没触发 change 时也拿得到）。 */
@@ -33,8 +28,8 @@ function initAdminToken() {
   });
 }
 
-/** 请求管理 API 并返回解析后的 JSON（204 返回 null）。非 2xx 抛 Error（带服务端 message）。 */
-async function api(method, path, body) {
+/** 请求管理 API，返回 {status, data}；非 2xx 抛 Error（带服务端 message）。 */
+async function apiRaw(method, path, body) {
   const init = { method, headers: { Accept: 'application/json' } };
   if (method !== 'GET') init.headers[TOKEN_HEADER] = adminToken();
   if (body !== undefined) {
@@ -43,21 +38,26 @@ async function api(method, path, body) {
   }
   const res = await fetch(path, init);
   const text = await res.text();
-  let payload = null;
+  let data = null;
   if (text !== '') {
     try {
-      payload = JSON.parse(text);
+      data = JSON.parse(text);
     } catch {
-      payload = null;
+      data = null;
     }
   }
   if (!res.ok) {
-    const message = payload && payload.message ? payload.message : res.status + ' ' + res.statusText;
+    const message = data && data.message ? data.message : res.status + ' ' + res.statusText;
     const error = new Error(message);
     error.status = res.status; // 409 这类「不是故障的状态」页面要单独处理（见 syncJellyfin）
     throw error;
   }
-  return payload;
+  return { status: res.status, data };
+}
+
+/** 只要响应体：绝大多数调用不关心 200 / 201 的区别。 */
+async function api(method, path, body) {
+  return (await apiRaw(method, path, body)).data;
 }
 
 /** 建节点：props 里 text 走 textContent，on* 走事件，其余走 setAttribute。 */
@@ -77,9 +77,14 @@ function el(tag, props = {}, ...children) {
   return node;
 }
 
-/** 在页面的 #notice 上显示一条提示（busy / ok / error）。 */
-function say(text, kind) {
-  const box = document.getElementById('notice');
+/** 状态徽标：tone = ok / warn / danger / muted。 */
+function badge(text, tone) {
+  return el('span', { class: 'badge', 'data-tone': tone || null, text });
+}
+
+/** 在某个 live region 上显示一条提示（默认页面级 #notice）。 */
+function say(text, kind, id) {
+  const box = document.getElementById(id || 'notice');
   if (!box) return;
   box.textContent = text;
   box.dataset.kind = kind || '';
@@ -114,109 +119,36 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ---- 同步与缓存看板 ----
+// ---- 概览 ----
 
-function initStatus() {
-  const totalsBox = document.getElementById('totals');
-  const sourcesBody = document.getElementById('sources');
-  const configBody = document.getElementById('config');
-  const form = document.getElementById('settings-form');
-  const saveBtn = document.getElementById('settings-save');
-  const hint = document.getElementById('settings-hint');
-  const jellyfinBody = document.getElementById('jellyfin');
-  const jellyfinBtn = document.getElementById('jellyfin-sync');
-  const jellyfinHint = document.getElementById('jellyfin-hint');
-  const jellyfinProgress = document.getElementById('jellyfin-progress');
+function initOverview() {
+  const summaryBox = document.getElementById('summary');
+  const sourcesBox = document.getElementById('sources');
+  const writeHint = document.getElementById('write-hint');
+  const jfBadge = document.getElementById('jellyfin-badge');
+  const jfWhen = document.getElementById('jellyfin-when');
+  const jfIssues = document.getElementById('jellyfin-issues');
+  const jfProgress = document.getElementById('jellyfin-progress');
+  const jfBtn = document.getElementById('jellyfin-sync');
+  const jfHint = document.getElementById('jellyfin-hint');
+  const dramaForm = document.getElementById('drama-form');
+  const dramaInput = document.getElementById('series-id');
+  const dramaBtn = document.getElementById('drama-submit');
 
-  // 表单字段 ↔ settings 键。页面不另写一份校验：值原样交给 PATCH，越界由服务端的
-  // 注册表拒（400），这里只显示服务端给的原因。
-  const fields = {
-    strm_prefix: 'set-strm-prefix',
-    cache_max_mb: 'set-cache-max-mb',
-    cache_lru_days: 'set-cache-lru-days',
-    merge_chunk_size: 'set-merge-chunk-size',
-    refresh_interval_sec: 'set-refresh-interval',
-  };
+  let status = null; // 最近一次 /api/status：令牌改动后据此重画按钮，不必再打服务端
+  let jellyfinPolling = false;
 
-  // WebDAV 凭据只写不读：/api/status 只报「是否已设置」，不回传值（凭据不该被多抄一份
-  // 到浏览器），所以这两项没有基线，留空 = 不改。
-  const credentials = {
-    webdav_user: 'set-webdav-user',
-    webdav_pass: 'set-webdav-pass',
-  };
+  const canWrite = () => Boolean(status && status.admin_token_set && adminToken() !== '');
 
-  // Jellyfin 的四项可改配置：输入框 id、settings 键、/api/status 里的字段名三者不同名，
-  // 所以逐项列出来（不靠命名约定拼字符串）。它们不在 config 块里，基线单独存一份。
-  const jellyfinFields = [
-    { key: 'jellyfin_url', id: 'set-jellyfin-url', view: 'url' },
-    { key: 'jellyfin_library_root', id: 'set-jellyfin-root', view: 'library_root' },
-    { key: 'jellyfin_library_prefix', id: 'set-jellyfin-prefix', view: 'library_prefix' },
-    { key: 'jellyfin_timeout_sec', id: 'set-jellyfin-timeout', view: 'timeout_sec' },
-  ];
-  let jellyfinBaseline = {};
-
-  let baseline = {}; // 上次读到的值：提交时只发改过的项（清空 strm_prefix 也算改）
-  let prefilled = false; // 表单只在首次加载与保存成功后回填，不冲掉正在打的值
-  let adminWritable = false; // 服务端有没有配 DRAMA_HUB_ADMIN_TOKEN
-
-  function stat(label, value, small) {
-    return el('div', {},
-      el('dt', { text: label }),
-      el('dd', { class: small ? 'small' : null, text: value }));
+  function renderSummary(t) {
+    summaryBox.replaceChildren(
+      el('span', {}, el('b', { text: String(t.dramas) }), ' 部剧'),
+      el('span', {}, el('b', { text: String(t.episodes) }), ' 集'),
+      el('span', {}, el('b', { text: String(t.emby_items) }), ' 个对外集'),
+      el('span', {}, '最近同步 ', el('b', { text: fmtTime(t.last_sync_at) })));
   }
 
-  function row(name, value, timing, note, mono) {
-    return el('tr', {},
-      el('td', { text: name }),
-      el('td', { class: mono ? 'mono' : null }, value instanceof Node ? value : String(value)),
-      el('td', { class: 'hint', text: timing }),
-      el('td', { class: 'hint', text: note }));
-  }
-
-  function flag(set) {
-    return el('span', { class: set ? 'tag' : 'tag warn', text: set ? '已设置' : '未设置' });
-  }
-
-  // sourceRow 渲染一个播放源：调度状态（上次运行/上次成功/下次/上次错误）来自
-  // /api/status 的调度字段，说明与配置来自 settings 现状。
-  function sourceRow(src) {
-    const state = src.running
-      ? el('span', { class: 'tag', text: '正在刷新' })
-      : src.enabled
-        ? el('span', { class: 'tag', text: '已启用' })
-        : el('span', { class: 'tag warn', text: '已停用' });
-    // base_url / request_timeout_sec 是启动时注入插件的构造期配置：显示正在生效的
-    // 值，并明说 settings 现值是否还要重启才生效。
-    const bootNote = 'base_url 生效值 ' +
-      (src.base_url_effective === '' ? '插件内置默认' : src.base_url_effective) +
-      '，请求超时生效值 ' + src.request_timeout_sec_effective + ' 秒（重启后生效），间隔 ' +
-      src.interval_sec + ' 秒' +
-      (src.restart_required
-        ? '；settings 现值（base_url ' + (src.base_url === '' ? '空' : src.base_url) +
-          ' / 超时 ' + src.request_timeout_sec + ' 秒）重启后生效'
-        : '');
-    const note = src.reason !== '' ? src.reason : bootNote;
-    const error = src.last_error === ''
-      ? '—'
-      : el('span', { class: 'mono', text: src.last_error });
-    return el('tr', {},
-      el('td', { text: src.label === src.name ? src.name : src.name + '（' + src.label + '）' }),
-      el('td', {}, state),
-      el('td', { class: 'mono', text: fmtTime(src.last_run_at) }),
-      el('td', { class: 'mono', text: fmtTime(src.last_ok_at) }),
-      el('td', { class: 'mono', text: fmtTime(src.next_due_at) }),
-      el('td', { class: 'hint' }, el('div', { text: note }), error),
-      el('td', { class: 'num' },
-        el('button', {
-          type: 'button', class: 'btn ghost', text: '立即刷新',
-          disabled: src.running || !src.enabled,
-          onclick: (event) => refreshSource(src, event.currentTarget),
-        })));
-  }
-
-  // refreshSource 打手动触发端点：202 = 一轮已派出去，409 = 该源正在跑，
-  // 401 = 没带对管理令牌，404 = 没有这个源或已停用。结果都回读 /api/status
-  // （不猜这一轮的结局）。
+  // refreshSource 打手动触发端点；202 / 409 / 401 / 404 之后一律回读 /api/status，不猜结局。
   async function refreshSource(src, button) {
     button.disabled = true;
     say('已请求刷新 ' + src.name + ' …', 'busy');
@@ -229,114 +161,79 @@ function initStatus() {
     await load();
   }
 
-  // renderConfig 渲染「运行配置」表：每行都带生效时机（MKACG-617 的生效性矩阵）。
-  function renderConfig(c) {
-    configBody.replaceChildren(
-      row('strm 前缀', c.strm_prefix === '' ? '空（按请求 Host 推导）' : c.strm_prefix, '即时',
-        'strm 内 URL 前缀；空 = 用访问本服务的 Host 拼绝对地址，填了就用填的（写入时去掉尾 /）', true),
-      row('缓存目录', c.cache_dir, '即时',
-        'cache_dir，海报与分片落 <cache_dir>/{cover,seg}，写入中的临时文件在 tmp/', true),
-      row('缓存上限', c.cache_max_mb + ' MB', '≤5 分钟',
-        'cache_max_mb，0 = 不按大小淘汰；下一轮淘汰生效'),
-      row('缓存保留', c.cache_lru_days + ' 天', '≤5 分钟',
-        'cache_lru_days，超过 N 天未命中的条目删除'),
-      row('合并分块集数', c.merge_chunk_size + ' 集 / 对外集', '即时',
-        'merge_chunk_size，每 N 集并成 1 条对外剧集；下一次列举 / 播放就按新分块，旧 id 随即 404'),
-      row('刷新间隔', c.refresh_interval_sec + ' 秒', '≤60 秒',
-        'refresh_interval_sec，一轮到期 = 上次运行 + 本值'),
-      row('每轮存量部数', String(c.refresh_batch), '即时', 'refresh_batch，0 = 关闭存量轮转'),
-      row('单轮预算', c.refresh_timeout_sec + ' 秒', '即时',
-        'refresh_timeout_sec，超时后下一轮按游标续跑'),
-      row('出流签名密钥', flag(c.stream_secret_set), '即时',
-        'stream_secret（ADR-0003）；换了之后所有旧 URL 失效'),
-      row('WebDAV 用户', flag(c.webdav_user_set), '即时', 'webdav_user'),
-      row('WebDAV 密码', flag(c.webdav_pass_set), '即时', 'webdav_pass'));
-  }
-
-  // fillSettings 把库里现在的值填进表单，并记成基线（提交时只发改过的项）。
-  function fillSettings(c) {
-    baseline = {};
-    for (const [key, id] of Object.entries(fields)) {
-      baseline[key] = String(c[key]);
-      document.getElementById(id).value = baseline[key];
+  function sourceCard(src) {
+    const name = src.label === src.name ? src.name : src.label;
+    const state = src.running
+      ? badge('正在刷新', 'warn')
+      : src.enabled ? badge('已启用', 'ok') : badge('已停用', 'danger');
+    const meta = name === src.name ? [] : [el('p', { class: 'card-sub', text: src.name })];
+    const body = el('div', { class: 'card-body' },
+      el('dl', { class: 'kv' },
+        el('dt', { text: '上次运行' }), el('dd', { title: src.last_run_at, text: fmtTime(src.last_run_at) }),
+        el('dt', { text: '上次成功' }), el('dd', { title: src.last_ok_at, text: fmtTime(src.last_ok_at) }),
+        el('dt', { text: '下次计划' }), el('dd', { title: src.next_due_at, text: fmtTime(src.next_due_at) })));
+    if (src.last_error !== '') {
+      body.append(el('p', { class: 'alert' }, el('b', { text: '上次错误' }), el('span', { text: src.last_error })));
     }
-    setCredentialPlaceholders(c);
+    if (src.reason !== '') {
+      body.append(el('p', { class: 'alert', 'data-tone': 'warn' }, el('span', { text: src.reason })));
+    }
+    if (src.restart_required) {
+      // base_url / 超时是启动时注入插件的构造期配置：改了要重启，页面上直说。
+      body.append(el('p', { class: 'hint', text:
+        'base_url 生效值 ' + (src.base_url_effective === '' ? '插件内置默认' : src.base_url_effective) +
+        '，请求超时生效值 ' + src.request_timeout_sec_effective + ' 秒；settings 现值（base_url ' +
+        (src.base_url === '' ? '空' : src.base_url) + ' / 超时 ' + src.request_timeout_sec +
+        ' 秒）重启后生效。' }));
+    }
+    body.append(el('p', { class: 'hint', text: '刷新间隔 ' + src.interval_sec + ' 秒。' }));
+    const button = el('button', {
+      type: 'button', class: 'btn', text: '立即刷新',
+      disabled: !src.enabled,
+      onclick: (event) => refreshSource(src, event.currentTarget),
+    });
+    button.dataset.refresh = src.name;
+    return el('article', { class: 'card' },
+      el('header', { class: 'card-head' },
+        el('div', {}, el('h2', { text: name }), meta), state),
+      body,
+      el('footer', { class: 'card-foot' }, button));
   }
 
-  // setCredentialPlaceholders 把「已设置 / 未设置」写在凭据输入框的占位符里：
-  // 值本身不回显（/api/status 只给 *_set 标志）。
-  function setCredentialPlaceholders(c) {
-    document.getElementById('set-webdav-user').value = '';
-    document.getElementById('set-webdav-user').placeholder =
-      c.webdav_user_set ? '已设置，留空不改' : '未设置（/webdav 恒 401）';
-    document.getElementById('set-webdav-pass').value = '';
-    document.getElementById('set-webdav-pass').placeholder =
-      c.webdav_pass_set ? '已设置，留空不改' : '未设置（/webdav 恒 401）';
-  }
-
-  // syncHint 说明「现在能不能写」：没配 env 令牌就写不了；配了但要先在顶栏填上。
-  function syncHint() {
-    if (!adminWritable) {
-      saveBtn.disabled = true;
-      jellyfinBtn.disabled = true;
-      hint.textContent = '未设置 DRAMA_HUB_ADMIN_TOKEN：后台改配置不可用（所有写操作都会 401）。' +
-        '在服务端加上这个 env 再重启，然后用这个表单改配置。';
-      jellyfinHint.textContent = '同步媒体库是写操作，同样需要 DRAMA_HUB_ADMIN_TOKEN。';
+  function renderSources(sources) {
+    if (sources.length === 0) {
+      sourcesBox.replaceChildren(el('p', { class: 'state', 'data-state': 'empty',
+        text: '还没有注册播放源；在服务端配置源插件后重启。' }));
       return;
     }
-    saveBtn.disabled = adminToken() === '';
-    jellyfinBtn.disabled = adminToken() === '';
-    jellyfinHint.textContent = adminToken() === ''
-      ? '先在顶栏「管理令牌」里填 DRAMA_HUB_ADMIN_TOKEN，再点「同步媒体库」（令牌只存在本标签页）。'
-      : '只增不删：分类消失只在这里列成「孤儿库」。';
-    hint.textContent = adminToken() === ''
-      ? '先在顶栏「管理令牌」里填 DRAMA_HUB_ADMIN_TOKEN，再保存（令牌只存在本标签页）。'
-      : '写 PATCH /api/settings；非法值整批拒绝（400）且库里不动；密码不回显，留空表示不改。';
+    sourcesBox.replaceChildren(...sources.map(sourceCard));
   }
 
-  // renderJellyfin 渲染媒体库现状：配置四项 + 上次结果。孤儿库只报告，prune 不进 UI
-  // （破坏性动作只走 API，少一个误点路径）。
   function renderJellyfin(j) {
-    const orphans = j.orphans.length === 0 ? '—' : j.orphans.join('、');
-    const conflicts = j.conflicts.length === 0 ? '—' : j.conflicts.join('、');
-    const missing = j.missing.length === 0 ? '' : '（缺 ' + j.missing.join('、') + '）';
-    const state = j.running
-      ? el('span', { class: 'tag', text: '正在同步' })
-      : j.configured
-        ? el('span', { class: 'tag', text: '已启用' })
-        : el('span', { class: 'tag warn', text: '未配置' });
-    jellyfinBody.replaceChildren(
-      row('状态', el('span', {}, state, missing), '即时',
-        '地址 / API key / 媒体库根三项都非空才启用；留空 = 整段关闭'),
-      row('地址', j.url === '' ? '—' : j.url, '即时', 'jellyfin_url', true),
-      row('媒体库根', j.library_root === '' ? '—' : j.library_root, '即时',
-        'jellyfin_library_root，必须是 Jellyfin 容器内看到的路径', true),
-      row('库名前缀', j.library_prefix, '即时',
-        'jellyfin_library_prefix，只操作带这个前缀的库'),
-      row('API key', flag(j.api_key_set), '即时', 'jellyfin_api_key（只写不读，状态面不返回值）'),
-      row('单次超时', j.timeout_sec + ' 秒', '即时', 'jellyfin_timeout_sec，每次出站请求一个超时'),
-      row('上次同步', fmtTime(j.last_run_at) +
-        (j.last_run_at === '' ? '' : '（耗时 ' + fmtDuration(j.duration_ms) + '）'), '—',
-        '状态只在内存里：重启后回到「未运行」；刷新页面从 GET /api/jellyfin/libraries 读回'),
-      row('上次成功', fmtTime(j.last_ok_at), '—', '孤儿与同名冲突不算失败，也会推进这一项'),
-      row('上次错误', j.last_error === '' ? '—' : el('span', { class: 'mono', text: j.last_error }), '—',
-        'Jellyfin 不可用只影响这一段：同步、WebDAV、播放都不受影响'),
-      row('上次新建', String(j.created), '—', '这一轮建了几个库'),
-      row('上次已存在', String(j.unchanged), '—',
-        '分类已有自管库、这一轮一个字段都没动的条数（幂等命中）。本服务不改已存在的库，所以没有「更新」'),
-      row('上次删除', String(j.removed), '—', 'prune 删掉的自管孤儿库数；默认不删，恒 0'),
-      row('结果未知', String(j.uncertain), '—',
-        '建库请求超时、Jellyfin 侧是否建成不确定的条数（不计入新建）。下一轮同步会以列库结果收口'),
-      row('被拒分类', j.failed.length === 0 ? '—' : el('span', { class: 'mono', text: j.failed.join('、') }), '—',
-        'Jellyfin 拒绝建库的分类：多半是库路径在 Jellyfin 容器内不存在。修好路径后下一轮自动补上'),
-      row('孤儿库', orphans, '—',
-        '分类已消失的自管库。默认不删，删除走 POST /api/jellyfin/libraries {"prune":true}'),
-      row('冲突库', conflicts, '—', '同名库不是本服务建的：不建、不删、不接管'));
+    const missing = j.missing.length === 0 ? '' : ' · 缺 ' + j.missing.join('、');
+    const text = j.running
+      ? '正在同步'
+      : !j.configured
+        ? '未配置'
+        : j.last_error !== '' ? '上次失败' : '已启用';
+    const tone = j.running ? 'warn' : !j.configured ? 'muted' : j.last_error !== '' ? 'danger' : 'ok';
+    jfBadge.textContent = text + missing;
+    jfBadge.dataset.tone = tone;
+    jfWhen.textContent = j.last_run_at === '' ? '还没有同步过' : '上次同步 ' + fmtTime(j.last_run_at);
+
+    const groups = [
+      ['孤儿库', j.orphans],
+      ['冲突库', j.conflicts],
+      ['被拒分类', j.failed],
+    ].filter(([, list]) => list.length > 0);
+    jfIssues.replaceChildren(...groups.map(([label, list]) =>
+      el('div', { class: 'issue' },
+        el('h3', { text: label }),
+        el('ul', {}, ...list.map((item) => el('li', { text: item }))))));
   }
 
   // jellyfinResultText 把「这一轮做了什么」写成一句话（MKACG-664 AC-2）。
-  // 「更新」恒 0：已存在的库一律不改（不重命名、不改路径，幂等），写出来并带上解释，
-  // 免得人以为是「更新数没显示」。last_error 已包含被拒分类与结果未知的细节，直接接上。
+  // 「更新」恒 0：已存在的库一律不改（不重命名、不改路径，幂等）。
   function jellyfinResultText(j) {
     let text = '新建 ' + j.created + '、更新 0（已存在的库不改动）、已存在 ' + j.unchanged +
       '、删除 ' + j.removed + '、失败 ' + j.failed.length +
@@ -345,9 +242,7 @@ function initStatus() {
     return text;
   }
 
-  // renderJellyfinProgress 画「正在跑」或「上次同步：时间 + 结果」那一行。
-  // 两态共用一行：运行中给出阶段 / 已处理 / 开始时间 / 已用时间，收尾后给出本轮结果。
-  // 内容全部来自状态面，所以刷新页面看到的仍是同一句话（不需要额外持久化）。
+  // 664：运行中显示阶段与进度；收尾后显示上次同步时间与结果。
   function renderJellyfinProgress(j) {
     if (j.running) {
       const parts = ['运行中'];
@@ -357,25 +252,19 @@ function initStatus() {
         parts.push('开始于 ' + fmtTime(j.started_at));
         parts.push('已用 ' + fmtDuration(Date.now() - Date.parse(j.started_at)));
       }
-      jellyfinProgress.textContent = parts.join(' · ');
-      jellyfinProgress.dataset.kind = 'busy';
+      jfProgress.textContent = parts.join(' · ');
+      jfProgress.dataset.kind = 'busy';
       return;
     }
-    jellyfinProgress.dataset.kind = j.last_error === '' ? 'ok' : 'error';
-    jellyfinProgress.textContent = j.last_run_at === ''
+    jfProgress.dataset.kind = j.last_error === '' ? 'ok' : 'error';
+    jfProgress.textContent = j.last_run_at === ''
       ? ''
       : '上次同步：' + fmtTime(j.last_run_at) + ' · ' + jellyfinResultText(j);
   }
 
-  // JELLYFIN_POLL_MS 是轮询间隔：一轮建库是按个串行发请求，1 秒足够看出进度在动。
-  // JELLYFIN_POLL_MAX_MS 是轮询上限（一轮最长 = 单次超时 × (库数 + 1)，30 分钟封顶）：
-  // 到点停止自动刷新，别让一个已经失控的页面永远每秒钟打服务端。
   const JELLYFIN_POLL_MS = 1000;
   const JELLYFIN_POLL_MAX_MS = 30 * 60 * 1000;
-  let jellyfinPolling = false;
 
-  // followJellyfin 轮询 GET /api/jellyfin/libraries 直到这一轮收尾。
-  // 轮询这个端点而不是 /api/status：后者每次都要全量统计 drama / episode 表。
   async function followJellyfin() {
     if (jellyfinPolling) return; // 同一时刻只留一条轮询链（load 与按钮都会进来）
     jellyfinPolling = true;
@@ -398,9 +287,177 @@ function initStatus() {
     } finally {
       jellyfinPolling = false;
     }
+    // 收尾后再读一次状态：updateWritable 用最新的 running 把「同步媒体库」
+    // 等写操作按钮放回来。（超时 return 的路径仍在跑，不刷新。）
+    await load().catch(fail);
   }
 
-  // fillJellyfin 把媒体库配置填进表单并记基线；api key 永远留空（只写不读）。
+  async function syncJellyfin() {
+    jfBtn.disabled = true;
+    say('已请求同步 Jellyfin 媒体库 …', 'busy');
+    try {
+      await api('POST', '/api/jellyfin/libraries', {});
+      say('', ''); // 进度与结果在卡片里，notice 不留一句立刻过时的话
+    } catch (err) {
+      // 409 不是故障：单飞锁挡住了重复派发，页面说「已在运行」而不是报红色错误。
+      if (err.status === 409) say('Jellyfin 媒体库同步已在运行，接着显示这一轮的进度', 'busy');
+      else fail(err);
+    } finally {
+      jfBtn.disabled = false;
+      await load().catch(fail);
+      await followJellyfin();
+    }
+  }
+
+  function updateWritable() {
+    if (!status) return;
+    const ready = canWrite();
+    if (!status.admin_token_set) {
+      writeHint.textContent = '未设置 DRAMA_HUB_ADMIN_TOKEN：刷新、同步与改配置都会 401。在服务端加上这个 env 再重启。';
+    } else if (adminToken() === '') {
+      writeHint.textContent = '先在顶栏「管理令牌」里填 DRAMA_HUB_ADMIN_TOKEN，再操作（令牌只存在本标签页）。';
+    } else {
+      writeHint.textContent = '';
+    }
+    jfBtn.disabled = !ready || status.jellyfin.running;
+    dramaBtn.disabled = !ready;
+    for (const button of sourcesBox.querySelectorAll('button[data-refresh]')) {
+      button.disabled = !ready;
+      if (status.sources.some((src) => src.name === button.dataset.refresh && (!src.enabled || src.running))) {
+        button.disabled = true;
+      }
+    }
+    jfHint.textContent = !status.jellyfin.configured
+      ? '还缺 ' + status.jellyfin.missing.join('、') + '；地址 / API key / 媒体库根三项都非空才启用。'
+      : ready
+        ? '只增不删：分类消失只在这里列成「孤儿库」。'
+        : '同步媒体库是写操作，需要先在顶栏填管理令牌。';
+  }
+
+  async function load() {
+    try {
+      status = await api('GET', '/api/status');
+    } catch (err) {
+      summaryBox.textContent = '读取失败';
+      sourcesBox.replaceChildren(el('p', { class: 'state', 'data-state': 'error' },
+        err.message + ' ',
+        el('button', { type: 'button', class: 'btn', text: '重试', onclick: () => load() })));
+      fail(err);
+      return;
+    }
+    renderSummary(status.totals);
+    renderSources(status.sources);
+    renderJellyfin(status.jellyfin);
+    renderJellyfinProgress(status.jellyfin);
+    updateWritable();
+    // 刷新 / 首次打开时这一轮可能还在跑：接着看，不必等用户再点一次。
+    if (status.jellyfin.running) followJellyfin();
+  }
+
+  dramaForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const raw = dramaInput.value.trim();
+    if (raw === '') {
+      say('先填上游剧 id 或 /player/ 链接', 'error', 'drama-notice');
+      return;
+    }
+    const digits = raw.match(/\d+/g);
+    const sid = digits === null ? '' : digits[digits.length - 1];
+    dramaBtn.disabled = true;
+    say('正在从上游同步 …', 'busy', 'drama-notice');
+    try {
+      const { status: code, data } = await apiRaw('POST', '/api/dramas', { series_id: raw });
+      const hit = data && data.dramas ? data.dramas.find((d) => d.provider_id === sid) : null;
+      const title = hit ? '《' + hit.title + '》' : '这部剧';
+      const extra = hit ? '，库里 ' + hit.episodes + ' 集' : '';
+      say(code === 201
+        ? '已新建 ' + title + extra + '（201）'
+        : title + ' 已在库，这次只更新' + extra + '（200）', 'ok', 'drama-notice');
+      dramaInput.value = '';
+      await load();
+    } catch (err) {
+      say(err.message, 'error', 'drama-notice');
+    } finally {
+      dramaBtn.disabled = !canWrite();
+    }
+  });
+
+  jfBtn.addEventListener('click', syncJellyfin);
+
+  const tokenInput = document.getElementById('admin-token');
+  if (tokenInput) tokenInput.addEventListener('input', updateWritable);
+
+  load();
+}
+
+// ---- 设置 ----
+
+function initSettings() {
+  const form = document.getElementById('settings-form');
+  const saveBtn = document.getElementById('settings-save');
+  const hint = document.getElementById('settings-hint');
+  const readonlyBox = document.getElementById('readonly');
+
+  const fields = {
+    strm_prefix: 'set-strm-prefix',
+    cache_max_mb: 'set-cache-max-mb',
+    cache_lru_days: 'set-cache-lru-days',
+    merge_chunk_size: 'set-merge-chunk-size',
+    refresh_interval_sec: 'set-refresh-interval',
+  };
+
+  const credentials = {
+    webdav_user: 'set-webdav-user',
+    webdav_pass: 'set-webdav-pass',
+  };
+
+  const jellyfinFields = [
+    { key: 'jellyfin_url', id: 'set-jellyfin-url', view: 'url' },
+    { key: 'jellyfin_library_root', id: 'set-jellyfin-root', view: 'library_root' },
+    { key: 'jellyfin_library_prefix', id: 'set-jellyfin-prefix', view: 'library_prefix' },
+    { key: 'jellyfin_timeout_sec', id: 'set-jellyfin-timeout', view: 'timeout_sec' },
+  ];
+  let jellyfinBaseline = {};
+  let baseline = {}; // 提交时只发改过的项
+  let prefilled = false; // 只在首次加载与保存成功后回填，不冲掉正在打的值
+  let adminWritable = false; // 服务端有没有配 DRAMA_HUB_ADMIN_TOKEN
+
+  const canWrite = () => adminWritable && adminToken() !== '';
+
+  function flag(set, yes, no) {
+    return el('span', { class: 'badge', 'data-tone': set ? 'ok' : 'muted', text: set ? yes : no });
+  }
+
+  function renderReadonly(c, j) {
+    readonlyBox.replaceChildren(
+      el('dt', { text: '缓存目录' }), el('dd', { class: 'mono', text: c.cache_dir }),
+      el('dt', { text: '每轮存量部数' }), el('dd', { text: c.refresh_batch + (c.refresh_batch === 0 ? '（0 = 关闭存量轮转）' : '') }),
+      el('dt', { text: '单轮预算' }), el('dd', { text: c.refresh_timeout_sec + ' 秒（超时后下一轮按游标续跑）' }),
+      el('dt', { text: '出流签名密钥' }), el('dd', {}, flag(c.stream_secret_set, '已设置', '未设置')),
+      el('dt', { text: 'WebDAV 凭据' }), el('dd', {},
+        flag(c.webdav_user_set, '用户已设置', '用户未设置'), ' ',
+        flag(c.webdav_pass_set, '密码已设置', '密码未设置')),
+      el('dt', { text: 'Jellyfin API key' }), el('dd', {}, flag(j.api_key_set, '已设置', '未设置')));
+  }
+
+  function fillSettings(c) {
+    baseline = {};
+    for (const [key, id] of Object.entries(fields)) {
+      baseline[key] = String(c[key]);
+      document.getElementById(id).value = baseline[key];
+    }
+    setCredentialPlaceholders(c);
+  }
+
+  function setCredentialPlaceholders(c) {
+    document.getElementById('set-webdav-user').value = '';
+    document.getElementById('set-webdav-user').placeholder =
+      c.webdav_user_set ? '已设置，留空不改' : '未设置（/webdav 恒 401）';
+    document.getElementById('set-webdav-pass').value = '';
+    document.getElementById('set-webdav-pass').placeholder =
+      c.webdav_pass_set ? '已设置，留空不改' : '未设置（/webdav 恒 401）';
+  }
+
   function fillJellyfin(j) {
     jellyfinBaseline = {};
     for (const f of jellyfinFields) {
@@ -410,49 +467,33 @@ function initStatus() {
     setJellyfinKeyPlaceholder(j);
   }
 
-  // setJellyfinKeyPlaceholder 只更新 key 输入框的占位符与清空值：值不回显。
   function setJellyfinKeyPlaceholder(j) {
     const input = document.getElementById('set-jellyfin-api-key');
     input.value = '';
     input.placeholder = j.api_key_set ? '已设置，留空不改' : '未设置（这一段不启用）';
   }
 
-  // syncJellyfin 手动触发一轮媒体库同步：202 = 已派出去（随后轮询进度），
-  // 409 = 上一轮还在跑（同样接着显示那一轮的进度），400 = 三项没配齐（响应体点名缺哪个键）。
-  // 结果一律回读状态面，不猜结局。
-  async function syncJellyfin() {
-    jellyfinBtn.disabled = true;
-    say('已请求同步 Jellyfin 媒体库 …', 'busy');
-    try {
-      await api('POST', '/api/jellyfin/libraries', {});
-      // 进度与结果都在下面那一行，notice 里不留一句立刻就会过时的话。
-      say('', '');
-    } catch (err) {
-      // 409 不是故障：单飞锁挡住了重复派发。页面要说「已在运行」而不是报一个红色错误，
-      // 然后照样把正在跑的那一轮显示出来（AC-4）。
-      if (err.status === 409) say('Jellyfin 媒体库同步已在运行，接着显示这一轮的进度', 'busy');
-      else fail(err);
-    } finally {
-      jellyfinBtn.disabled = false;
-      await load().catch(fail);
-      await followJellyfin();
+  function updateHint() {
+    if (!adminWritable) {
+      saveBtn.disabled = true;
+      hint.textContent = '未设置 DRAMA_HUB_ADMIN_TOKEN：后台改配置不可用（所有写操作都会 401）。' +
+        '在服务端加上这个 env 再重启，然后用这个表单改配置。';
+      return;
     }
+    saveBtn.disabled = adminToken() === '';
+    hint.textContent = adminToken() === ''
+      ? '先在顶栏「管理令牌」里填 DRAMA_HUB_ADMIN_TOKEN，再保存（令牌只存在本标签页）。'
+      : '只提交改动过的项；密码与 API key 不回显，留空表示不改。';
   }
 
   async function load() {
-    const status = await api('GET', '/api/status');
-    const t = status.totals;
-    totalsBox.replaceChildren(
-      stat('剧目', String(t.dramas)),
-      stat('集', String(t.episodes)),
-      stat('对外集', String(t.emby_items)),
-      stat('最近同步', fmtTime(t.last_sync_at), true));
-    renderConfig(status.config);
-    renderJellyfin(status.jellyfin);
-    renderJellyfinProgress(status.jellyfin);
-    // 刷新 / 首次打开时这一轮可能还在跑：接着看，不必等用户再点一次。
-    if (status.jellyfin.running) followJellyfin();
-    sourcesBody.replaceChildren(...status.sources.map(sourceRow));
+    let status;
+    try {
+      status = await api('GET', '/api/status');
+    } catch (err) {
+      fail(err);
+      return;
+    }
     adminWritable = status.admin_token_set === true;
     if (!prefilled) {
       prefilled = true;
@@ -463,7 +504,8 @@ function initStatus() {
       setCredentialPlaceholders(status.config);
       setJellyfinKeyPlaceholder(status.jellyfin);
     }
-    syncHint();
+    renderReadonly(status.config, status.jellyfin);
+    updateHint();
   }
 
   form.addEventListener('submit', async (event) => {
@@ -478,7 +520,8 @@ function initStatus() {
       if (value !== '') payload[key] = value;
     }
     for (const f of jellyfinFields) {
-      const value = document.getElementById(f.id).value.trim();
+      // 前缀里的尾随空格有意义（`短剧 · `），这里不 trim，否则每次保存都会被当成改动重发。
+      const value = document.getElementById(f.id).value;
       if (value !== (jellyfinBaseline[f.key] || '')) payload[f.key] = value;
     }
     // key 只写不读：留空 = 不改（要清空就显式传空串，这条只走 API）。
@@ -507,25 +550,23 @@ function initStatus() {
       }
       for (const id of Object.values(credentials)) document.getElementById(id).value = '';
       document.getElementById('set-jellyfin-api-key').value = '';
-      say('已写入：' + Object.keys(data.settings).join('、') + '（生效时机见「运行配置」）', 'ok');
+      say('已写入：' + Object.keys(data.settings).join('、') + '（生效时机见各字段徽标）', 'ok');
       await load();
     } catch (err) {
       fail(err);
     } finally {
-      syncHint();
+      updateHint();
     }
   });
 
-  jellyfinBtn.addEventListener('click', syncJellyfin);
-
-  // 顶栏令牌改动后立刻更新提示与按钮状态。
   const tokenInput = document.getElementById('admin-token');
-  if (tokenInput) tokenInput.addEventListener('input', syncHint);
+  if (tokenInput) tokenInput.addEventListener('input', updateHint);
 
-  load().catch(fail);
+  load();
 }
 
 // ---- 分派 ----
 
 initAdminToken();
-if (document.body.dataset.page === 'status') initStatus();
+if (document.body.dataset.page === 'overview') initOverview();
+if (document.body.dataset.page === 'settings') initSettings();

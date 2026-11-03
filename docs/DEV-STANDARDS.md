@@ -127,7 +127,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 | `DRAMA_HUB_CACHE_DIR` | `cache_dir` | 镜像里默认 `/data/cache`（`WORKDIR /data`，相对默认值会落成 `/data/data/cache`）；裸机默认仍是 `./data/cache` |
 
 **WebDAV 账号密码不走 env**（lxz 2026-10-31 定）：`webdav_user` / `webdav_pass` 是后台配置项，
-由 `PATCH /api/settings` 或 `/status` 页的表单写入（MKACG-622）；env 再种一份就会出现两个
+由 `PATCH /api/settings` 或 `/settings` 页的表单写入（MKACG-622）；env 再种一份就会出现两个
 真值，所以这两个 env 不存在，设了也会按「未知变量」报出来。
 
 拼错或已废弃的 `DRAMA_HUB_*` 变量会打一条 warn，连同**支持的键**一起列出（只报变量名、
@@ -833,13 +833,31 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 ### 页面
 
+页面集合 = 两个页面，同一个 `base.html` + 各自模板；`pages.go` 的 `pageMetaOf` 是唯一
+答案，未登记路径（含旧的 `/status`）一律 404。
+
 | 路径 | 页面 | 能干的事 |
 |---|---|---|
-| `/`、`/status` | 同步与缓存 | 同步计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / `strm_prefix` / 缓存上限与保留期 / 刷新间隔 → `PATCH /api/settings`，每项标签写着生效时机）、各播放源状态（是否启用、正在刷新、上次运行/上次成功/上次错误/下次计划、生效的 `base_url` 与超时、停用原因）、手动「立即刷新」、**Jellyfin 媒体库**（5 个配置输入 + 「同步媒体库」按钮 + 现状表：状态/地址/库根/前缀/API key 是否已设置/上次同步与错误/孤儿库/冲突库）、运行配置现状（密钥只报「是否已设置」，**每行带「生效时机」列**）。缓存面字段（`mode` / `max_size` / …）是 ADR-0004 遗留，已在 MKACG-616 删除 |
+| `/` | 概览（`data-page=overview`） | 摘要条（剧/集/对外集计数与最近同步时间）；每个播放源一张卡片：状态徽标（已启用/已停用/正在刷新）、上次运行/上次成功/下次计划（`title` 给完整 ISO）、仅非空时出现的上次错误、停用原因与「重启后生效」提示、页脚「立即刷新」；Jellyfin 卡片：状态徽标（未配置/已启用/正在同步/上次失败 + 缺哪几项）、上次同步时间、664 的进度与结果行、孤儿/冲突/被拒分类（空则整段不出）、页脚「同步媒体库」；默认收起的「补录 / 查一部剧」（`POST /api/dramas`，201 新建 / 200 只更新） |
+| `/settings` | 设置（`data-page=settings`） | 单表单、单「保存」：访问（WebDAV 用户/密码、`strm_prefix`）、同步与刷新（`refresh_interval_sec`）、合并与对外集号（`merge_chunk_size`）、缓存（`cache_max_mb` / `cache_lru_days`）、Jellyfin（地址 / API key / 媒体库根 / 库名前缀 / 单次超时）；每项带生效时机徽标，只提交改动过的项；底部可折叠「只读运行参数」（`cache_dir` / `refresh_batch` / `refresh_timeout_sec` / 密钥与凭据是否已设置） |
 
-剧目页已在 MKACG-665 删除（人工按剧查看/删除不再需要，对外集号由 `emby_item` 派生并
-按 `merge_chunk_size` 自动切块）：`/` 直接就是这一页，`/status` 保留为稳定链接；单剧补录
-走 `POST /api/dramas`。
+剧目的查看/删除入口已在 MKACG-665 删除（对外集号由 `emby_item` 派生并按
+`merge_chunk_size` 自动切块），补录走概览页的 `<details>` 或 `POST /api/dramas`。
+
+设计系统（MKACG-667）：
+
+- **单一 token 层**在 `:root`：颜色角色 `--bg` / `--surface` / `--ink` / `--ink-2` /
+  `--ink-3` / `--line` / `--line-strong` / `--accent` / `--accent-ink` / `--ok` / `--warn` /
+  `--danger` + 三档状态底 `--ok-bg` / `--warn-bg` / `--danger-bg`；间距 `--s1..--s7` =
+  4/8/12/16/24/32/48；字号 11/12.5/14/17/22；圆角 2（徽标、输入）/ 6（卡片）。
+  深色只在 `@media (prefers-color-scheme: dark)` 里覆盖颜色 token，不写第二套规则。
+- **两页 `<table>` 计数为 0**：播放源与媒体库用卡片，键值用 `dl` —— 删表就是移动端策略，
+  不做 data-label 表格转卡片。窄屏单列、触控目标 ≥44px、长值 `overflow-wrap: anywhere`；
+  ≥880px 概览两列、设置项两列。断点只有 `max-width: 640px` 与 `min-width: 880px` 两个。
+- **复用一组状态件**：`.badge[data-tone]` 状态徽标、`.badge[data-timing]` 生效时机
+  （`immediate` / `refresh` / `evict` / `restart`）、`.alert` 错误与警告、
+  `.state[data-state=loading|empty|error]` 三态。不引入图标库、字体文件、动画关键帧、
+  主题切换开关或任何构建步骤（ADR-0002）。
 
 模板 `templates/*.html` 与 `static/app.css`、`static/app.js` 用 `//go:embed` 进二进制：
 界面没有构建步骤、没有 `package.json`（ADR-0002）。页面 JS 只调下面这些 API，渲染结果
@@ -882,7 +900,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 |---|---|
 | 令牌来源 | env `DRAMA_HUB_ADMIN_TOKEN`（**不是** settings 键：它保护的就是「改 settings」这个动作，放进 settings 会变成改配置不需要令牌） |
 | 传法 | 请求头 `X-Admin-Token: <token>` |
-| 未设令牌 | 所有写端点 **401（fail closed）**：没配 ≠ 不设防，否则新部署会悄悄裸奔。状态页显示「未设置 `DRAMA_HUB_ADMIN_TOKEN`，后台改配置不可用」并禁用保存；`/api/status` 的 `admin_token_set` 报有没有配（不报值） |
+| 未设令牌 | 所有写端点 **401（fail closed）**：没配 ≠ 不设防，否则新部署会悄悄裸奔。页面显示「未设置 `DRAMA_HUB_ADMIN_TOKEN`，后台改配置不可用」并禁用按钮；`/api/status` 的 `admin_token_set` 报有没有配（不报值） |
 | 令牌不符 / 缺失 | 401，`message` 说明缺哪个请求头 |
 | 范围 | 按「方法 + `/api/` 前缀」判定（`Server.ServeHTTP` 里的闸门）：新增写端点默认受保护，不需要逐个登记 |
 | 不受影响 | `GET /api/*`、单页界面、`/webdav/`（Basic 认证）、`/video/`（HMAC 签名）各按自己的口径 |
@@ -897,7 +915,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 - **自管集合 = 三条同时成立**：名字带前缀、`Locations` 只有一个、那个位置正好是 root 的
   直接子目录。判定在 `jellyfin.Diff`（纯函数，表驱动测试覆盖三类「不算自管」）。
-- **只增不删**：分类消失只进 `orphans[]`（状态页 + 日志），删除只走
+- **只增不删**：分类消失只进 `orphans[]`（概览卡片 + 日志），删除只走
   `POST /api/jellyfin/libraries {"prune":true}`，且只删自管孤儿。prune 不进页面 UI。
 - **触发**：手动端点 + `scheduler.runRound` 的轮末钩子（`afterRound`，`saveState` 之后、
   一轮一次）。两者共用一把单飞锁；`Start` 只派 goroutine（`context.WithoutCancel`），

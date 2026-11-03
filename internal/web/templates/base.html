@@ -3,23 +3,26 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>{{.Title}} · drama-hub</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body data-page="{{.Page}}">
+<a class="skip" href="#main">跳到内容</a>
 <header class="topbar">
   <span class="wordmark">drama-hub</span>
   <nav class="tabs" aria-label="管理页">
-    <a href="/status" aria-current="page">同步与缓存</a>
+    <a href="/"{{if eq .Page "overview"}} aria-current="page"{{end}}>概览</a>
+    <a href="/settings"{{if eq .Page "settings"}} aria-current="page"{{end}}>设置</a>
   </nav>
-  <!-- 写操作（同步/改配置）要带 X-Admin-Token；令牌只存在本标签页的 sessionStorage。 -->
-  <label class="field inline token-field" title="DRAMA_HUB_ADMIN_TOKEN：写操作（同步 / 改配置）要带上它">
+  <!-- 写操作（刷新/同步/改配置）要带 X-Admin-Token；令牌只存在本标签页的 sessionStorage。 -->
+  <label class="token" for="admin-token">
     <span>管理令牌</span>
     <input type="password" id="admin-token" autocomplete="off" spellcheck="false"
            placeholder="DRAMA_HUB_ADMIN_TOKEN">
   </label>
 </header>
-<main id="main">
+<main id="main" tabindex="-1">
 {{template "content" .}}
 </main>
 <script src="/static/app.js"></script>

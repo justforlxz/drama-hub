@@ -166,11 +166,11 @@ func TestHandler_RetiredPlaybackPaths(t *testing.T) {
 	}
 }
 
-// TestHandler_ManagementSurface 覆盖 R1 的装配面：管理界面（`/` 与 `/status`）与 `/api/` 都挂在
+// TestHandler_ManagementSurface 覆盖 R1 的装配面：管理界面（`/` 与 `/settings`）与 `/api/` 都挂在
 // 装配根的 `/` 上（不是 404、不是 501），未登记路径仍由 web 的 mux 兜底 404。
 func TestHandler_ManagementSurface(t *testing.T) {
 	h := newTestHandler(t)
-	for _, path := range []string{"/", "/status"} {
+	for _, path := range []string{"/", "/settings"} {
 		rec := serve(t, h, http.MethodGet, path)
 		if rec.Code != http.StatusOK {
 			t.Errorf("GET %s 状态码 = %d, 期望 200（管理面没挂上）", path, rec.Code)

@@ -82,7 +82,7 @@ type Schedule interface {
 // （装配根按注册表给，空表示没有源）；adminToken 是写操作的令牌
 // （`DRAMA_HUB_ADMIN_TOKEN`，空 = 没配 = 写操作一律 401）；logger 用于请求与同步日志。
 //
-// 路由分两类：管理界面（`/`、`/status` 与内嵌的 `/static/`）与管理 API
+// 路由分两类：管理界面（`/`、`/settings` 与内嵌的 `/static/`）与管理 API
 // （`/api/` 子树）。不注册 catch-all：未登记路径由 ServeMux 兜底 404，
 // 这是「未知路径 → 404」的前提（cmd 的装配注释同此约定）。
 //
@@ -102,9 +102,9 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 	}
 
 	// 页面与静态资源：模板与 CSS/JS 随二进制嵌入（ADR-0002，无构建步骤）。
-	// 剧目页删除后 `/` 就是同步与缓存页（MKACG-665）；`/status` 是稳定链接。
-	s.mux.HandleFunc("GET /{$}", s.handleStatusPage)
-	s.mux.HandleFunc("GET /status", s.handleStatusPage)
+	// 页面集合见 pages.go 的 pageMetaOf；未登记路径（含旧的 /status）由 ServeMux 兜底 404。
+	s.mux.HandleFunc("GET /{$}", s.handlePage("overview"))
+	s.mux.HandleFunc("GET /settings", s.handlePage("settings"))
 	s.mux.HandleFunc("GET /static/{file}", s.handleStatic)
 
 	// 管理 API：路径即契约，页面 JS 与脚本只调这些端点（见 docs/DEV-STANDARDS.md）。

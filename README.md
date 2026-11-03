@@ -19,7 +19,7 @@ DRAMA_HUB_ADDR=:8080 ./bin/drama-hub
 ```
 
 启动时自动迁移到最新 schema（库本身要先存在，服务不建库）。`stream_secret` 与 `cache_dir` 由环境变量**只在键缺失时**写入
-一次；WebDAV 账号密码不走 env，用后台配置（`PATCH /api/settings` 或 `/status` 页的表单）
+一次；WebDAV 账号密码不走 env，用后台配置（`PATCH /api/settings` 或 `/settings` 页的表单）
 写入：
 
 ```bash
@@ -28,7 +28,7 @@ DRAMA_HUB_ADMIN_TOKEN=<自己定一个长随机串> ./bin/drama-hub
 ```
 
 `DRAMA_HUB_ADMIN_TOKEN` 是**写操作的令牌**：`POST` / `DELETE` / `PATCH` 必须带
-`X-Admin-Token` 请求头，否则一律 401（没设这个 env 时所有写操作都不可用，状态页会直说）。
+`X-Admin-Token` 请求头，否则一律 401（没设这个 env 时所有写操作都不可用，页面会直说）。
 读操作（页面、`GET /api/*`、WebDAV、播放）不需要它。新部署的完整路径就是：起容器 →
 用令牌写 WebDAV 账号密码 → 可用：
 
@@ -39,7 +39,7 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
   http://127.0.0.1:8080/api/settings
 ```
 
-已有值不会被 env 覆盖；之后改值都走这条接口（或在 `/status` 页上改，每项标着生效时机，
+已有值不会被 env 覆盖；之后改值都走这条接口（或在 `/settings` 页上改，每项标着生效时机，
 见 `docs/DEV-STANDARDS.md`「配置」）。`strm_prefix` 留空时 `.strm` 里的地址按访问的 `Host`
 推导成绝对 URL，默认安装即可直接播放。
 
@@ -61,7 +61,8 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | `/video/{id}.m3u8` | GET / HEAD | 200/401/404/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
 | `/video/{id}/{seq}.m4s` | GET / HEAD | 200/206/401/404/502/503 | 整集 fMP4 分片：本地缓存命中即回，未命中整集转封装并落缓存 |
 | `/s/{token}/…`、`/dav/…` | 任意 | 404 | 已退役（不留兼容层） |
-| `/`、`/status` | GET | 200 | 管理界面：同步与缓存看板（`/` 与 `/status` 是同一页的两个入口） |
+| `/` | GET | 200 | 管理界面：概览（同步计数、播放源调度、Jellyfin 媒体库现状与问题、补录入口） |
+| `/settings` | GET | 200 | 管理界面：设置（访问 / 同步与刷新 / 合并 / 缓存 / Jellyfin 共 12 个可改项，一个保存按钮） |
 | `/static/app.css`、`/static/app.js` | GET | 200 | 内嵌样式与脚本（随二进制，无构建步骤） |
 | `/api/dramas` | GET / POST | 200 / 200·201 | 剧目列表（含计数）/ 按上游剧 id 同步入库：**新建 201、已存在（只更新）200** |
 | `/api/status` | GET | 200 | 同步计数、运行配置现状（含各键的现读值；密钥只报「是否已设置」）、各源调度状态、`jellyfin` 块（媒体库同步现状：配置、上次结果、运行中进度、孤儿库；API key 只报 `api_key_set`）、`admin_token_set`（写操作能不能用） |
@@ -102,21 +103,25 @@ PTS（ADR-0011）。
 
 ## 管理界面
 
-一页，纯 Go 模板 + 原生 JS，随二进制嵌入（没有 `package.json`、没有构建步骤）：
+两页，纯 Go 模板 + 原生 JS，随二进制嵌入（没有 `package.json`、没有构建步骤）：
 
 | 页面 | 能干的事 |
 |---|---|
-| `/`、`/status` 同步与缓存 | 剧目/集/对外集计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / strm 前缀 / 缓存上限与保留期 / 合并分块集数 / 刷新间隔，直接写 `PATCH /api/settings`）、运行配置现状（密钥只显示是否已设置，每行标「生效时机」）、各源调度状态 |
+| `/` 概览 | 摘要条（剧/集/对外集计数与最近同步时间）、每个播放源一张卡片（状态徽标、上次运行/成功/下次计划、上次错误、立即刷新）、Jellyfin 卡片（状态徽标、同步进度与上次结果、孤儿/冲突/被拒分类、同步媒体库）、默认收起的「补录 / 查一部剧」 |
+| `/settings` 设置 | 一个表单、一个「保存」：访问（WebDAV 账号密码 / strm 前缀）、同步与刷新、合并与对外集号、缓存、Jellyfin，每项带生效时机徽标；底部可折叠「只读运行参数」（缓存目录 / 每轮存量 / 单轮预算 / 密钥与凭据是否已设置） |
 
-单剧补录走 `POST /api/dramas`（curl，见下）。页面里的每个操作都直接落到上面的 `/api/`
-端点，渲染结果与 API 返回一致。写操作（同步 / 改配置）要先用顶栏的「管理令牌」填上
-`DRAMA_HUB_ADMIN_TOKEN`，令牌只存在本标签页（`sessionStorage`）。
+页面里的每个操作都直接落到上面的 `/api/` 端点，渲染结果与 API 返回一致；补录走
+`POST /api/dramas`（201 新建、200 已在库只更新）。写操作（刷新 / 同步 / 改配置）要先用
+顶栏的「管理令牌」填上 `DRAMA_HUB_ADMIN_TOKEN`，令牌只存在本标签页（`sessionStorage`）。
+
+界面只有一层 `:root` token（颜色 / 间距 / 字号 / 圆角），深色只覆盖颜色；两页都是 0 张
+表格（卡片 + `dl`），窄屏单列、触控目标 ≥44px；不发请求的纯样式改动不会引入构建步骤。
 
 缓存由本服务自己负责（ADR-0007）：海报与分片落 `<cache_dir>`，按
 `cache_max_mb` / `cache_lru_days` 淘汰，规则见 `docs/CACHE-MODEL.md`；播放字节一律经本
 服务的 `/video/…`，rclone 只剩 WebDAV 只读挂载，不再需要 `--vfs-cache-mode full`。
 （`/api/status` 原先那份 rclone 建议参数属 ADR-0004 遗留，已在 MKACG-616 删除：
-状态页只展示真正参与运行的配置，缓存目录/上限/保留天数都在「运行配置」里。）
+页面只展示真正参与运行的配置，缓存目录/上限/保留天数都在设置页里。）
 
 ```bash
 open http://127.0.0.1:8080/            # 状态页（顶栏填管理令牌后才能同步/改配置）

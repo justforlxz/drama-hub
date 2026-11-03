@@ -17,10 +17,22 @@ import (
 //go:embed templates/*.html static/*
 var assets embed.FS
 
-// statusPageFile 是「同步与缓存」页面的模板，与 templates/base.html 一起渲染。
-//
-// 剧目页删掉后后台只剩这一页（MKACG-665）；`base.html` 的导航随之只剩一个链接。
-const statusPageFile = "templates/status.html"
+// pageMeta 是一页的模板与标题。页面集合只由 pageMetaOf 决定：未收录的路径一律
+// 404（不做 catch-all），所以这张表就是「后台有哪些页面」的唯一答案。
+type pageMeta struct {
+	File  string
+	Title string
+}
+
+var pages = map[string]pageMeta{
+	"overview": {File: "templates/overview.html", Title: "概览"},
+	"settings": {File: "templates/settings.html", Title: "设置"},
+}
+
+// pageMetaOf 查页面集合。调用方只传本包的页面名常量，未登记路径由路由表兜底 404。
+func pageMetaOf(page string) pageMeta {
+	return pages[page]
+}
 
 // pageData 是模板的渲染入参：Page 同时用于高亮导航与 body 的 data-page，
 // 页面 JS 靠 body[data-page] 决定挂哪一段逻辑。
@@ -29,25 +41,25 @@ type pageData struct {
 	Title string
 }
 
-// handleStatusPage 处理 GET / 与 GET /status（同步与缓存看板）。
-//
-// 剧目页删除后 `/` 直接就是这一页；`/status` 保留为稳定链接（MKACG-665）。
-// 后台首页的重设计在 MKACG-667，届时再决定 `/` 是否另作他用。
+// handlePage 渲染一页管理界面（templates/base.html + 该页模板）。
 //
 // 模板每次请求解析：整页几 KB，单用户管理面下这点开销可以忽略，换来的是不持有
 // 包级模板对象。
-func (s *Server) handleStatusPage(w http.ResponseWriter, r *http.Request) {
-	tpl, err := template.ParseFS(assets, "templates/base.html", statusPageFile)
-	if err != nil {
-		httpx.WriteError(w, fmt.Errorf("解析页面模板 %s: %w", statusPageFile, err))
-		return
+func (s *Server) handlePage(page string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		meta := pageMetaOf(page)
+		tpl, err := template.ParseFS(assets, "templates/base.html", meta.File)
+		if err != nil {
+			httpx.WriteError(w, fmt.Errorf("解析页面模板 %s: %w", meta.File, err))
+			return
+		}
+		buf := &bytes.Buffer{}
+		if err := tpl.ExecuteTemplate(buf, "base", pageData{Page: page, Title: meta.Title}); err != nil {
+			httpx.WriteError(w, fmt.Errorf("渲染页面 %s: %w", meta.File, err))
+			return
+		}
+		writeBody(w, http.StatusOK, "text/html; charset=utf-8", buf.Bytes())
 	}
-	buf := &bytes.Buffer{}
-	if err := tpl.ExecuteTemplate(buf, "base", pageData{Page: "status", Title: "同步与缓存"}); err != nil {
-		httpx.WriteError(w, fmt.Errorf("渲染页面 %s: %w", statusPageFile, err))
-		return
-	}
-	writeBody(w, http.StatusOK, "text/html; charset=utf-8", buf.Bytes())
 }
 
 // handleStatic 提供内嵌的样式与脚本。

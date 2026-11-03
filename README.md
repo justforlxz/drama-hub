@@ -66,8 +66,8 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | `/api/dramas` | GET / POST | 200 / 200·201 | 剧目列表（含计数）/ 按上游剧 id 同步入库：**新建 201、已存在（只更新）200** |
 | `/api/dramas/{id}` | DELETE | 204 | 删剧目（级联删集与对外集号） |
 | `/api/dramas/{id}/episodes` | GET | 200 | 该剧全部集（按 `ep_no` 升序） |
-| `/api/status` | GET | 200 | 同步计数、运行配置现状（含各键的现读值；密钥只报「是否已设置」）、各源调度状态、`jellyfin` 块（媒体库同步现状：配置、上次结果、孤儿库；API key 只报 `api_key_set`）、`admin_token_set`（写操作能不能用） |
-| `/api/jellyfin/libraries` | POST | 202 / 400 / 401 / 409 | 手动跑一轮媒体库同步：body 可省或 `{"prune":true}`（显式删自管孤儿库）；400 = 三项配置没配齐（点名缺哪个键），409 = 上一轮还在跑；结果看 `/api/status` 的 `jellyfin` 块 |
+| `/api/status` | GET | 200 | 同步计数、运行配置现状（含各键的现读值；密钥只报「是否已设置」）、各源调度状态、`jellyfin` 块（媒体库同步现状：配置、上次结果、运行中进度、孤儿库；API key 只报 `api_key_set`）、`admin_token_set`（写操作能不能用） |
+| `/api/jellyfin/libraries` | GET / POST | 200 / 202 / 400 / 401 / 409 | GET = 一轮媒体库同步的现状与进度（`running` / `phase_label` / `processed` / `total` / `started_at`；收尾后 `created` / `unchanged` / `removed` / `duration_ms`），页面每秒轮询它、不碰 drama 表；POST = 手动跑一轮：body 可省或 `{"prune":true}`（显式删自管孤儿库）；400 = 三项配置没配齐（点名缺哪个键），409 = 上一轮还在跑（接着 GET 看那一轮进度） |
 | `/api/settings` | PATCH | 200 / 400 / 401 | 按 key 批量写配置：`{"settings":{"<key>":"<值>"}}` → 归一化后的值；未知键 / 非法值 400 且整批不落库；写操作要 `X-Admin-Token` |
 | 其它未登记路径 | 任意 | 404 | 由 web 的 mux 兜底 |
 
@@ -166,6 +166,12 @@ Emby 能逐层往下扫，Jellyfin 不能：它只把**库根的直接子目录*
 2. `PATCH /api/settings` 写 `jellyfin_url` / `jellyfin_api_key` / `jellyfin_library_root`
    （库根填 **Jellyfin 容器内**看到的挂载根）；
 3. `POST /api/jellyfin/libraries` 跑一轮，或等同步轮末自动跑（幂等）。
+
+点「同步媒体库」之后页面每秒轮询 `GET /api/jellyfin/libraries`，把这一轮显示成一行：当前阶段
+（读取现有库 / 列分类 / 比对 / 创建 / 删除孤儿 / 触发扫描）、已处理几项、开始与已用时间；收尾后
+那一行变成「上次同步：时间 · 新建 / 更新 0 / 已存在 / 删除 / 失败 · 耗时」，刷新页面读回同一份
+状态。运行中再点一次返回 409（已在运行），页面会接着显示正在跑的那一轮。本服务不改已存在的库，
+所以「更新」恒为 0，「已存在」就是这一轮幂等命中的条数。
 
 分类消失只列成「孤儿库」，不删库；要删必须显式 `{"prune":true}`。Jellyfin 不可达只影响这
 一段，同步/WebDAV/播放照常。步骤与核对命令见 `docs/DEPLOY.md`「5b」，理由与 API 事实见

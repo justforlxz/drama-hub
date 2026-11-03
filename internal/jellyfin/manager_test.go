@@ -45,6 +45,21 @@ func (h *harness) run(prune bool) {
 // state 读一次状态面。
 func (h *harness) state() State { return h.manager.State(context.Background()) }
 
+// waitForState 轮询状态面直到 cond 成立（最多 5 秒）：进度是异步写进状态的，测试只能
+// 「等到它出现」—— 与页面轮询 GET /api/jellyfin/libraries 走的是同一条读路径。
+func (h *harness) waitForState(what string, cond func(State) bool) State {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if st := h.state(); cond(st) {
+			return st
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.t.Fatalf("等不到状态「%s」（当前 %+v）", what, h.state())
+	return State{}
+}
+
 // TestManagerCreatesOneLibraryPerCategory 锁定「一分类一库」（AC-2）：每个分类一个
 // POST，库名带前缀、路径是 <root>/<分类>，末尾恰好一次扫描。
 func TestManagerCreatesOneLibraryPerCategory(t *testing.T) {
@@ -477,5 +492,94 @@ func TestManagerBadPathDoesNotAbort(t *testing.T) {
 	}
 	if state := h.state(); len(state.Failed) != 0 || state.LastError != "" {
 		t.Errorf("补上后 Failed = %v / LastError = %q, 期望空", state.Failed, state.LastError)
+	}
+}
+
+// TestManagerStateReportsProgress 锁定「运行中能看到跑到哪一步」（MKACG-664 AC-1）：
+// 建库阶段状态面给出当前阶段与本轮总数，处理过的条数随建库推进；收尾时阶段归空、
+// 计数与耗时落定。
+func TestManagerStateReportsProgress(t *testing.T) {
+	categories := []string{"都市", "爱情", "科幻"}
+	h := newHarness(t, nil, categories)
+	h.ff.writeDelay = 200 * time.Millisecond // 让建库阶段的窗口足够长，能稳定读到中间态
+
+	if err := h.manager.Start(context.Background(), false); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	mid := h.waitForState("建库阶段的进度", func(st State) bool {
+		return st.Phase == PhaseCreate && st.Processed > 0
+	})
+	if !mid.Running {
+		t.Error("建库过程中 Running 应为 true")
+	}
+	if mid.StartedAt.IsZero() {
+		t.Error("运行中 StartedAt 应非零（页面靠它算已用时间）")
+	}
+	if mid.Total != len(categories) {
+		t.Errorf("进度 Total = %d, 期望 %d（本轮要建的库数）", mid.Total, len(categories))
+	}
+	if mid.Processed < 1 || mid.Processed > len(categories) {
+		t.Errorf("进度 Processed = %d, 期望落在 1..%d", mid.Processed, len(categories))
+	}
+	h.manager.Wait()
+
+	done := h.state()
+	if done.Running || done.Phase != "" {
+		t.Errorf("收尾后 Running=%v / Phase=%q, 期望 false / 空", done.Running, done.Phase)
+	}
+	if done.Created != len(categories) || done.Unchanged != 0 {
+		t.Errorf("收尾后 created=%d / unchanged=%d, 期望 %d / 0", done.Created, done.Unchanged, len(categories))
+	}
+	if done.DurationMS <= 0 {
+		t.Errorf("DurationMS = %d, 期望 > 0（本轮耗时）", done.DurationMS)
+	}
+	if want := done.LastRunAt.Sub(done.StartedAt).Milliseconds(); done.DurationMS != want {
+		t.Errorf("DurationMS = %d, 期望等于 LastRunAt - StartedAt = %d", done.DurationMS, want)
+	}
+}
+
+// TestManagerStateReportsUnchanged 锁定「再点一次也要说清楚这次做了什么」（AC-2）：
+// 分类都已有自管库时本轮 created=0、unchanged=总数，状态面能看出这一轮是幂等命中
+// 而不是没跑。
+func TestManagerStateReportsUnchanged(t *testing.T) {
+	root := "/data/video/dramahub"
+	h := newHarness(t, []Library{
+		{Name: "短剧 - 都市", Locations: []string{root + "/都市"}},
+		{Name: "短剧 - 爱情", Locations: []string{root + "/爱情"}},
+	}, []string{"都市", "爱情"})
+	h.run(false)
+
+	state := h.state()
+	if state.Created != 0 {
+		t.Errorf("created = %d, 期望 0", state.Created)
+	}
+	if state.Unchanged != 2 {
+		t.Errorf("unchanged = %d, 期望 2（两个分类都已建好、这一轮什么都没动）", state.Unchanged)
+	}
+	if state.Removed != 0 {
+		t.Errorf("removed = %d, 期望 0（prune=false）", state.Removed)
+	}
+	if state.LastOKAt.IsZero() {
+		t.Error("幂等命中不算失败：last_ok_at 应前进")
+	}
+}
+
+// TestManagerProgressClearedOnFailure 锁定失败收尾也不留半截进度（AC-3）：
+// 失败后页面读到的是「没在跑 + 一条 last_error」，不是一条永远停在某个阶段的进度。
+func TestManagerProgressClearedOnFailure(t *testing.T) {
+	h := newHarness(t, nil, []string{"都市"})
+	h.ff.failList = true
+	h.ff.status = http.StatusInternalServerError
+	h.run(false)
+
+	state := h.state()
+	if state.Running {
+		t.Error("失败收尾后 Running 应为 false")
+	}
+	if state.Phase != "" {
+		t.Errorf("Phase = %q, 期望空（收尾后没有「正在做什么」）", state.Phase)
+	}
+	if state.LastError == "" {
+		t.Error("失败必须留下 last_error，页面靠它显示原因")
 	}
 }

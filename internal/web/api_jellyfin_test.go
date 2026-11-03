@@ -143,6 +143,59 @@ func TestAPI_StatusJellyfin(t *testing.T) {
 	}
 }
 
+// TestAPI_JellyfinLibrariesState 覆盖 GET /api/jellyfin/libraries（MKACG-664）：
+// 页面轮询的轻量端点 —— 运行中给出阶段与进度，收尾后给出本轮计数与耗时；只读，
+// 不触发新的一轮。
+func TestAPI_JellyfinLibrariesState(t *testing.T) {
+	started := time.Date(2026, 11, 3, 6, 30, 0, 0, time.UTC)
+	jf := &fakeJellyfin{state: jellyfin.State{
+		Configured: true,
+		Missing:    []string{},
+		Running:    true,
+		StartedAt:  started,
+		Phase:      jellyfin.PhaseCreate,
+		Processed:  12,
+		Total:      58,
+		LastRunAt:  started.Add(-time.Minute),
+		Unchanged:  55,
+		DurationMS: 1234,
+	}}
+	srv, _, _ := newTestServerWith(t, jf)
+
+	rec := do(t, srv, http.MethodGet, "/api/jellyfin/libraries", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	got := decode[jellyfinView](t, rec)
+	if !got.Running {
+		t.Error("running 应为 true（这一轮还在跑）")
+	}
+	if got.Phase != jellyfin.PhaseCreate || got.PhaseLabel != "创建媒体库" {
+		t.Errorf("phase = %q / phase_label = %q, 期望 create / 创建媒体库（页面直接显示 label）",
+			got.Phase, got.PhaseLabel)
+	}
+	if got.Processed != 12 || got.Total != 58 {
+		t.Errorf("进度 = %d / %d, 期望 12 / 58", got.Processed, got.Total)
+	}
+	if want := started.Format(time.RFC3339); got.StartedAt != want {
+		t.Errorf("started_at = %q, 期望 %q（页面靠它算已用时间）", got.StartedAt, want)
+	}
+	if got.Unchanged != 55 || got.DurationMS != 1234 {
+		t.Errorf("unchanged = %d / duration_ms = %d, 期望 55 / 1234", got.Unchanged, got.DurationMS)
+	}
+	if jf.calls != 0 {
+		t.Errorf("GET 触发了 %d 轮同步，期望 0（轮询端点只读）", jf.calls)
+	}
+
+	// 收尾后（没在跑）：阶段与 label 都空，页面只显示「上次同步：时间 + 结果」。
+	jf.state = jellyfin.State{Configured: true, Missing: []string{}}
+	idle := decode[jellyfinView](t, do(t, srv, http.MethodGet, "/api/jellyfin/libraries", ""))
+	if idle.Running || idle.Phase != "" || idle.PhaseLabel != "" {
+		t.Errorf("收尾后 running=%v / phase=%q / phase_label=%q, 期望 false / 空 / 空",
+			idle.Running, idle.Phase, idle.PhaseLabel)
+	}
+}
+
 // TestAPI_SettingsJellyfin 覆盖五项配置的写入面（AC-1 / AC-8）：
 // api_key 只回 null、library_root 归一化去尾 /、越界值 400 且不落库。
 func TestAPI_SettingsJellyfin(t *testing.T) {

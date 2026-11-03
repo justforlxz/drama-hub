@@ -25,7 +25,8 @@ type jellyfinLibrariesResponse struct {
 // handleJellyfinLibraries 处理 POST /api/jellyfin/libraries：派一轮媒体库同步。
 //
 // 202 已派出 / 409 上一轮还没结束 / 400 三项配置没配齐（body 指出缺哪个键）。
-// 结果不在响应里：跑完看 /api/status 的 jellyfin 块（AC-2 / AC-3 都在那里比对）。
+// 结果不在响应里：跑完看 GET /api/jellyfin/libraries（页面轮询的就是它，MKACG-664），
+// /api/status 的 jellyfin 块是同一份视图。
 func (s *Server) handleJellyfinLibraries(w http.ResponseWriter, r *http.Request) {
 	var req jellyfinLibrariesRequest
 	// 请求体可省：curl 不带 body 也要能触发（破坏性动作必须显式给 body）。
@@ -40,6 +41,15 @@ func (s *Server) handleJellyfinLibraries(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, jellyfinLibrariesResponse{Started: true})
+}
+
+// handleJellyfinLibrariesState 处理 GET /api/jellyfin/libraries：一轮同步的现状与进度。
+//
+// 页面在派发后轮询它（MKACG-664），所以刻意不去读 drama / episode 表 —— 那部分由
+// /api/status 负责，一秒一次的轮询只该读内存状态与五项配置。刷新页面后读到的仍是
+// 同一份状态，这就是「上次同步：时间 + 结果」常驻的来源。
+func (s *Server) handleJellyfinLibrariesState(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, jellyfinViewOf(s.jellyfin.State(r.Context())))
 }
 
 // mapJellyfinErr 把 jellyfin 包的哨兵接到传输层：

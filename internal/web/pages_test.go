@@ -250,6 +250,19 @@ func TestStatusPageSettingsForm(t *testing.T) {
 	}
 }
 
+// TestStatusPageJellyfinProgress 锁定页面上的同步进度/结果行（MKACG-664）：
+// app.js 把进度与「上次同步：时间 + 结果」写进 #jellyfin-progress，模板少了这个
+// 元素，点完「同步媒体库」就只剩静默 202。
+func TestStatusPageJellyfinProgress(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	doc := parseDoc(t, do(t, srv, http.MethodGet, "/status", "").Body.Bytes())
+	if findNode(doc, func(n *html.Node) bool {
+		return isElement(n, "p") && attrOf(n, "id") == "jellyfin-progress"
+	}) == nil {
+		t.Fatal("/status 缺少 #jellyfin-progress：同步进度与上次结果没有地方显示")
+	}
+}
+
 // nextNode 深度优先遍历的下一个节点（含子节点），到末尾返回 nil。
 func nextNode(n *html.Node) *html.Node {
 	if n.FirstChild != nil {

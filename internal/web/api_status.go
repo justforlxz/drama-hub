@@ -97,16 +97,44 @@ type jellyfinView struct {
 	APIKeySet     bool     `json:"api_key_set"`
 	TimeoutSec    int      `json:"timeout_sec"`
 
-	Running   bool     `json:"running"`
-	LastRunAt string   `json:"last_run_at"`
-	LastOkAt  string   `json:"last_ok_at"`
-	LastError string   `json:"last_error"`
-	Created   int      `json:"created"`
-	Uncertain int      `json:"uncertain"`
-	Failed    []string `json:"failed"`
-	Orphans   []string `json:"orphans"`
-	Conflicts []string `json:"conflicts"`
+	Running   bool   `json:"running"`
+	LastRunAt string `json:"last_run_at"`
+	LastOkAt  string `json:"last_ok_at"`
+	LastError string `json:"last_error"`
+	Created   int    `json:"created"`
+	// Unchanged / Removed / DurationMS 是本轮「做了什么」的其余部分（MKACG-664）：
+	// 已存在且没动的条数、prune 删掉的条数、整轮耗时。本服务不改已存在的库，
+	// 所以没有「更新」这个计数。
+	Unchanged  int      `json:"unchanged"`
+	Removed    int      `json:"removed"`
+	DurationMS int64    `json:"duration_ms"`
+	Uncertain  int      `json:"uncertain"`
+	Failed     []string `json:"failed"`
+	Orphans    []string `json:"orphans"`
+	Conflicts  []string `json:"conflicts"`
+
+	// 进行中的进度（MKACG-664）：页面轮询本块，按 started_at + phase_label + processed/total
+	// 显示「正在跑 · 跑到哪一步 · 已处理几项」。phase 是稳定标识（空 = 没在跑），
+	// phase_label 是给人看的说法 —— 措辞只在这一个地方维护。
+	StartedAt  string `json:"started_at"`
+	Phase      string `json:"phase"`
+	PhaseLabel string `json:"phase_label"`
+	Processed  int    `json:"processed"`
+	Total      int    `json:"total"`
 }
+
+// jellyfinPhaseLabels 把一轮同步的阶段标识翻成页面上的一句话。
+var jellyfinPhaseLabels = map[string]string{
+	jellyfin.PhaseList:       "读取现有媒体库",
+	jellyfin.PhaseCategories: "列分类",
+	jellyfin.PhaseDiff:       "比对现有库",
+	jellyfin.PhaseCreate:     "创建媒体库",
+	jellyfin.PhasePrune:      "删除孤儿库",
+	jellyfin.PhaseScan:       "触发扫描",
+}
+
+// jellyfinPhaseLabel 取阶段的展示文案；未知或空阶段返回空串（页面只显示「运行中」）。
+func jellyfinPhaseLabel(phase string) string { return jellyfinPhaseLabels[phase] }
 
 // statusView 是 GET /api/status 的响应体：同步计数 + 运行配置 + 播放源 + 媒体库。
 type statusView struct {
@@ -135,10 +163,18 @@ func jellyfinViewOf(state jellyfin.State) jellyfinView {
 		LastOkAt:      formatTime(state.LastOKAt),
 		LastError:     state.LastError,
 		Created:       state.Created,
+		Unchanged:     state.Unchanged,
+		Removed:       state.Removed,
+		DurationMS:    state.DurationMS,
 		Uncertain:     state.Uncertain,
 		Failed:        nonNilStrings(state.Failed),
 		Orphans:       nonNilStrings(state.Orphans),
 		Conflicts:     nonNilStrings(state.Conflicts),
+		StartedAt:     formatTime(state.StartedAt),
+		Phase:         state.Phase,
+		PhaseLabel:    jellyfinPhaseLabel(state.Phase),
+		Processed:     state.Processed,
+		Total:         state.Total,
 	}
 }
 

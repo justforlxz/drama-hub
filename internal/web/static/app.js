@@ -53,7 +53,9 @@ async function api(method, path, body) {
   }
   if (!res.ok) {
     const message = payload && payload.message ? payload.message : res.status + ' ' + res.statusText;
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = res.status; // 409 这类「不是故障的状态」页面要单独处理（见 syncJellyfin）
+    throw error;
   }
   return payload;
 }
@@ -96,6 +98,20 @@ function fmtTime(iso) {
   const p = (n) => String(n).padStart(2, '0');
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
     ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+/** 把毫秒写成「不到 1 秒 / 12.3 秒 / 1 分 5 秒」；非数字显示破折号。 */
+function fmtDuration(ms) {
+  if (typeof ms !== 'number' || ms < 0) return '—';
+  if (ms < 1000) return '不到 1 秒';
+  const sec = ms / 1000;
+  if (sec < 60) return sec.toFixed(1) + ' 秒';
+  return Math.floor(sec / 60) + ' 分 ' + Math.round(sec % 60) + ' 秒';
+}
+
+/** 等一会儿（轮询间隔用）。 */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---- 剧目页 ----
@@ -178,6 +194,7 @@ function initStatus() {
   const jellyfinBody = document.getElementById('jellyfin');
   const jellyfinBtn = document.getElementById('jellyfin-sync');
   const jellyfinHint = document.getElementById('jellyfin-hint');
+  const jellyfinProgress = document.getElementById('jellyfin-progress');
 
   // 表单字段 ↔ settings 键。页面不另写一份校验：值原样交给 PATCH，越界由服务端的
   // 注册表拒（400），这里只显示服务端给的原因。
@@ -366,11 +383,16 @@ function initStatus() {
         'jellyfin_library_prefix，只操作带这个前缀的库'),
       row('API key', flag(j.api_key_set), '即时', 'jellyfin_api_key（只写不读，状态面不返回值）'),
       row('单次超时', j.timeout_sec + ' 秒', '即时', 'jellyfin_timeout_sec，每次出站请求一个超时'),
-      row('上次同步', fmtTime(j.last_run_at), '—', '状态只在内存里：重启后回到「未运行」'),
+      row('上次同步', fmtTime(j.last_run_at) +
+        (j.last_run_at === '' ? '' : '（耗时 ' + fmtDuration(j.duration_ms) + '）'), '—',
+        '状态只在内存里：重启后回到「未运行」；刷新页面从 GET /api/jellyfin/libraries 读回'),
       row('上次成功', fmtTime(j.last_ok_at), '—', '孤儿与同名冲突不算失败，也会推进这一项'),
       row('上次错误', j.last_error === '' ? '—' : el('span', { class: 'mono', text: j.last_error }), '—',
         'Jellyfin 不可用只影响这一段：同步、WebDAV、播放都不受影响'),
-      row('上次新建', String(j.created), '—', '这一轮建了几个库；0 = 幂等命中'),
+      row('上次新建', String(j.created), '—', '这一轮建了几个库'),
+      row('上次已存在', String(j.unchanged), '—',
+        '分类已有自管库、这一轮一个字段都没动的条数（幂等命中）。本服务不改已存在的库，所以没有「更新」'),
+      row('上次删除', String(j.removed), '—', 'prune 删掉的自管孤儿库数；默认不删，恒 0'),
       row('结果未知', String(j.uncertain), '—',
         '建库请求超时、Jellyfin 侧是否建成不确定的条数（不计入新建）。下一轮同步会以列库结果收口'),
       row('被拒分类', j.failed.length === 0 ? '—' : el('span', { class: 'mono', text: j.failed.join('、') }), '—',
@@ -378,6 +400,72 @@ function initStatus() {
       row('孤儿库', orphans, '—',
         '分类已消失的自管库。默认不删，删除走 POST /api/jellyfin/libraries {"prune":true}'),
       row('冲突库', conflicts, '—', '同名库不是本服务建的：不建、不删、不接管'));
+  }
+
+  // jellyfinResultText 把「这一轮做了什么」写成一句话（MKACG-664 AC-2）。
+  // 「更新」恒 0：已存在的库一律不改（不重命名、不改路径，幂等），写出来并带上解释，
+  // 免得人以为是「更新数没显示」。last_error 已包含被拒分类与结果未知的细节，直接接上。
+  function jellyfinResultText(j) {
+    let text = '新建 ' + j.created + '、更新 0（已存在的库不改动）、已存在 ' + j.unchanged +
+      '、删除 ' + j.removed + '、失败 ' + j.failed.length +
+      ' · 耗时 ' + fmtDuration(j.duration_ms);
+    if (j.last_error !== '') text += ' · ' + j.last_error;
+    return text;
+  }
+
+  // renderJellyfinProgress 画「正在跑」或「上次同步：时间 + 结果」那一行。
+  // 两态共用一行：运行中给出阶段 / 已处理 / 开始时间 / 已用时间，收尾后给出本轮结果。
+  // 内容全部来自状态面，所以刷新页面看到的仍是同一句话（不需要额外持久化）。
+  function renderJellyfinProgress(j) {
+    if (j.running) {
+      const parts = ['运行中'];
+      if (j.phase_label !== '') parts.push('阶段：' + j.phase_label);
+      if (j.total > 0) parts.push(j.processed + ' / ' + j.total);
+      if (j.started_at !== '') {
+        parts.push('开始于 ' + fmtTime(j.started_at));
+        parts.push('已用 ' + fmtDuration(Date.now() - Date.parse(j.started_at)));
+      }
+      jellyfinProgress.textContent = parts.join(' · ');
+      jellyfinProgress.dataset.kind = 'busy';
+      return;
+    }
+    jellyfinProgress.dataset.kind = j.last_error === '' ? 'ok' : 'error';
+    jellyfinProgress.textContent = j.last_run_at === ''
+      ? ''
+      : '上次同步：' + fmtTime(j.last_run_at) + ' · ' + jellyfinResultText(j);
+  }
+
+  // JELLYFIN_POLL_MS 是轮询间隔：一轮建库是按个串行发请求，1 秒足够看出进度在动。
+  // JELLYFIN_POLL_MAX_MS 是轮询上限（一轮最长 = 单次超时 × (库数 + 1)，30 分钟封顶）：
+  // 到点停止自动刷新，别让一个已经失控的页面永远每秒钟打服务端。
+  const JELLYFIN_POLL_MS = 1000;
+  const JELLYFIN_POLL_MAX_MS = 30 * 60 * 1000;
+  let jellyfinPolling = false;
+
+  // followJellyfin 轮询 GET /api/jellyfin/libraries 直到这一轮收尾。
+  // 轮询这个端点而不是 /api/status：后者每次都要全量统计 drama / episode 表。
+  async function followJellyfin() {
+    if (jellyfinPolling) return; // 同一时刻只留一条轮询链（load 与按钮都会进来）
+    jellyfinPolling = true;
+    const deadline = Date.now() + JELLYFIN_POLL_MAX_MS;
+    try {
+      for (;;) {
+        const j = await api('GET', '/api/jellyfin/libraries');
+        renderJellyfin(j);
+        renderJellyfinProgress(j);
+        if (!j.running) break;
+        if (Date.now() > deadline) {
+          say('媒体库同步超过 ' + JELLYFIN_POLL_MAX_MS / 60000 + ' 分钟仍未收尾，已停止自动刷新；' +
+            '再点一次「同步媒体库」会返回「已在运行」并接着显示进度', 'busy');
+          return;
+        }
+        await sleep(JELLYFIN_POLL_MS);
+      }
+    } catch (err) {
+      fail(err);
+    } finally {
+      jellyfinPolling = false;
+    }
   }
 
   // fillJellyfin 把媒体库配置填进表单并记基线；api key 永远留空（只写不读）。
@@ -397,19 +485,25 @@ function initStatus() {
     input.placeholder = j.api_key_set ? '已设置，留空不改' : '未设置（这一段不启用）';
   }
 
-  // syncJellyfin 手动触发一轮媒体库同步：202 = 已派出去，409 = 上一轮还在跑，
-  // 400 = 三项没配齐（响应体点名缺哪个键）。结果一律回读 /api/status，不猜结局。
+  // syncJellyfin 手动触发一轮媒体库同步：202 = 已派出去（随后轮询进度），
+  // 409 = 上一轮还在跑（同样接着显示那一轮的进度），400 = 三项没配齐（响应体点名缺哪个键）。
+  // 结果一律回读状态面，不猜结局。
   async function syncJellyfin() {
     jellyfinBtn.disabled = true;
     say('已请求同步 Jellyfin 媒体库 …', 'busy');
     try {
       await api('POST', '/api/jellyfin/libraries', {});
-      say('已派出一轮媒体库同步，结果看「上次同步」与「上次错误」', 'ok');
+      // 进度与结果都在下面那一行，notice 里不留一句立刻就会过时的话。
+      say('', '');
     } catch (err) {
-      fail(err);
+      // 409 不是故障：单飞锁挡住了重复派发。页面要说「已在运行」而不是报一个红色错误，
+      // 然后照样把正在跑的那一轮显示出来（AC-4）。
+      if (err.status === 409) say('Jellyfin 媒体库同步已在运行，接着显示这一轮的进度', 'busy');
+      else fail(err);
     } finally {
+      jellyfinBtn.disabled = false;
       await load().catch(fail);
-      syncHint();
+      await followJellyfin();
     }
   }
 
@@ -423,6 +517,9 @@ function initStatus() {
       stat('最近同步', fmtTime(t.last_sync_at), true));
     renderConfig(status.config);
     renderJellyfin(status.jellyfin);
+    renderJellyfinProgress(status.jellyfin);
+    // 刷新 / 首次打开时这一轮可能还在跑：接着看，不必等用户再点一次。
+    if (status.jellyfin.running) followJellyfin();
     sourcesBody.replaceChildren(...status.sources.map(sourceRow));
     adminWritable = status.admin_token_set === true;
     if (!prefilled) {

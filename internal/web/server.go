@@ -117,6 +117,8 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 	s.mux.HandleFunc("PATCH /api/settings", s.handlePatchSettings)
 	// 建库是写操作：令牌闸门在 ServeHTTP 里统一过，这里不重复。
 	s.mux.HandleFunc("POST /api/jellyfin/libraries", s.handleJellyfinLibraries)
+	// 同一条路径的读：页面轮询进度与上次结果（MKACG-664），不碰 drama 表。
+	s.mux.HandleFunc("GET /api/jellyfin/libraries", s.handleJellyfinLibrariesState)
 	return s
 }
 

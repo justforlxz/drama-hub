@@ -19,10 +19,23 @@ var (
 	ErrBusy = errors.New("jellyfin 媒体库同步正在跑")
 )
 
-// State 是状态面要显示的现状：配置（密钥只报「已设置」）+ 上一次 reconcile 的结果。
+// 一轮 reconcile 的阶段标识（MKACG-664）：状态页在运行中按它显示「跑到哪一步」，
+// 计数（Processed / Total）只在建库与删库两个阶段有意义。空串 = 没在跑。
+const (
+	PhaseList       = "list"       // 读取 Jellyfin 现有媒体库
+	PhaseCategories = "categories" // 列分类目录
+	PhaseDiff       = "diff"       // 比对现有库与分类
+	PhaseCreate     = "create"     // 创建缺的库（Processed / Total）
+	PhasePrune      = "prune"      // 删除孤儿库（Processed / Total）
+	PhaseScan       = "scan"       // 触发一次扫描
+)
+
+// State 是状态面要显示的现状：配置（密钥只报「已设置」）+ 上一次 reconcile 的结果
+// + 这一轮进行中的进度。
 //
 // 只存在内存里，不落库、不加表：reconcile 本身幂等，跨重启不需要接续；重启后显示
-// 「未运行」是可接受的（prune 的判定也完全不依赖历史）。
+// 「未运行」是可接受的（prune 的判定也完全不依赖历史）。页面刷新不影响它 ——
+// 结果本来就随 GET /api/jellyfin/libraries 读回（MKACG-664 的「刷新后仍可见」）。
 type State struct {
 	Configured    bool
 	Missing       []string
@@ -37,6 +50,22 @@ type State struct {
 	LastOKAt  time.Time
 	LastError string
 	Created   int
+	// Unchanged 是「分类已经有自管库，这一轮一个字段都没动」的条数（幂等命中）。
+	// 已存在的库一律不改（不重命名、不改路径、不同步 libraryOptions）—— 所以本服务
+	// 没有「更新」这个动作，这个计数就是「上次同步有没有白跑」最直接的答案。
+	Unchanged int
+	// Removed 是这一轮 prune 删掉的自管孤儿库数（prune=false 时恒 0）。
+	Removed int
+	// DurationMS 是上一轮从 Start 到收尾的耗时；只在有上一轮时有意义。
+	DurationMS int64
+
+	// 进行中的进度：StartedAt 是本轮开始时刻，Phase 是当前阶段标识，Processed / Total
+	// 是当前阶段的进度（Total=0 表示这个阶段没有可数的项）。
+	// 收尾后 Phase 归空、Processed / Total 保留最后一格（页面只在 Running 时读它们）。
+	StartedAt time.Time
+	Phase     string
+	Processed int
+	Total     int
 	// Uncertain 是「请求超时、Jellyfin 那边结果未知」的次数（建库为主）。
 	// 实测 12.1 在扫库期间单次建库会 >10s：客户端先超时，但库往往已经建成了。
 	// 所以这类不能算 created（没收到 204），也不能当成「一个都没建」——它有独立的
@@ -54,7 +83,9 @@ type State struct {
 // Uncertain 与 Created 分开：一个建库请求超时时，Jellyfin 可能已经建成（实测 12.1
 // 扫库期间单次 >10s），所以既不能计入 Created（没收到 204），也不能当成「一个都没建」。
 type Result struct {
-	Created   int
+	Created int
+	// Unchanged 是分类已有自管库、这一轮没动的条数（幂等命中，见 State.Unchanged）。
+	Unchanged int
 	Uncertain int
 	Failed    []string
 	Removed   int
@@ -111,7 +142,7 @@ func (m *Manager) Start(ctx context.Context, prune bool) error {
 		return fmt.Errorf("%w: 上一次还没结束", ErrBusy)
 	}
 
-	m.setRunning(true)
+	m.begin()
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -154,6 +185,13 @@ func (m *Manager) State(ctx context.Context) State {
 	out.LastOKAt = m.state.LastOKAt
 	out.LastError = m.state.LastError
 	out.Created = m.state.Created
+	out.Unchanged = m.state.Unchanged
+	out.Removed = m.state.Removed
+	out.DurationMS = m.state.DurationMS
+	out.StartedAt = m.state.StartedAt
+	out.Phase = m.state.Phase
+	out.Processed = m.state.Processed
+	out.Total = m.state.Total
 	out.Uncertain = m.state.Uncertain
 	out.Failed = m.state.Failed
 	out.Orphans = m.state.Orphans
@@ -210,18 +248,24 @@ func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result
 	res := Result{}
 	client := NewClient(cfg, nil)
 
+	m.progress(PhaseList, 0, 0)
 	existing, err := client.ListLibraries(ctx)
 	if err != nil {
 		return m.record(res, err)
 	}
+	m.progress(PhaseCategories, 0, 0)
 	categories, err := m.categories(ctx)
 	if err != nil {
 		return m.record(res, fmt.Errorf("列分类: %w", err))
 	}
 
+	m.progress(PhaseDiff, 0, 0)
 	plan := Diff(existing, categories, cfg.LibraryRoot, cfg.Prefix)
 	res.Orphans = plan.Orphans
 	res.Conflicts = plan.Conflicts
+	// 一个分类一种结局：已有自管库（不动） / 名字被别人占着（冲突） / 要新建。
+	// 剩下的是「幂等命中」—— 这一轮确实白跑的那部分，状态页要能看出它有多大。
+	res.Unchanged = len(categories) - len(plan.Create) - len(plan.Conflicts)
 
 	// 剩余请求数 = 建库 + （prune 时）删库 + 1 次扫描。整轮预算按它给：固定预算
 	// 在库多的部署上必然中途放弃（58 个分类 × 实测 1.1s/次 远大于旧的 2×timeout）。
@@ -231,7 +275,10 @@ func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result
 	}
 	ctx, cancel := context.WithTimeout(ctx, roundBudget(pending, cfg.Timeout))
 	defer cancel()
-	for _, action := range plan.Create {
+	if len(plan.Create) > 0 {
+		m.progress(PhaseCreate, 0, len(plan.Create))
+	}
+	for i, action := range plan.Create {
 		err := client.CreateLibrary(ctx, action.Name, action.Path)
 		switch {
 		case err == nil:
@@ -255,19 +302,25 @@ func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result
 			// 继续打只会把同一个错误复读几十次，整轮中止留一条 last_error。
 			return m.record(res, err)
 		}
+		m.progress(PhaseCreate, i+1, len(plan.Create))
 	}
 	if prune {
-		for _, name := range plan.Orphans {
+		if len(plan.Orphans) > 0 {
+			m.progress(PhasePrune, 0, len(plan.Orphans))
+		}
+		for i, name := range plan.Orphans {
 			if err := client.DeleteLibrary(ctx, name); err != nil {
 				return m.record(res, err)
 			}
 			res.Removed++
+			m.progress(PhasePrune, i+1, len(plan.Orphans))
 		}
 	}
 	// 0 变化时一个写请求都不发（这就是「再点一次」幂等的可验证点，AC-3）。
 	// Uncertain 也算「可能有变化」：超时的那次建库很可能已经在 Jellyfin 侧落成，
 	// 不扫描它就一直是个空库。
 	if res.Created > 0 || res.Removed > 0 || res.Uncertain > 0 {
+		m.progress(PhaseScan, 0, 0)
 		if err := client.Refresh(ctx); err != nil {
 			return m.record(res, err)
 		}
@@ -288,7 +341,13 @@ func (m *Manager) record(res Result, err error) (Result, error) {
 
 	m.mu.Lock()
 	m.state.LastRunAt = now
+	m.state.Phase = ""
+	if !m.state.StartedAt.IsZero() {
+		m.state.DurationMS = now.Sub(m.state.StartedAt).Milliseconds()
+	}
 	m.state.Created = res.Created
+	m.state.Unchanged = res.Unchanged
+	m.state.Removed = res.Removed
 	m.state.Uncertain = res.Uncertain
 	m.state.Failed = nonNil(res.Failed)
 	m.state.Orphans = res.Orphans
@@ -336,6 +395,31 @@ func (m *Manager) record(res Result, err error) (Result, error) {
 		"conflicts", len(res.Conflicts),
 		"err", err)
 	return res, err
+}
+
+// begin 记下这一轮的开始时刻并置为「正在跑」。
+//
+// Phase 先置成第一步：Start 到第一次 progress 之间调度器可能马上被轮询到，显示一个
+// 空阶段不如显示「正要读取」准确。Processed / Total 归零，不带着上一轮的进度进来。
+func (m *Manager) begin() {
+	m.mu.Lock()
+	m.state.Running = true
+	m.state.StartedAt = time.Now().UTC()
+	m.state.Phase = PhaseList
+	m.state.Processed = 0
+	m.state.Total = 0
+	m.mu.Unlock()
+}
+
+// progress 更新一轮进行中的阶段与计数（状态页轮询读它）。
+//
+// total=0 表示这个阶段没有可数的项（列库 / 列分类 / 比对 / 扫描），页面只显示阶段。
+func (m *Manager) progress(phase string, processed, total int) {
+	m.mu.Lock()
+	m.state.Phase = phase
+	m.state.Processed = processed
+	m.state.Total = total
+	m.mu.Unlock()
 }
 
 // setRunning 更新「正在跑」标志（状态页读它）。

@@ -12,6 +12,7 @@ import (
 
 	"github.com/justforlxz/drama-hub/internal/jellyfin"
 	"github.com/justforlxz/drama-hub/internal/pgtest"
+	"github.com/justforlxz/drama-hub/internal/playback"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
@@ -263,7 +264,8 @@ func TestAPI_SettingsJellyfin(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	settings := store.NewSettings(db.DB)
 	srv := NewServer(store.NewStore(db.DB), settings, &fakeSyncer{}, &fakeSchedule{}, &fakeJellyfin{},
-		[]Source{{Name: "web", Label: "红果官网 SSR"}}, nil, testAdminToken, slog.New(slog.DiscardHandler))
+		[]Source{{Name: "web", Label: "红果官网 SSR"}}, playback.NewTracker(time.Now),
+		&fakeCovers{}, testSignID, testDramaPath, testAdminToken, slog.New(slog.DiscardHandler))
 
 	rec := do(t, srv, http.MethodPatch, "/api/settings",
 		`{"settings":{"jellyfin_url":"https://jellyfin.example/","jellyfin_api_key":"abcd1234","jellyfin_library_root":"/data/video/dramahub/","jellyfin_library_prefix":"库 - ","jellyfin_timeout_sec":"15"}}`)

@@ -856,16 +856,20 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 ### 页面
 
-页面集合 = 两个页面，同一个 `base.html` + 各自模板；`pages.go` 的 `pageMetaOf` 是唯一
-答案，未登记路径（含旧的 `/status`）一律 404。
+页面集合 = 四个页面 + 一个对象详情页，同一个 `base.html` + 各自模板；`pages.go` 的
+`pages` 与 `dramaPage` 是唯一答案，未登记路径（含旧的 `/status`）一律 404。
 
 | 路径 | 页面 | 能干的事 |
 |---|---|---|
-| `/` | 概览（`data-page=overview`） | 摘要条（剧/集/对外集计数与最近同步时间）；每个播放源一张卡片：状态徽标（已启用/已停用/正在刷新）、上次运行/上次成功/下次计划（`title` 给完整 ISO）、仅非空时出现的上次错误、停用原因与「重启后生效」提示、页脚「立即刷新」；Jellyfin 卡片：状态徽标（未配置/已启用/正在同步/上次失败 + 缺哪几项）、上次同步时间、664 的进度与结果行、分类开关列表（MKACG-668，一行一个分类）、孤儿/冲突/被拒分类（空则整段不出）、页脚「同步媒体库」；默认收起的「补录 / 查一部剧」（`POST /api/dramas`，201 新建 / 200 只更新） |
-| `/settings` | 设置（`data-page=settings`） | 单表单、单「保存」：访问（WebDAV 用户/密码、`strm_prefix`）、同步与刷新（`refresh_interval_sec`）、合并与对外集号（`merge_chunk_size`）、缓存（`cache_max_mb` / `cache_lru_days`）、Jellyfin（地址 / API key / 媒体库根 / 库名前缀 / 单次超时）；每项带生效时机徽标，只提交改动过的项；底部可折叠「只读运行参数」（`cache_dir` / `refresh_batch` / `refresh_timeout_sec` / 密钥与凭据是否已设置） |
+| `/` | 概览（`data-page=overview`） | 健康带：摘要条（剧/集/对外集计数与最近同步时间）；每个播放源一张卡片：状态徽标（已启用/已停用/正在刷新）、上次运行/上次成功/下次计划（`title` 给完整 ISO）、仅非空时出现的上次错误、停用原因与「重启后生效」提示、页脚「立即刷新」；Jellyfin 卡片：状态徽标（未配置/已启用/正在同步/上次失败 + 缺哪几项）、上次同步时间、664 的进度与结果行、孤儿/冲突/被拒分类（空则整段不出）、页脚「同步媒体库」；「正在播放」卡片：当前几条流与剧名/集块、进度、已出字节、客户端，空态写「当前没有播放」，4 秒轮询且仅页面可见时发（MKACG-683）。补录入口已迁到剧库页（MKACG-675） |
+| `/library` | 剧库（`data-page=library`） | 工具条：搜索（剧名 / 上游 id）、分类下拉、状态筛选（无封面 / 集数不齐）、视图切换（列表 / 海报墙，默认列表）、补录开关；**台账**九列（封面 / 标题 / 年份 / 分类 / 集数 / 上游 id / 上次同步 / Jellyfin 归属 / 操作），ARIA `table` 语义 + CSS Grid，≤640px 按行塌成卡片；海报墙是同一数据的第二种渲染（`loading=lazy`、2:3 占位）；前端 50 条/页；`<details>` 补录表单（`POST /api/dramas`，201 新建 / 200 只更新） |
+| `/library/{id}` | 剧详情（`data-page=drama`） | 封面、标题/年份/分类、简介、WebDAV 路径（可复制）、Jellyfin 归属、单剧刷新（`POST /api/dramas` 传 `series_id`）、按当前 `merge_chunk_size` 分块的集列表：每块「第 A-B 集」+ 成员集与时长 + 播放地址 `…/video/<签名 id>.m3u8` 与复制按钮；id 非法或剧不存在 → 404（显式路由，不是 catch-all） |
+| `/categories` | 分类（`data-page=categories`） | 分类名、剧数 / 集数、Jellyfin 库状态、启用开关（一行一个分类）；关掉的分类在下一轮同步时删除对应的自管库，剧与文件不动（MKACG-668） |
+| `/settings` | 设置（`data-page=settings`） | 单表单、单「保存」，五组按人话排序：访问（WebDAV 用户/密码、`strm_prefix`）、同步与刷新（`refresh_interval_sec`）、合并与对外集号（`merge_chunk_size`）、缓存（`cache_max_mb` / `cache_lru_days`）、Jellyfin（地址 / API key / 媒体库根 / 库名前缀 / 单次超时）；每项带生效时机徽标与 settings key 提示，只提交改动过的项；底部可折叠「只读运行参数」（`cache_dir` / `refresh_batch` / `refresh_timeout_sec` / 密钥与凭据是否已设置） |
 
-剧目的查看/删除入口已在 MKACG-665 删除（对外集号由 `emby_item` 派生并按
-`merge_chunk_size` 自动切块），补录走概览页的 `<details>` 或 `POST /api/dramas`。
+剧目的查看入口是 `/library` → `/library/{id}`（MKACG-675）；删除仍没有入口（对外集号
+由运行时派生并按 `merge_chunk_size` 自动切块，ADR-0014），补录走剧库页的 `<details>`
+或 `POST /api/dramas`。
 
 设计系统（MKACG-667）：
 
@@ -874,24 +878,31 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
   `--danger` + 三档状态底 `--ok-bg` / `--warn-bg` / `--danger-bg`；间距 `--s1..--s7` =
   4/8/12/16/24/32/48；字号 11/12.5/14/17/22；圆角 2（徽标、输入）/ 6（卡片）。
   深色只在 `@media (prefers-color-scheme: dark)` 里覆盖颜色 token，不写第二套规则。
-- **两页 `<table>` 计数为 0**：播放源与媒体库用卡片，键值用 `dl` —— 删表就是移动端策略，
-  不做 data-label 表格转卡片。窄屏单列、触控目标 ≥44px、长值 `overflow-wrap: anywhere`；
-  ≥880px 概览两列、设置项两列。断点只有 `max-width: 640px` 与 `min-width: 880px` 两个。
+- **所有页面的 `<table>` 计数为 0**：播放源与媒体库用卡片，键值用 `dl` —— 删表就是移动端
+  策略，不做 data-label 表格转卡片。剧库台账是唯一的表格形态，但用的是 ARIA `table` /
+  `row` / `cell` 语义 + CSS Grid（ADR-0017），不是 `<table>` 元素：≥880px 是九列，≤640px
+  同一份 DOM 按行塌成卡片。窄屏单列、触控目标 ≥44px、长值 `overflow-wrap: anywhere`；
+  ≥880px 概览与设置项两列。断点只有 `max-width: 640px` 与 `min-width: 880px` 两个。
 - **复用一组状态件**：`.badge[data-tone]` 状态徽标、`.badge[data-timing]` 生效时机
   （`immediate` / `refresh` / `evict` / `restart`）、`.alert` 错误与警告、
   `.state[data-state=loading|empty|error]` 三态。不引入图标库、字体文件、动画关键帧、
   主题切换开关或任何构建步骤（ADR-0002）。
 
-模板 `templates/*.html` 与 `static/app.css`、`static/app.js` 用 `//go:embed` 进二进制：
-界面没有构建步骤、没有 `package.json`（ADR-0002）。页面 JS 只调下面这些 API，渲染结果
+模板 `templates/*.html` 与 `static/app.css`、`static/app.js`、`static/paging.js` 用
+`//go:embed` 进二进制：界面没有构建步骤、没有 `package.json`（ADR-0002）。`paging.js`
+只放剧库的纯逻辑（筛选 / 分页 / 台账单元格），不碰 DOM —— 浏览器里挂
+`window.DramaHubPaging`，node 里可 `require`，`TestPagingContract` 用同一份源码做表驱动
+单测（e2e 镜像装 nodejs 就是为了它，运行时镜像不需要）。页面 JS 只调下面这些 API，渲染结果
 与 API 返回一一对应；页面响应同样给出精确 `Content-Length`（渲染成字节 → 再写响应）。
 
 ### 管理 API
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/api/dramas` | GET | 剧目列表：drama 行 + `episodes` / `emby_items`（对外集数，运行时派生）计数 |
+| `/api/dramas` | GET | 剧目列表：drama 行（含 `genre` / `plot` / 布尔 `has_cover`）+ `episodes` / `emby_items`（对外集数，运行时派生）计数 |
 | `/api/dramas` | POST | 新增剧目：`{"series_id":"<上游剧 id 或 /player/ 链接>"}`，同步入库后返回整份列表：**库里新建了行 → 201，这部剧已存在（这次只更新）→ 200** |
+| `/api/dramas/{id}/episodes` | GET | 剧详情页的集分块：`{"id","merge_chunk_size","webdav_path","chunks":[{"ep_no","from","to","count","play_id","play_url","episodes":[{"ep_no","title","duration_sec"}]}]}`。块边界与对外集号只走 `store.ListEmbyItems`（内部 `deriveEmbyItems`），播放 id 只由后端签名；id 非法 400、剧不存在 404 |
+| `/api/dramas/{id}/cover` | GET | 海报字节：命中 → 200 + `image/*` + 精确 `Content-Length` + `Cache-Control`；没有海报或上游失败 → 404（不 500）。与 WebDAV 的 `poster.jpg` 共用同一个 CoverCache |
 | `/api/refresh` | POST | 手动跑一轮：`{"source":"web"}` → 202 已启动 / 404 无此源或未启用 / 409 该源正在跑（与定时共用单飞锁） |
 | `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `cache_dir` / `merge_chunk_size` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」）+ `jellyfin` 块 = 媒体库维护现状（`configured` / `missing[]` / `url` / `library_root` / `library_prefix` / `api_key_set` / `timeout_sec` / `running` / `last_run_at` / `last_ok_at` / `last_error` / `created` / `unchanged` / `removed` / `duration_ms` / `uncertain` / `failed[]` / `delete_failed[]` / `disabled[]` / `orphans[]` / `conflicts[]`，运行中另有 `started_at` / `phase` / `phase_label` / `processed` / `total` 进度字段；**api key 永不出现在响应里**，只给 `api_key_set`） |
 | `/api/settings` | PATCH | 按 key 批量写配置：`{"settings":{"<key>":"<原始值>",…}}` → 200 + **归一化后的值**（`strm_prefix` 去尾 `/`；`webdav_pass` / `stream_secret` 回 `null`，不回显）。未知键 / 非法值 → 400 且**整批一行不写**；`{"settings":{}}` → 400。值一律写成字符串（数字/布尔也写成 `"4096"` / `"false"`），校验只有服务端那一份。写操作要令牌，见下「写操作鉴权」 |
@@ -929,7 +940,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | 令牌不符 / 缺失 | 401，`message` 说明缺哪个请求头 |
 | 范围 | 按「方法 + `/api/` 前缀」判定（`Server.ServeHTTP` 里的闸门）：新增写端点默认受保护，不需要逐个登记 |
 | 不受影响 | `GET /api/*`、单页界面、`/webdav/`（Basic 认证）、`/video/`（HMAC 签名）各按自己的口径 |
-| 页面怎么带 | 顶栏「管理令牌」输入框 → `sessionStorage`（关掉标签页就没了）；`app.js` 对非 GET 请求自动加这个头。令牌不进任何页面响应、不进日志 |
+| 页面怎么带 | 顶栏只有「写操作 · 未解锁」按钮，点开原生 `<dialog id=token-dialog>` 填 `#admin-token`（MKACG-675）；确认后存 `sessionStorage`（关掉标签页就没了），`app.js` 对非 GET 请求自动加这个头；任一写请求 401 会自动打开弹窗并显示服务端原因。令牌不进任何页面响应、不进日志 |
 
 ### Jellyfin 媒体库（ADR-0012）
 

@@ -373,3 +373,138 @@ details.card[open] > summary {
     --danger-bg: #2d1917;
   }
 }
+
+/* ---- 令牌按需解锁：顶栏按钮 + 原生 dialog ---- */
+
+.token-btn { margin-left: auto; }
+.token-btn[data-unlocked="true"] { border-color: var(--accent); color: var(--accent); }
+
+dialog.token-dialog {
+  width: min(42ch, calc(100vw - var(--s6)));
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
+}
+dialog.token-dialog::backdrop { background: rgb(20 15 10 / 45%); }
+.token-form { display: flex; flex-direction: column; gap: var(--s3); padding: var(--s5); }
+.token-form h2 { margin: 0; font-size: var(--f-lg); }
+.token-form .notice { margin: 0; }
+.dialog-foot { display: flex; justify-content: flex-end; gap: var(--s2); }
+
+/* ---- 剧库：工具条 ---- */
+
+.toolbar {
+  display: flex; flex-wrap: wrap; align-items: flex-end;
+  gap: var(--s3); margin-bottom: var(--s4);
+}
+.toolbar .field { flex: 1 1 18ch; }
+.toolbar-actions { display: flex; gap: var(--s2); margin-left: auto; }
+
+/* ---- 剧库：ARIA 台账（窄屏卡片 / ≥880px 表格） ---- */
+
+.ledger-row {
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s1);
+  padding: var(--s3) var(--s4); margin-bottom: var(--s3);
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--surface);
+}
+.ledger-head { display: none; }
+.ledger-cell {
+  display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: var(--s2);
+  min-width: 0; font-size: var(--f-sm); color: var(--ink-2);
+}
+.ledger-cell::before { content: attr(data-label); color: var(--ink-3); font-size: var(--f-xs); }
+.ledger-title { font-size: var(--f-md); font-weight: 600; color: var(--ink); }
+.cover-thumb {
+  display: block; width: 48px; height: 64px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--bg); object-fit: cover;
+}
+span.cover-thumb {
+  display: grid; place-items: center;
+  font-size: var(--f-xs); color: var(--ink-3);
+}
+
+/* ---- 剧库：海报墙 ---- */
+
+/* [hidden] 必须压过组件自己的 display（.wall 是 grid、.pager 是 flex），
+ * 否则 author 声明会盖掉 UA 的 [hidden] { display: none }，隐藏的视图照样渲染。 */
+[hidden] { display: none !important; }
+
+.wall { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: var(--s4); }
+.poster-card { display: flex; flex-direction: column; gap: var(--s2); color: inherit; text-decoration: none; }
+.poster-frame {
+  position: relative; aspect-ratio: 2 / 3; overflow: hidden;
+  border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg);
+}
+.poster-frame img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.poster-card:hover .poster-frame { border-color: var(--line-strong); }
+.poster-title { overflow: hidden; font-size: var(--f-sm); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.poster-meta { font-size: var(--f-xs); color: var(--ink-3); }
+
+/* ---- 分页 ---- */
+
+.pager { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); margin-top: var(--s4); }
+.pager-info { margin-left: auto; font-size: var(--f-sm); color: var(--ink-3); }
+
+/* ---- 剧详情 ---- */
+
+.drama-head { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s5); align-items: start; }
+.drama-cover { width: 100%; max-width: 200px; aspect-ratio: 2 / 3; object-fit: cover; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); }
+.drama-plot { color: var(--ink-2); line-height: 1.65; white-space: pre-wrap; }
+.drama-actions { display: flex; flex-wrap: wrap; gap: var(--s2); margin: var(--s4) 0; }
+.chunk-list { display: flex; flex-direction: column; gap: var(--s3); }
+.chunk { border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface); }
+.chunk-head {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s3);
+  padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line);
+}
+.chunk-head strong { font-size: var(--f-md); }
+.chunk-body { display: flex; flex-wrap: wrap; gap: var(--s2); padding: var(--s3) var(--s4); }
+.ep-pill { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 2px var(--s2); font-size: var(--f-xs); color: var(--ink-2); }
+.play-url { display: flex; gap: var(--s2); align-items: center; padding: var(--s2) var(--s4) var(--s4); }
+.play-url code {
+  flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere;
+  padding: var(--s2); border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--bg); font-family: var(--mono); font-size: var(--f-xs);
+}
+
+/* ---- 分类 ---- */
+
+.cat-row {
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s2);
+  padding: var(--s3) 0; border-bottom: 1px solid var(--line);
+}
+.cat-row:last-child { border-bottom: 0; }
+.cat-name { font-weight: 600; }
+.cat-meta { font-size: var(--f-sm); color: var(--ink-3); }
+
+/* ---- 宽屏：台账表格化、海报墙放大、详情两栏、分类行一行 ---- */
+
+@media (min-width: 880px) {
+  .ledger { overflow: hidden; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface); }
+  .ledger-head,
+  .ledger-row {
+    display: grid; align-items: center; gap: var(--s3);
+    grid-template-columns:
+      64px minmax(0, 2.4fr) 64px 110px 96px 130px 130px 110px 88px;
+    padding: var(--s2) var(--s4);
+  }
+  .ledger-head {
+    border-bottom: 1px solid var(--line); color: var(--ink-3);
+    font-size: var(--f-xs); letter-spacing: .06em; text-transform: uppercase;
+  }
+  .ledger-row {
+    margin: 0; border: 0; border-radius: 0; border-bottom: 1px solid var(--line); background: transparent;
+  }
+  .ledger-row:last-child { border-bottom: 0; }
+  .ledger-row:hover { background: var(--bg); }
+  .ledger-cell { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ledger-cell::before { content: none; }
+  .wall { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+  .drama-head { grid-template-columns: 200px minmax(0, 1fr); }
+  .cat-row { grid-template-columns: minmax(0, 1fr) 110px 110px 130px auto; align-items: center; }
+}

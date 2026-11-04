@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/justforlxz/drama-hub/internal/pgtest"
+	"github.com/justforlxz/drama-hub/internal/playback"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
@@ -68,7 +70,8 @@ func TestAPI_WriteEndpointsRequireToken(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = db.Close() })
 		srv := NewServer(store.NewStore(db.DB), store.NewSettings(db.DB), &fakeSyncer{}, &fakeSchedule{},
-			&fakeJellyfin{}, nil, nil, "", slog.New(slog.DiscardHandler))
+			&fakeJellyfin{}, nil, playback.NewTracker(time.Now), &fakeCovers{}, testSignID, testDramaPath,
+			"", slog.New(slog.DiscardHandler))
 		req := httptest.NewRequest(http.MethodPatch, "/api/settings",
 			strings.NewReader(`{"settings":{"webdav_user":"alice"}}`))
 		rec := httptest.NewRecorder()

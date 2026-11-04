@@ -220,7 +220,7 @@ func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, 
 	// 播放面两条路由由 internal/segment 自己提供（领域包只提供 handler，挂载点在此）。
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
 	mux.HandleFunc(segment.SegmentRoute, cutter.ServeSegment)
-	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, jellyfinMgr, sources, playbackTracker, adminToken, logger))
+	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, jellyfinMgr, sources, playbackTracker, covers, signID, treePath(tree), adminToken, logger))
 	return httpx.RequestLogger(logger, mux)
 }
 
@@ -412,6 +412,14 @@ func sourceList(reg *plugin.Registry, boots map[string]pluginBoot) []web.Source 
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
+}
+
+// treePath 把 Tree.DramaPath 适配为 web.DramaPathFunc：管理界面展示的 WebDAV 目录
+// 与虚拟树共用同一份命名算法（分类兜底名与转义、同分类内同名冲突后缀）。
+func treePath(tree *vfs.Tree) web.DramaPathFunc {
+	return func(ctx context.Context, d store.Drama) (string, error) {
+		return tree.DramaPath(ctx, d)
+	}
 }
 
 // signID 把 stream.ID 适配为 vfs.IDFunc：vfs（rank 30）只声明它需要一个「(secret, uid)

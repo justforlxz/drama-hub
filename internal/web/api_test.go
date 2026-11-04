@@ -100,7 +100,30 @@ func newTestServerWith(t *testing.T, jellyfinMgr Jellyfin) (*Server, *store.Stor
 	// 状态页的播放源清单由装配根给（生产里来自注册表），测试固定一个源。
 	sources := []Source{{Name: "web", Label: "红果官网 SSR"}}
 	return NewServer(st, store.NewSettings(db.DB), syncer, &fakeSchedule{}, jellyfinMgr, sources,
-		playback.NewTracker(time.Now), testAdminToken, slog.New(slog.DiscardHandler)), st, syncer
+		playback.NewTracker(time.Now), &fakeCovers{}, testSignID, testDramaPath,
+		testAdminToken, slog.New(slog.DiscardHandler)), st, syncer
+}
+
+// fakeCovers 是封面依赖的替身：默认「没有封面」，用例要命中时给 body/available。
+// 真实回源、单飞与落盘由 internal/cache 自己覆盖。
+type fakeCovers struct {
+	body      []byte
+	available bool
+	err       error
+	calls     int
+}
+
+func (f *fakeCovers) Poster(context.Context, string, string, string) ([]byte, bool, error) {
+	f.calls++
+	return f.body, f.available, f.err
+}
+
+// testSignID 是播放 id 签名依赖的替身：确定性、可读，不在 web 包里复制 stream.ID。
+func testSignID(secret, uid string) string { return uid + "@" + secret }
+
+// testDramaPath 是剧目录路径依赖的替身：真实拼法由 internal/vfs 覆盖。
+func testDramaPath(context.Context, store.Drama) (string, error) {
+	return "短剧/其他/测试剧 (2024)", nil
 }
 
 // fakeJellyfin 是媒体库维护依赖的替身：记下触发次数，现状与分类开关由用例给定。
@@ -309,20 +332,16 @@ func TestAPI_CreateDrama_SyncFails(t *testing.T) {
 	}
 }
 
-// TestAPI_RemovedDramaEndpoints 覆盖「删剧目」与「集列表」两个端点随剧目页一起移除
-// （MKACG-665）：它们只服务已删除的页面，没有其它使用场景，于是退化成未登记路径（404）。
+// TestAPI_RemovedDramaEndpoints 覆盖「删剧目」端点仍是未登记路径（MKACG-665）：
+// 它只服务已删除的剧目页。集列表端点已由 MKACG-675 以新形态恢复
+// （GET /api/dramas/{id}/episodes，见 TestAPI_DramaEpisodes），不再属于「已移除」。
 func TestAPI_RemovedDramaEndpoints(t *testing.T) {
 	srv, st, _ := newTestServer(t)
 	dramaID := seedDrama(t, st, "5005", "已删端点的剧", []string{"a", "b"})
 	base := "/api/dramas/" + strconv.Itoa(int(dramaID))
 
-	for _, c := range []struct{ method, path, body string }{
-		{http.MethodDelete, base, ""},
-		{http.MethodGet, base + "/episodes", ""},
-	} {
-		if rec := do(t, srv, c.method, c.path, c.body); rec.Code != http.StatusNotFound {
-			t.Errorf("%s %s 状态码 = %d, 期望 404（端点已移除）", c.method, c.path, rec.Code)
-		}
+	if rec := do(t, srv, http.MethodDelete, base, ""); rec.Code != http.StatusNotFound {
+		t.Errorf("DELETE %s 状态码 = %d, 期望 404（端点已移除）", base, rec.Code)
 	}
 }
 
@@ -660,7 +679,7 @@ func TestAPI_Refresh_RealScheduler(t *testing.T) {
 		map[string]scheduler.Syncer{"web": syncer},
 		slog.New(slog.DiscardHandler), nil)
 	srv := NewServer(st, settings, syncer, sched, &fakeJellyfin{}, []Source{{Name: "web", Label: "红果官网 SSR"}},
-		nil, testAdminToken, slog.New(slog.DiscardHandler))
+		nil, &fakeCovers{}, testSignID, testDramaPath, testAdminToken, slog.New(slog.DiscardHandler))
 
 	if rec := do(t, srv, http.MethodPost, "/api/refresh", `{"source":"web"}`); rec.Code != http.StatusAccepted {
 		t.Fatalf("第一次手动触发状态码 = %d, 期望 202（body=%s）", rec.Code, rec.Body.String())

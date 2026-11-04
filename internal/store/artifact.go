@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // artifact 表的 kind 取值（docs/DATA-MODEL.md「0003」「0006」的 CHECK 约束）。
@@ -52,6 +53,44 @@ func (s *Store) ArtifactByKey(ctx context.Context, kind, key string) (Artifact, 
 		return Artifact{}, fmt.Errorf("查缓存资产 %s/%s: %w", kind, key, err)
 	}
 	return a, nil
+}
+
+// CoverRef 是一部剧的海报身份：artifact 键 `<provider>/<provider_id>` 的结构化形态。
+// 键的拼法只在本包（CoverRefs 负责拆），调用方不自己拼字符串。
+type CoverRef struct {
+	Provider   string
+	ProviderID string
+}
+
+// CoverRefs 返回全部已登记海报的身份集合（kind='cover'）。
+//
+// 剧目列表用它一次算出每部剧的 has_cover：一次 kind='cover' 的扫描，代价是该表封面
+// 行数，不按剧逐个点查（那会变成 N+1）。行在即「有封面」——文件被淘汰后行仍保留
+// （见 internal/cache 的 hitFile 注释），列表不会因为淘汰而闪成占位块。
+func (s *Store) CoverRefs(ctx context.Context) (map[CoverRef]struct{}, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key FROM artifact WHERE kind = $1`, ArtifactKindCover)
+	if err != nil {
+		return nil, fmt.Errorf("列海报键: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[CoverRef]struct{})
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("读海报键: %w", err)
+		}
+		// 键恒为 `<provider>/<provider_id>`；provider 是插件名，不含 `/`，
+		// 所以按第一个 `/` 切分即可还原。
+		provider, providerID, ok := strings.Cut(key, "/")
+		if !ok {
+			continue
+		}
+		out[CoverRef{Provider: provider, ProviderID: providerID}] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("列海报键: %w", err)
+	}
+	return out, nil
 }
 
 // PutArtifact 以 (kind, key) 为身份写入或更新一份缓存资产的索引行。

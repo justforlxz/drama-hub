@@ -8,14 +8,14 @@
 const TOKEN_KEY = 'drama-hub.admin-token';
 const TOKEN_HEADER = 'X-Admin-Token';
 
-/** 当前管理令牌：以顶栏输入框为准（刚打完字、还没触发 change 时也拿得到）。 */
+/** 当前管理令牌：以令牌弹窗里的输入框为准（刚打完字、还没触发 change 时也拿得到）。 */
 function adminToken() {
   const input = document.getElementById('admin-token');
   if (input && input.value.trim() !== '') return input.value.trim();
   return sessionStorage.getItem(TOKEN_KEY) || '';
 }
 
-/** 顶栏令牌框：回填上次输入，改动即记住（清空 = 忘掉）。 */
+/** 令牌弹窗里的输入框：回填上次输入，改动即记住（清空 = 忘掉）。 */
 function initAdminToken() {
   const input = document.getElementById('admin-token');
   if (!input) return;
@@ -26,6 +26,71 @@ function initAdminToken() {
     if (value === '') sessionStorage.removeItem(TOKEN_KEY);
     else sessionStorage.setItem(TOKEN_KEY, value);
   });
+}
+
+// ---- 管理令牌：平时不占页面，点顶栏按钮才开原生 dialog ----
+
+function updateTokenState() {
+  const state = document.getElementById('token-state');
+  const button = document.getElementById('token-button');
+  const unlocked = adminToken() !== '';
+  if (state) state.textContent = unlocked ? '写操作 · 已解锁' : '写操作 · 未解锁';
+  if (button) button.dataset.unlocked = unlocked ? 'true' : 'false';
+}
+
+/** 打开令牌弹窗：焦点落在输入框，方便直接粘贴。 */
+function openTokenDialog() {
+  const dialog = document.getElementById('token-dialog');
+  if (!dialog) return;
+  updateTokenState();
+  if (typeof dialog.showModal === 'function') {
+    if (!dialog.open) dialog.showModal();
+  } else {
+    dialog.setAttribute('open', '');
+  }
+  const input = document.getElementById('admin-token');
+  if (input) input.focus();
+}
+
+function closeTokenDialog() {
+  const dialog = document.getElementById('token-dialog');
+  if (!dialog) return;
+  if (typeof dialog.close === 'function') dialog.close();
+  else dialog.removeAttribute('open');
+}
+
+/** 顶栏按钮开弹窗；弹窗里「解锁」存 sessionStorage，「清除」忘掉令牌。 */
+function initTokenDialog() {
+  const dialog = document.getElementById('token-dialog');
+  const button = document.getElementById('token-button');
+  const clear = document.getElementById('token-clear');
+  const form = document.getElementById('token-form');
+  const input = document.getElementById('admin-token');
+  if (button) button.addEventListener('click', openTokenDialog);
+  if (clear) {
+    clear.addEventListener('click', () => {
+      if (input) input.value = '';
+      sessionStorage.removeItem(TOKEN_KEY);
+      updateTokenState();
+      closeTokenDialog();
+      say('已清除管理令牌，写操作要重新解锁', 'ok');
+    });
+  }
+  if (form) {
+    form.addEventListener('submit', () => {
+      // method=dialog 的表单会自己关窗；这里只落存储并刷新状态。
+      if (input) {
+        const value = input.value.trim();
+        input.value = value;
+        if (value === '') sessionStorage.removeItem(TOKEN_KEY);
+        else sessionStorage.setItem(TOKEN_KEY, value);
+      }
+      updateTokenState();
+    });
+  }
+  if (dialog) dialog.addEventListener('close', updateTokenState);
+  if (input) input.addEventListener('change', updateTokenState);
+  updateTokenState();
 }
 
 /** 请求管理 API，返回 {status, data}；非 2xx 抛 Error（带服务端 message）。 */
@@ -50,6 +115,12 @@ async function apiRaw(method, path, body) {
     const message = data && data.message ? data.message : res.status + ' ' + res.statusText;
     const error = new Error(message);
     error.status = res.status; // 409 这类「不是故障的状态」页面要单独处理（见 syncJellyfin）
+    // 401 = 没解锁 / 令牌不对：直接把令牌弹窗打开，并把服务端说明贴进去。
+    if (res.status === 401) {
+      openTokenDialog();
+      const notice = document.getElementById('token-notice');
+      if (notice) notice.textContent = message;
+    }
     throw error;
   }
   return { status: res.status, data };
@@ -132,9 +203,6 @@ function initOverview() {
   const jfBtn = document.getElementById('jellyfin-sync');
   const jfHint = document.getElementById('jellyfin-hint');
   const jfCategories = document.getElementById('jellyfin-categories');
-  const dramaForm = document.getElementById('drama-form');
-  const dramaInput = document.getElementById('series-id');
-  const dramaBtn = document.getElementById('drama-submit');
   const pbSummary = document.getElementById('playback-summary');
   const pbBadge = document.getElementById('playback-badge');
   const pbList = document.getElementById('playback-list');
@@ -462,12 +530,11 @@ function initOverview() {
     if (!status.admin_token_set) {
       writeHint.textContent = '未设置 DRAMA_HUB_ADMIN_TOKEN：刷新、同步与改配置都会 401。在服务端加上这个 env 再重启。';
     } else if (adminToken() === '') {
-      writeHint.textContent = '先在顶栏「管理令牌」里填 DRAMA_HUB_ADMIN_TOKEN，再操作（令牌只存在本标签页）。';
+      writeHint.textContent = '先在顶栏「写操作 · 未解锁」里填 DRAMA_HUB_ADMIN_TOKEN，再操作（令牌只存在本标签页）。';
     } else {
       writeHint.textContent = '';
     }
     jfBtn.disabled = !ready || status.jellyfin.running;
-    dramaBtn.disabled = !ready;
     updateCategoryWritable();
     for (const button of sourcesBox.querySelectorAll('button[data-refresh]')) {
       button.disabled = !ready;
@@ -479,7 +546,7 @@ function initOverview() {
       ? '还缺 ' + status.jellyfin.missing.join('、') + '；地址 / API key / 媒体库根三项都非空才启用。'
       : ready
         ? '关掉的分类在下一轮同步时删库；孤儿库（分类已消失）只报告，不删。'
-        : '同步媒体库与分类开关都是写操作，需要先在顶栏填管理令牌。';
+        : '同步媒体库与分类开关都是写操作，需要先点顶栏解锁写操作。';
   }
 
   async function load() {
@@ -503,34 +570,6 @@ function initOverview() {
     // 刷新 / 首次打开时这一轮可能还在跑：接着看，不必等用户再点一次。
     if (status.jellyfin.running) followJellyfin();
   }
-
-  dramaForm.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const raw = dramaInput.value.trim();
-    if (raw === '') {
-      say('先填上游剧 id 或 /player/ 链接', 'error', 'drama-notice');
-      return;
-    }
-    const digits = raw.match(/\d+/g);
-    const sid = digits === null ? '' : digits[digits.length - 1];
-    dramaBtn.disabled = true;
-    say('正在从上游同步 …', 'busy', 'drama-notice');
-    try {
-      const { status: code, data } = await apiRaw('POST', '/api/dramas', { series_id: raw });
-      const hit = data && data.dramas ? data.dramas.find((d) => d.provider_id === sid) : null;
-      const title = hit ? '《' + hit.title + '》' : '这部剧';
-      const extra = hit ? '，库里 ' + hit.episodes + ' 集' : '';
-      say(code === 201
-        ? '已新建 ' + title + extra + '（201）'
-        : title + ' 已在库，这次只更新' + extra + '（200）', 'ok', 'drama-notice');
-      dramaInput.value = '';
-      await load();
-    } catch (err) {
-      say(err.message, 'error', 'drama-notice');
-    } finally {
-      dramaBtn.disabled = !canWrite();
-    }
-  });
 
   jfBtn.addEventListener('click', syncJellyfin);
 
@@ -716,8 +755,403 @@ function initSettings() {
   load();
 }
 
+// ---- 剧库 ----
+
+function initLibrary() {
+  const P = window.DramaHubPaging;
+  const summaryBox = document.getElementById('library-summary');
+  const rowsBox = document.getElementById('library-rows');
+  const wallBox = document.getElementById('library-wall');
+  const emptyBox = document.getElementById('library-empty');
+  const ledger = document.getElementById('library-ledger');
+  const pager = document.getElementById('library-pager');
+  const prevBtn = document.getElementById('pager-prev');
+  const nextBtn = document.getElementById('pager-next');
+  const pagerInfo = document.getElementById('pager-info');
+  const searchInput = document.getElementById('library-search');
+  const genreSelect = document.getElementById('library-genre');
+  const filterSelect = document.getElementById('library-filter');
+  const listBtn = document.getElementById('library-view-list');
+  const wallBtn = document.getElementById('library-view-wall');
+  const lookupToggle = document.getElementById('lookup-toggle');
+  const lookup = document.getElementById('lookup');
+  const dramaForm = document.getElementById('drama-form');
+  const dramaInput = document.getElementById('series-id');
+  const dramaBtn = document.getElementById('drama-submit');
+
+  const state = { query: '', genre: '', status: '', page: 1, view: 'list' };
+  let dramas = [];
+  let jellyfin = new Map(); // 分类名 -> 媒体库是否启用
+  let status = null;
+
+  const canWrite = () => Boolean(status && status.admin_token_set && adminToken() !== '');
+
+  function jellyfinText(genre) {
+    if (jellyfin.size === 0) return '—';
+    if (!jellyfin.has(genre)) return '未建库';
+    return jellyfin.get(genre) ? '已入库' : '已关库';
+  }
+
+  function coverNode(drama, className) {
+    if (!drama.has_cover) return el('span', { class: className, text: '无封面' });
+    return el('img', {
+      class: className,
+      src: '/api/dramas/' + drama.id + '/cover',
+      alt: '',
+      loading: 'lazy',
+    });
+  }
+
+  function ledgerRow(drama) {
+    const cells = P.ledgerCells(drama, fmtTime, jellyfinText);
+    const row = el('div', { class: 'ledger-row', role: 'row' });
+    cells.forEach((cell, index) => {
+      const box = el('div', { class: 'ledger-cell', role: 'cell', 'data-label': cell.label });
+      if (index === 0) box.append(coverNode(drama, 'cover-thumb'));
+      else if (index === 1) box.append(el('a', { class: 'ledger-title', href: '/library/' + drama.id, text: cell.text }));
+      else if (index === 8) box.append(el('a', { class: 'btn', href: '/library/' + drama.id, text: '详情' }));
+      else box.append(el('span', { text: cell.text }));
+      row.append(box);
+    });
+    return row;
+  }
+
+  function posterCard(drama) {
+    const frame = el('div', { class: 'poster-frame' });
+    if (drama.has_cover) {
+      frame.append(el('img', { src: '/api/dramas/' + drama.id + '/cover', alt: '', loading: 'lazy' }));
+    } else {
+      frame.append(el('span', { class: 'hint', text: '无封面' }));
+    }
+    const meta = [drama.year ? drama.year + ' 年' : '', P.genreOf(drama), drama.episodes + ' 集']
+      .filter((part) => part !== '').join(' · ');
+    return el('a', { class: 'poster-card', href: '/library/' + drama.id },
+      frame,
+      el('span', { class: 'poster-title', text: drama.title || '未命名' }),
+      el('span', { class: 'poster-meta', text: meta }));
+  }
+
+  function render() {
+    const view = P.computeView(dramas, state);
+    state.page = view.page;
+    const wall = state.view === 'wall';
+    // 只填当前视图那一侧：隐藏的一侧不留旧数据，海报也不会跟着发图片请求。
+    if (wall) {
+      wallBox.replaceChildren(...view.items.map(posterCard));
+      rowsBox.replaceChildren();
+    } else {
+      rowsBox.replaceChildren(...view.items.map(ledgerRow));
+      wallBox.replaceChildren();
+    }
+    ledger.hidden = wall;
+    wallBox.hidden = !wall;
+    emptyBox.hidden = view.total !== 0;
+    pager.hidden = view.pages <= 1;
+    pagerInfo.textContent = '第 ' + view.page + ' / ' + view.pages + ' 页 · 共 ' + view.total + ' 部';
+    prevBtn.disabled = view.page <= 1;
+    nextBtn.disabled = view.page >= view.pages;
+    listBtn.setAttribute('aria-pressed', wall ? 'false' : 'true');
+    wallBtn.setAttribute('aria-pressed', wall ? 'true' : 'false');
+  }
+
+  // 分类下拉用库里出现过的分类去重（空分类归「其他」）。
+  function fillGenres() {
+    const names = Array.from(new Set(dramas.map((d) => P.genreOf(d))))
+      .sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+    const current = genreSelect.value;
+    genreSelect.replaceChildren(
+      el('option', { value: '', text: '全部分类' }),
+      ...names.map((name) => el('option', { value: name, text: name })));
+    genreSelect.value = names.includes(current) ? current : '';
+    state.genre = genreSelect.value;
+  }
+
+  function syncWritable() {
+    dramaBtn.disabled = !canWrite();
+  }
+
+  function applyFilter(patch) {
+    Object.assign(state, P.withFilter(state, patch));
+    render();
+  }
+
+  async function load() {
+    try {
+      const [list, cats, st] = await Promise.all([
+        api('GET', '/api/dramas'),
+        api('GET', '/api/jellyfin/categories').catch(() => null),
+        api('GET', '/api/status'),
+      ]);
+      dramas = list && list.dramas ? list.dramas : [];
+      status = st;
+      jellyfin = new Map();
+      if (cats && cats.categories) {
+        for (const category of cats.categories) jellyfin.set(category.name, category.enabled);
+      }
+      const sum = P.totals(dramas);
+      summaryBox.textContent = sum.dramas + ' 部剧 · ' + sum.episodes + ' 集 · ' + sum.emby_items + ' 个对外集';
+      fillGenres();
+      render();
+      syncWritable();
+    } catch (err) {
+      summaryBox.textContent = '读取失败';
+      fail(err);
+    }
+  }
+
+  searchInput.addEventListener('input', () => applyFilter({ query: searchInput.value }));
+  genreSelect.addEventListener('change', () => applyFilter({ genre: genreSelect.value }));
+  filterSelect.addEventListener('change', () => applyFilter({ status: filterSelect.value }));
+  prevBtn.addEventListener('click', () => { state.page -= 1; render(); });
+  nextBtn.addEventListener('click', () => { state.page += 1; render(); });
+  listBtn.addEventListener('click', () => { state.view = 'list'; render(); });
+  wallBtn.addEventListener('click', () => { state.view = 'wall'; render(); });
+  lookupToggle.addEventListener('click', () => {
+    const open = !lookup.open;
+    lookup.open = open;
+    lookupToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) dramaInput.focus();
+  });
+
+  dramaForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const raw = dramaInput.value.trim();
+    if (raw === '') {
+      say('先填上游剧 id 或 /player/ 链接', 'error', 'drama-notice');
+      return;
+    }
+    const digits = raw.match(/\d+/g);
+    const sid = digits === null ? '' : digits[digits.length - 1];
+    dramaBtn.disabled = true;
+    say('正在从上游同步 …', 'busy', 'drama-notice');
+    try {
+      const { status: code, data } = await apiRaw('POST', '/api/dramas', { series_id: raw });
+      const hit = data && data.dramas ? data.dramas.find((d) => d.provider_id === sid) : null;
+      const title = hit ? '《' + hit.title + '》' : '这部剧';
+      const extra = hit ? '，库里 ' + hit.episodes + ' 集' : '';
+      say(code === 201
+        ? '已新建 ' + title + extra + '（201）'
+        : title + ' 已在库，这次只更新' + extra + '（200）', 'ok', 'drama-notice');
+      dramaInput.value = '';
+      await load();
+    } catch (err) {
+      say(err.message, 'error', 'drama-notice');
+    } finally {
+      syncWritable();
+    }
+  });
+
+  load();
+}
+
+// ---- 剧详情 ----
+
+function initDrama() {
+  const P = window.DramaHubPaging;
+  const card = document.getElementById('drama-card');
+  if (!card) return;
+  const id = Number(card.dataset.dramaId);
+  const titleEl = document.getElementById('drama-title');
+  const summaryBox = document.getElementById('drama-summary');
+  const metaBox = document.getElementById('drama-meta');
+  const plotBox = document.getElementById('drama-plot');
+  const cover = document.getElementById('drama-cover');
+  const webdavBox = document.getElementById('drama-webdav');
+  const webdavCopy = document.getElementById('drama-webdav-copy');
+  const refreshBtn = document.getElementById('drama-refresh');
+  const chunkInfo = document.getElementById('chunk-info');
+  const chunkList = document.getElementById('chunk-list');
+
+  let drama = null;
+  let status = null;
+
+  // 复制有降级：没有剪贴板权限时什么都不做，不弹假成功。
+  async function copyText(text, button) {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      return;
+    }
+    if (button) {
+      const old = button.textContent;
+      button.textContent = '已复制';
+      setTimeout(() => { button.textContent = old; }, 1200);
+    }
+  }
+
+  function kv(label, value) {
+    return [el('dt', { text: label }), el('dd', { text: value === '' || value === null ? '—' : String(value) })];
+  }
+
+  function renderDrama() {
+    titleEl.textContent = drama.title || '剧详情';
+    document.title = (drama.title || '剧详情') + ' · drama-hub';
+    summaryBox.textContent = [drama.year ? drama.year + ' 年' : '',
+      P.genreOf(drama),
+      (drama.episodes || 0) + '/' + (drama.episode_total || 0) + ' 集',
+      (drama.emby_items || 0) + ' 个对外集'].join(' · ');
+    metaBox.replaceChildren(
+      ...kv('上游', drama.provider + ':' + drama.provider_id),
+      ...kv('分类', P.genreOf(drama)),
+      ...kv('年份', drama.year),
+      ...kv('上次同步', fmtTime(drama.sync_at)));
+    plotBox.textContent = drama.plot || '（这个源没给简介）';
+    if (drama.has_cover) {
+      cover.src = '/api/dramas/' + drama.id + '/cover';
+      cover.alt = drama.title || '';
+      cover.hidden = false;
+    }
+  }
+
+  function chunkCard(chunk) {
+    const pills = chunk.episodes.map((ep) => el('span', {
+      class: 'ep-pill',
+      text: '#' + ep.ep_no + ' ' + (ep.title || '') + (ep.duration_sec ? ' · ' + ep.duration_sec + ' 秒' : ''),
+    }));
+    return el('div', { class: 'chunk' },
+      el('div', { class: 'chunk-head' },
+        el('strong', { text: P.chunkRangeLabel(chunk.from, chunk.to) }),
+        el('span', { class: 'hint', text: '对外第 ' + chunk.ep_no + ' 集 · ' + chunk.count + ' 个片段' })),
+      el('div', { class: 'chunk-body' }, ...pills),
+      el('div', { class: 'play-url' },
+        el('code', { text: chunk.play_url || '—' }),
+        el('button', {
+          type: 'button',
+          class: 'btn',
+          text: '复制',
+          onclick: (event) => copyText(chunk.play_url, event.currentTarget),
+        })));
+  }
+
+  function renderEpisodes(data) {
+    webdavBox.textContent = data.webdav_path || '—';
+    chunkInfo.textContent = '每 ' + data.merge_chunk_size + ' 个片段合一块 · 共 ' + data.chunks.length + ' 块';
+    chunkList.replaceChildren(...data.chunks.map(chunkCard));
+  }
+
+  async function load() {
+    try {
+      const [list, st] = await Promise.all([api('GET', '/api/dramas'), api('GET', '/api/status')]);
+      status = st;
+      drama = (list.dramas || []).find((item) => item.id === id) || null;
+      if (!drama) {
+        titleEl.textContent = '找不到这部剧';
+        summaryBox.textContent = '';
+        fail(new Error('库里没有 id=' + id + ' 的剧'));
+        return;
+      }
+      renderDrama();
+      refreshBtn.disabled = !(status.admin_token_set && adminToken() !== '');
+      renderEpisodes(await api('GET', '/api/dramas/' + id + '/episodes'));
+    } catch (err) {
+      fail(err);
+    }
+  }
+
+  refreshBtn.addEventListener('click', async () => {
+    if (!drama) return;
+    refreshBtn.disabled = true;
+    say('正在从上游重新同步这部剧 …', 'busy');
+    try {
+      await api('POST', '/api/dramas', { series_id: drama.provider_id });
+      say('已提交同步，完成后刷新本页看新集', 'ok');
+    } catch (err) {
+      say(err.message, 'error');
+    } finally {
+      refreshBtn.disabled = !(status && status.admin_token_set && adminToken() !== '');
+    }
+  });
+  webdavCopy.addEventListener('click', () => copyText(webdavBox.textContent, webdavCopy));
+
+  load();
+}
+
+// ---- 分类 ----
+
+function initCategories() {
+  const P = window.DramaHubPaging;
+  const summaryBox = document.getElementById('categories-summary');
+  const listBox = document.getElementById('category-list');
+
+  let status = null;
+
+  const canWrite = () => Boolean(status && status.admin_token_set && adminToken() !== '');
+
+  async function toggleCategory(name, checkbox) {
+    const want = checkbox.checked;
+    checkbox.disabled = true;
+    try {
+      await api('PATCH', '/api/jellyfin/categories', { name, enabled: want });
+      say('已' + (want ? '启用' : '关闭') + '「' + name + '」的媒体库；关掉的库在下一轮同步时删除', 'ok');
+      await load();
+    } catch (err) {
+      checkbox.checked = !want;
+      checkbox.disabled = false;
+      fail(err);
+    }
+  }
+
+  function categoryRow(name, items, enabled, configured) {
+    const episodes = items.reduce((sum, item) => sum + (item.episodes || 0), 0);
+    const toggle = el('input', {
+      type: 'checkbox',
+      'aria-label': name + ' 的 Jellyfin 媒体库',
+      onchange: (event) => toggleCategory(name, event.currentTarget),
+    });
+    toggle.checked = Boolean(enabled);
+    toggle.disabled = !canWrite();
+    return el('div', { class: 'cat-row' },
+      el('span', { class: 'cat-name', text: name }),
+      el('span', { class: 'cat-meta', text: items.length + ' 部剧 · ' + episodes + ' 集' }),
+      el('span', { class: 'cat-meta', text: !configured ? 'Jellyfin 未配置' : enabled ? '已入库' : '已关库' }),
+      el('label', { class: 'switch-row' }, toggle, el('span', { text: '媒体库' })));
+  }
+
+  async function load() {
+    try {
+      const [list, cats, st] = await Promise.all([
+        api('GET', '/api/dramas'),
+        api('GET', '/api/jellyfin/categories'),
+        api('GET', '/api/status'),
+      ]);
+      status = st;
+      const byGenre = new Map();
+      for (const item of list.dramas || []) {
+        const name = P.genreOf(item);
+        if (!byGenre.has(name)) byGenre.set(name, []);
+        byGenre.get(name).push(item);
+      }
+      const enabled = new Map();
+      for (const category of cats.categories || []) {
+        enabled.set(category.name, category.enabled);
+        if (!byGenre.has(category.name)) byGenre.set(category.name, []);
+      }
+      const configured = Boolean(st.jellyfin && st.jellyfin.configured);
+      const names = Array.from(byGenre.keys()).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+      if (names.length === 0) {
+        listBox.replaceChildren(el('p', { class: 'hint', text: '库里还没有剧。' }));
+      } else {
+        listBox.replaceChildren(...names.map((name) =>
+          categoryRow(name, byGenre.get(name), enabled.get(name), configured)));
+      }
+      const totalEpisodes = (list.dramas || []).reduce((sum, item) => sum + (item.episodes || 0), 0);
+      summaryBox.textContent = names.length + ' 个分类 · ' + (list.dramas || []).length + ' 部剧 · ' + totalEpisodes + ' 集';
+    } catch (err) {
+      listBox.replaceChildren(el('p', { class: 'state', 'data-state': 'error', text: err.message }));
+      summaryBox.textContent = '读取失败';
+    }
+  }
+
+  load();
+}
+
 // ---- 分派 ----
 
 initAdminToken();
+initTokenDialog();
 if (document.body.dataset.page === 'overview') initOverview();
+if (document.body.dataset.page === 'library') initLibrary();
+if (document.body.dataset.page === 'drama') initDrama();
+if (document.body.dataset.page === 'categories') initCategories();
 if (document.body.dataset.page === 'settings') initSettings();

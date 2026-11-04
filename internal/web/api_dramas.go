@@ -19,12 +19,17 @@ type dramaView struct {
 	ID           int64  `json:"id"`
 	Title        string `json:"title"`
 	Year         int    `json:"year"`
+	Genre        string `json:"genre"`
+	Plot         string `json:"plot"`
 	Provider     string `json:"provider"`
 	ProviderID   string `json:"provider_id"`
 	EpisodeTotal int    `json:"episode_total"`
 	Episodes     int    `json:"episodes"`
 	EmbyItems    int    `json:"emby_items"`
-	SyncAt       string `json:"sync_at"`
+	// HasCover 表示这部剧的封面已经在本地落过盘（artifact 行在），剧库页据此决定
+	// 显示缩略图还是占位块；它不触发回源。
+	HasCover bool   `json:"has_cover"`
+	SyncAt   string `json:"sync_at"`
 }
 
 // dramaList 是剧目列表的响应体；GET 与 POST 返回同一形态，调用方直接套用。
@@ -32,13 +37,18 @@ type dramaList struct {
 	Dramas []dramaView `json:"dramas"`
 }
 
-// dramaViews 拼装剧目列表：一次 ListDramas + 一次 ListDramaStats，不做 N+1。
+// dramaViews 拼装剧目列表：一次 ListDramas + 一次 ListDramaStats + 一次 CoverRefs，
+// 不做 N+1。
 func (s *Server) dramaViews(ctx context.Context) ([]dramaView, error) {
 	dramas, err := s.st.ListDramas(ctx)
 	if err != nil {
 		return nil, err
 	}
 	stats, err := s.st.ListDramaStats(ctx)
+	if err != nil {
+		return nil, err
+	}
+	covers, err := s.st.CoverRefs(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -54,15 +64,24 @@ func (s *Server) dramaViews(ctx context.Context) ([]dramaView, error) {
 			ID:           d.ID,
 			Title:        d.Title,
 			Year:         d.Year,
+			Genre:        d.Genre,
+			Plot:         d.Plot,
 			Provider:     d.Provider,
 			ProviderID:   d.ProviderID,
 			EpisodeTotal: d.EpisodeTotal,
 			Episodes:     st.Episodes,
 			EmbyItems:    st.EmbyItems,
+			HasCover:     hasCover(covers, d.Provider, d.ProviderID),
 			SyncAt:       d.SyncAt,
 		})
 	}
 	return out, nil
+}
+
+// hasCover 判断这部剧的封面是否已在本地落盘。集合来自一次 CoverRefs 查询。
+func hasCover(refs map[store.CoverRef]struct{}, provider, providerID string) bool {
+	_, ok := refs[store.CoverRef{Provider: provider, ProviderID: providerID}]
+	return ok
 }
 
 // handleListDramas 处理 GET /api/dramas。

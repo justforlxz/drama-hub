@@ -57,6 +57,12 @@ type Server struct {
 	// playback 是「正在播放」的内存会话表（MKACG-683），只读快照给 /api/playback。
 	// 采集在 internal/segment，本包不写它。
 	playback *playback.Tracker
+	// covers 是海报字节的来源（与 WebDAV、同步共用同一份缓存实例）；signID 把
+	// (stream_secret, uid) 算成对外播放 id；dramaPath 返回剧在树里的目录路径。
+	// 三者都由装配根注入：本包不 import cache / stream / vfs 的实现。
+	covers    Coverer
+	signID    IDFunc
+	dramaPath DramaPathFunc
 	// adminToken 是写操作的令牌（DRAMA_HUB_ADMIN_TOKEN）。空 = 没配 = 写操作一律 401。
 	adminToken string
 	logger     *slog.Logger
@@ -73,6 +79,25 @@ type Jellyfin interface {
 	State(ctx context.Context) jellyfin.State
 	Categories(ctx context.Context) ([]jellyfin.CategoryState, error)
 }
+
+// Coverer 是海报字节的来源（生产实现：*cache.CoverCache，与同步、WebDAV 共用同一
+// 实例）。接口定义在消费方：本包只要「字节 + 有没有」这一个动作，落盘布局、单飞锁、
+// 回源超时都在实现方，web 不认识 cache 内部。
+type Coverer interface {
+	Poster(ctx context.Context, provider, providerID, url string) (body []byte, available bool, err error)
+}
+
+// IDFunc 由装配根注入，把 (stream_secret, uid) 算成对外播放 id。
+//
+// 与 vfs.IDFunc 同一形态：web（rank 50）不 import internal/stream（rank 20），
+// 算法在装配根接上（docs/PLAYBACK-CONTRACT.md「id 怎么来」）。
+type IDFunc func(secret, uid string) string
+
+// DramaPathFunc 由装配根注入，返回一部剧在虚拟树里的目录路径（`短剧/<分类>/<剧目录>`）。
+//
+// 目录名只有 vfs 一处算法（分类兜底与转义、同分类内同名冲突后缀），管理界面拿它
+// 拼可复制的 WebDAV 串，不自己拼（否则两处规则必然漂移）。
+type DramaPathFunc func(ctx context.Context, d store.Drama) (string, error)
 
 // Schedule 是刷新调度的依赖：手动触发一轮，以及状态页要显示的调度现状。
 // 生产实现是 *scheduler.Scheduler（签名一致）；测试注入假实现。
@@ -94,7 +119,7 @@ type Schedule interface {
 //
 // 写操作（非 GET/HEAD/OPTIONS）在 ServeHTTP 里先过令牌，路由表本身不重复这件事：
 // 新增写端点不需要记得加鉴权，忘不了。
-func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, schedule Schedule, jellyfinMgr Jellyfin, sources []Source, pb *playback.Tracker, adminToken string, logger *slog.Logger) *Server {
+func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, schedule Schedule, jellyfinMgr Jellyfin, sources []Source, pb *playback.Tracker, covers Coverer, signID IDFunc, dramaPath DramaPathFunc, adminToken string, logger *slog.Logger) *Server {
 	s := &Server{
 		st:         st,
 		settings:   settings,
@@ -103,6 +128,9 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 		jellyfin:   jellyfinMgr,
 		sources:    sources,
 		playback:   pb,
+		covers:     covers,
+		signID:     signID,
+		dramaPath:  dramaPath,
 		adminToken: adminToken,
 		logger:     logger,
 		mux:        http.NewServeMux(),
@@ -111,12 +139,19 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 	// 页面与静态资源：模板与 CSS/JS 随二进制嵌入（ADR-0002，无构建步骤）。
 	// 页面集合见 pages.go 的 pageMetaOf；未登记路径（含旧的 /status）由 ServeMux 兜底 404。
 	s.mux.HandleFunc("GET /{$}", s.handlePage("overview"))
+	// 剧库、剧详情、分类：剧详情带路径参数，因此单独注册（显式路由，不做 catch-all）。
+	s.mux.HandleFunc("GET /library", s.handlePage("library"))
+	s.mux.HandleFunc("GET /library/{id}", s.handleDramaPage)
+	s.mux.HandleFunc("GET /categories", s.handlePage("categories"))
 	s.mux.HandleFunc("GET /settings", s.handlePage("settings"))
 	s.mux.HandleFunc("GET /static/{file}", s.handleStatic)
 
 	// 管理 API：路径即契约，页面 JS 与脚本只调这些端点（见 docs/DEV-STANDARDS.md）。
 	s.mux.HandleFunc("GET /api/dramas", s.handleListDramas)
 	s.mux.HandleFunc("POST /api/dramas", s.handleCreateDrama)
+	// 剧详情页的两个只读端点：集分块（块边界由 store.deriveEmbyItems 派生）与封面字节。
+	s.mux.HandleFunc("GET /api/dramas/{id}/episodes", s.handleDramaEpisodes)
+	s.mux.HandleFunc("GET /api/dramas/{id}/cover", s.handleDramaCover)
 	s.mux.HandleFunc("POST /api/refresh", s.handleRefresh)
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
 	// 「正在播放」快照：纯内存只读，GET 不过令牌闸门（MKACG-683）。

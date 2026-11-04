@@ -12,19 +12,37 @@
 <header class="topbar">
   <span class="wordmark">drama-hub</span>
   <nav class="tabs" aria-label="管理页">
-    <a href="/"{{if eq .Page "overview"}} aria-current="page"{{end}}>概览</a>
-    <a href="/settings"{{if eq .Page "settings"}} aria-current="page"{{end}}>设置</a>
+    <a href="/"{{if eq .Nav "overview"}} aria-current="page"{{end}}>概览</a>
+    <a href="/library"{{if eq .Nav "library"}} aria-current="page"{{end}}>剧库</a>
+    <a href="/categories"{{if eq .Nav "categories"}} aria-current="page"{{end}}>分类</a>
+    <a href="/settings"{{if eq .Nav "settings"}} aria-current="page"{{end}}>设置</a>
   </nav>
-  <!-- 写操作（刷新/同步/改配置）要带 X-Admin-Token；令牌只存在本标签页的 sessionStorage。 -->
-  <label class="token" for="admin-token">
-    <span>管理令牌</span>
-    <input type="password" id="admin-token" autocomplete="off" spellcheck="false"
-           placeholder="DRAMA_HUB_ADMIN_TOKEN">
-  </label>
+  <!-- 写操作（刷新/同步/改配置/补录）要带 X-Admin-Token。令牌平时不出现在页面上：
+       点这个按钮才开 #token-dialog，解锁后只存本标签页的 sessionStorage。 -->
+  <button type="button" class="btn token-btn" id="token-button" aria-haspopup="dialog">
+    <span id="token-state">写操作 · 未解锁</span>
+  </button>
 </header>
+<dialog id="token-dialog" class="token-dialog" aria-labelledby="token-title">
+  <form class="token-form" id="token-form" method="dialog">
+    <h2 id="token-title">管理令牌</h2>
+    <p class="hint">写操作需要部署时设置的 DRAMA_HUB_ADMIN_TOKEN。令牌只存在本标签页的 sessionStorage，关掉标签页即失效。</p>
+    <label class="field">
+      <span class="field-label">令牌</span>
+      <input type="password" id="admin-token" autocomplete="off" spellcheck="false"
+             placeholder="DRAMA_HUB_ADMIN_TOKEN">
+    </label>
+    <p class="notice" id="token-notice" role="status" aria-live="polite"></p>
+    <div class="dialog-foot">
+      <button type="button" class="btn" id="token-clear">清除</button>
+      <button type="submit" class="btn primary" id="token-save">解锁</button>
+    </div>
+  </form>
+</dialog>
 <main id="main" tabindex="-1">
 {{template "content" .}}
 </main>
+<script src="/static/paging.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>{{end}}

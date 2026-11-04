@@ -1,6 +1,7 @@
 package hongguo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -42,6 +43,26 @@ func (f *fakeSite) setRoutes(routes map[string]route) {
 	f.respond = func(path string) (int, string) {
 		if r, ok := routes[path]; ok {
 			return r.status, r.body
+		}
+		return http.StatusNotFound, ""
+	}
+}
+
+// setReplies 按到达顺序逐条应答（用完后一直重复最后一条）：模拟「前 N 次坏、之后好」。
+//
+// 与 setReply / setRoutes 一样只换 respond（在锁里换，handler 取 respond 时也持锁），
+// 顺序状态活在闭包里，不需要调用方自己加锁。
+func (f *fakeSite) setReplies(replies []route) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.respond = func(string) (int, string) {
+		if len(replies) > 1 {
+			r := replies[0]
+			replies = replies[1:]
+			return r.status, r.body
+		}
+		if len(replies) == 1 {
+			return replies[0].status, replies[0].body
 		}
 		return http.StatusNotFound, ""
 	}
@@ -453,5 +474,148 @@ func TestPlaybackHeaderLines(t *testing.T) {
 	// 不返回共享切片：调用方（装配根）改了不该污染别的实例。
 	if a, b := PlaybackHeaderLines(""), PlaybackHeaderLines(""); &a[0] == &b[0] {
 		t.Error("PlaybackHeaderLines 返回了同一个底层数组")
+	}
+}
+
+// newLoggingPlugin 与 newTestPlugin 相同，只多一个可读的日志缓冲：重试的可观测性
+// （WARN / INFO 与 attempt 字段）是 MKACG-677 的验收项，必须能断言到。
+func newLoggingPlugin(t *testing.T, srv *httptest.Server, logs *bytes.Buffer) *Plugin {
+	t.Helper()
+	return New(Config{
+		BaseURL:           srv.URL,
+		HTTPClient:        srv.Client(),
+		Logger:            slog.New(slog.NewTextHandler(logs, nil)),
+		DeviceRegisterURL: "http://127.0.0.1:1/service/2/device_register/",
+		AppVideoURL:       "http://127.0.0.1:1/video",
+	})
+}
+
+// 前两次 200 + 0 字节、第三次正常：一次 Work 必须重试到成功。
+//
+// 这是实测故障的退化形态（真机是响应头发完就挂住、30s 才超时，空体是同一判据）：
+// GET 是幂等的，空体不是源侧给的确定答复，只是「这一次抓取被挂」。
+func TestFetchRetriesStalledBody(t *testing.T) {
+	body := readFixture(t, "page-series.html")
+	fake, srv := newFakeSite(t, http.StatusOK, body)
+	fake.setReplies([]route{
+		{http.StatusOK, ""},
+		{http.StatusOK, ""},
+		{http.StatusOK, body},
+	})
+	logs := &bytes.Buffer{}
+	p := newLoggingPlugin(t, srv, logs)
+
+	got, err := p.Work(context.Background(), testRef())
+	if err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if want := len(fixtureVidList(t, "page-series.html")); len(got.Episodes) != want {
+		t.Fatalf("集数 = %d, 期望 %d", len(got.Episodes), want)
+	}
+	reqs := fake.requests()
+	if len(reqs) != 3 {
+		t.Fatalf("上游请求 = %v, 期望前两次空体各重试一次、第 3 次成功", reqs)
+	}
+	for _, r := range reqs {
+		if r != "/player/"+fixtureSID {
+			t.Fatalf("上游请求 = %v, 期望全部是详情页", reqs)
+		}
+	}
+	for _, want := range []string{"上游抓取被挂，稍后重试", "上游请求重试成功", "attempt=2"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("日志缺 %q：%s", want, logs.String())
+		}
+	}
+}
+
+// 一直 200 + 空体：重试用尽后的错误必须能看出「是重试耗尽」，不是笼统的上游失败。
+func TestFetchEmptyBodyExhausted(t *testing.T) {
+	fake, srv := newFakeSite(t, http.StatusOK, "")
+	p := newTestPlugin(t, srv)
+
+	_, err := p.Work(context.Background(), testRef())
+	if !errors.Is(err, plugin.ErrUpstream) {
+		t.Fatalf("err = %v, 期望 ErrUpstream", err)
+	}
+	for _, want := range []string{"没有响应体", "已尝试 3 次", "最后一次耗时"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误文本缺 %q：%v", want, err)
+		}
+	}
+	if reqs := fake.requests(); len(reqs) != 3 {
+		t.Fatalf("上游请求 = %v, 期望 3 次（重试次数用尽）", reqs)
+	}
+}
+
+// 限流 / 风控 / 404 / 结构错误是源侧的确定答复：不重试，立刻上抛。
+func TestFetchDoesNotRetryRejected(t *testing.T) {
+	fake, srv := newFakeSite(t, http.StatusTooManyRequests, "")
+	p := newTestPlugin(t, srv)
+
+	_, err := p.Work(context.Background(), testRef())
+	if !errors.Is(err, plugin.ErrRejected) {
+		t.Fatalf("err = %v, 期望 ErrRejected", err)
+	}
+	if reqs := fake.requests(); len(reqs) != 1 {
+		t.Fatalf("上游请求 = %v, 429 不是「抓取被挂」，不该重试", reqs)
+	}
+}
+
+// 一次 ResolveSeries 只取一次详情页：合并集 M 集播放也只有 1 次 /player/{sid}，
+// 请求数不再随集数放大（MKACG-677 T2）。
+func TestResolveSeriesOneDetailPage(t *testing.T) {
+	vids := fixtureVidList(t, "page-series.html")
+	// 集页模板只认 ep1 的 vid：把 vid 换掉即得任意集的集页（bound 校验仍成立）。
+	epPage := func(vid string) string {
+		return strings.ReplaceAll(readFixture(t, "page-episode.html"), fixtureVID, vid)
+	}
+	fake, srv := newFakeSite(t, http.StatusOK, "")
+	fake.setRoutes(map[string]route{
+		"/player/" + fixtureSID:                 {http.StatusOK, readFixture(t, "page-series.html")},
+		"/player/" + fixtureSID + "/" + vids[0]: {http.StatusOK, epPage(vids[0])},
+		"/player/" + fixtureSID + "/" + vids[5]: {http.StatusOK, epPage(vids[5])},
+	})
+	p := newTestPlugin(t, srv)
+
+	got, err := p.ResolveSeries(context.Background(), testRef(), []int{1, 6})
+	if err != nil {
+		t.Fatalf("ResolveSeries: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("结果条数 = %d, 期望 2（与 epNos 对齐）", len(got))
+	}
+	for i, vid := range []string{vids[0], vids[5]} {
+		if want := DefaultBaseURL + "/video/public/" + vid + "/360p.mp4"; got[i].URL != want {
+			t.Errorf("第 %d 条直链 = %q, 期望 %q", i, got[i].URL, want)
+		}
+	}
+	details := 0
+	for _, r := range fake.requests() {
+		if r == "/player/"+fixtureSID {
+			details++
+		}
+	}
+	if details != 1 {
+		t.Fatalf("详情页请求 %d 次, 期望 1 次（同一 series 只取一次页面）：%v", details, fake.requests())
+	}
+	if reqs := fake.requests(); len(reqs) != 3 {
+		t.Fatalf("上游请求 = %v, 期望 详情页 1 次 + 集页 2 次", reqs)
+	}
+}
+
+// 空集号列表不发任何请求（批量接口的平凡边界）。
+func TestResolveSeriesEmpty(t *testing.T) {
+	fake, srv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series.html"))
+	p := newTestPlugin(t, srv)
+
+	got, err := p.ResolveSeries(context.Background(), testRef(), nil)
+	if err != nil {
+		t.Fatalf("ResolveSeries: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("结果 = %v, 期望空", got)
+	}
+	if reqs := fake.requests(); len(reqs) != 0 {
+		t.Fatalf("上游请求 = %v, 期望零请求", reqs)
 	}
 }

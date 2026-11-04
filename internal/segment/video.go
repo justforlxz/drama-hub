@@ -196,15 +196,23 @@ func (c *Cutter) timelineStart(ctx context.Context, uid string, eps []store.Epis
 	ensureCtx, cancel := context.WithTimeout(ctx, c.ensureTimeout)
 	defer cancel()
 
+	// 前置集里还没回填时长的那些，一次批量解析（同一 series 页面只取一次）。
+	missing := make([]int, 0, seq)
 	for i := 0; i < seq && i < len(eps); i++ {
-		if eps[i].DurationSec > 0 {
-			continue
+		if eps[i].DurationSec <= 0 {
+			missing = append(missing, i)
 		}
-		d, err := c.resolve(ctx, eps[i])
-		if err != nil {
-			return 0, resolveFailure(eps[i].ID, err)
-		}
-		seconds, err := c.ensureDuration(ensureCtx, eps[i], d)
+	}
+	batch := make([]store.Episode, len(missing))
+	for j, i := range missing {
+		batch[j] = eps[i]
+	}
+	directs, err := c.resolveDirects(ctx, batch)
+	if err != nil {
+		return 0, err
+	}
+	for j, i := range missing {
+		seconds, err := c.ensureDuration(ensureCtx, eps[i], directs[j])
 		if err != nil {
 			return 0, err
 		}
@@ -290,9 +298,10 @@ func (c *Cutter) unit(ctx context.Context, uid string) (playbackUnit, error) {
 
 // timelineFor 把一个播放单元的成员集展开成时间轴：每集一片。
 //
-// 每个成员都要现解析一次直链：拿不到就 502，不放一份「能读、一播就失败」的播放
-// 列表。解析结果同时给出通道，顺手把 segment 行的 channel 对齐（626 裁决 3 的机制
-// 原样保留：判据仍然只有 channelOf 一处）。时长取 episode.duration_sec，为 0 的
+// 整块成员的直链一次解析（resolveDirects → 批量能力）：同一 series 的页面只取一次，
+// 请求数不随成员数增长（MKACG-677）。拿不到就 502，不放一份「能读、一播就失败」的
+// 播放列表。解析结果同时给出通道，顺手把 segment 行的 channel 对齐（626 裁决 3 的
+// 机制原样保留：判据仍然只有 channelOf 一处）。时长取 episode.duration_sec，为 0 的
 // 现 ffprobe 一次并回填（ADR-0011 D2：唯一真值，不再有第二份时长）。
 //
 // 整体受 ensureDeadline 约束：超时 → 503 + Retry-After（httpx.ErrUnavailable）。
@@ -300,17 +309,17 @@ func (c *Cutter) timelineFor(ctx context.Context, u playbackUnit) (*Timeline, er
 	ensureCtx, cancel := context.WithTimeout(ctx, c.ensureTimeout)
 	defer cancel()
 
+	directs, err := c.resolveDirects(ctx, u.eps)
+	if err != nil {
+		return nil, err
+	}
 	eps := make([]TimelineEpisode, 0, len(u.eps))
-	for _, ep := range u.eps {
-		d, err := c.resolve(ctx, ep)
-		if err != nil {
-			return nil, resolveFailure(ep.ID, err)
-		}
-		dur, err := c.ensureDuration(ensureCtx, ep, d)
+	for i, ep := range u.eps {
+		dur, err := c.ensureDuration(ensureCtx, ep, directs[i])
 		if err != nil {
 			return nil, err
 		}
-		if err := c.ensureChannel(ctx, ep.ID, channelOf(d)); err != nil {
+		if err := c.ensureChannel(ctx, ep.ID, channelOf(directs[i])); err != nil {
 			return nil, err
 		}
 		eps = append(eps, TimelineEpisode{EpisodeID: ep.ID, Dur: dur})
@@ -344,7 +353,28 @@ func parseSeqFile(name string) (int, bool) {
 	return seq, true
 }
 
-// resolveFailure 把「解析直链失败」折成出流面的错误。
+// resolveDirects 一次解析一组成员的直链（批量能力，同一 series 页面只取一次），
+// 失败按播放面的错误矩阵报出。返回顺序与 eps 对齐。
+func (c *Cutter) resolveDirects(ctx context.Context, eps []store.Episode) ([]stream.Direct, error) {
+	if len(eps) == 0 {
+		return nil, nil
+	}
+	directs, err := c.resolveMany(ctx, eps)
+	if err != nil {
+		return nil, fmt.Errorf("解析整块成员直链（%v）: %w", err, playErr(err))
+	}
+	if len(directs) != len(eps) {
+		return nil, fmt.Errorf("解析 %d 集直链只回来 %d 条: %w", len(eps), len(directs), httpx.ErrUpstream)
+	}
+	return directs, nil
+}
+
+// resolveFailure 把「解析某一集直链失败」折成出流面的错误（类别见 playErr）。
+func resolveFailure(epID int64, err error) error {
+	return fmt.Errorf("解析剧集 %d 直链（%v）: %w", epID, err, playErr(err))
+}
+
+// playErr 把「解析直链失败」折成出流面的错误类别。
 //
 // 三类原因必须分开报（MKACG-676）：
 //   - 需要登录态 / 该集无权限 → 403：用户该做的是配一次登录 Cookie，不是换源；
@@ -352,15 +382,14 @@ func parseSeqFile(name string) (int, bool) {
 //   - 其余（上游故障、被拒、格式看不懂）→ 502：源侧的问题。
 //
 // 折成同一个 502 时，前两种会被显示成「源坏了」，配置项也就失去意义。
-func resolveFailure(epID int64, err error) error {
-	target := httpx.ErrUpstream
+func playErr(err error) error {
 	switch {
 	case errors.Is(err, plugin.ErrLoginRequired):
-		target = httpx.ErrForbidden
+		return httpx.ErrForbidden
 	case errors.Is(err, plugin.ErrUnsupported):
-		target = httpx.ErrUnsupported
+		return httpx.ErrUnsupported
 	}
-	return fmt.Errorf("解析剧集 %d 直链（%v）: %w", epID, err, target)
+	return httpx.ErrUpstream
 }
 
 // writeVideoError 按播放面的错误矩阵写出响应：时长探测超时 → 503 + Retry-After

@@ -394,8 +394,8 @@ func TestAPI_Status(t *testing.T) {
 		t.Fatalf("sources = %+v, 期望 1 个源", got.Sources)
 	}
 	if src := got.Sources[0]; src.Name != "web" || src.Label != "红果官网 SSR" ||
-		!src.Enabled || src.RequestTimeoutSec != 30 || src.Reason != "" {
-		t.Errorf("source = %+v, 期望 web 默认启用、超时 30 秒、无原因", src)
+		!src.Enabled || src.RequestTimeoutSec != 8 || src.Reason != "" {
+		t.Errorf("source = %+v, 期望 web 默认启用、超时 8 秒、无原因", src)
 	}
 	// 构造期配置：测试里的装配根没带 Boot* 值，现值与生效值不同 → 报「需重启」。
 	// 这是网页上「改了要重启」那一行的数据来源。
@@ -417,11 +417,11 @@ func TestAPI_StatusRestartRequired(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	ctx := context.Background()
 	key := func(item string) store.SettingKey { return store.PluginSettingKey("web", item) }
-	// 启动时注入的值：base_url 空（插件内置地址）、超时 30 秒。
-	srv.sources = []Source{{Name: "web", Label: "红果官网 SSR", BootRequestTimeoutSec: 30}}
+	// 启动时注入的值：base_url 空（插件内置地址）、超时 8 秒（settings 默认值）。
+	srv.sources = []Source{{Name: "web", Label: "红果官网 SSR", BootRequestTimeoutSec: 8}}
 	got := decode[statusView](t, do(t, srv, http.MethodGet, "/api/status", ""))
 	if src := got.Sources[0]; src.RestartRequired || src.BaseURLEffective != "" ||
-		src.RequestTimeoutSecEffective != 30 {
+		src.RequestTimeoutSecEffective != 8 {
 		t.Fatalf("source = %+v, 期望与启动值一致、不报需重启", src)
 	}
 
@@ -434,7 +434,7 @@ func TestAPI_StatusRestartRequired(t *testing.T) {
 	}
 	got = decode[statusView](t, do(t, srv, http.MethodGet, "/api/status", ""))
 	src := got.Sources[0]
-	if !src.RestartRequired || src.BaseURLEffective != "" || src.RequestTimeoutSecEffective != 30 {
+	if !src.RestartRequired || src.BaseURLEffective != "" || src.RequestTimeoutSecEffective != 8 {
 		t.Fatalf("source = %+v, 期望现值已变、生效值不变、需重启", src)
 	}
 	if src.BaseURL != "http://127.0.0.1:18080" || src.RequestTimeoutSec != 5 {

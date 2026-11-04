@@ -255,6 +255,27 @@ func (p localOrigin) Resolve(ctx context.Context, ref plugin.WorkRef, epNo int) 
 	if err != nil {
 		return plugin.Stream{}, err
 	}
+	return p.rewrite(st)
+}
+
+// ResolveSeries 覆盖批量解析的同一个改写：框架侧（stream.DirectMany）一旦走批量，
+// localOrigin 从 *hongguo.Plugin 提升来的 ResolveSeries 会把直链留在真实上游域名上，
+// 本地 origin 改写就失效了（播放面会去连公网）。批量与逐集必须给出同一份地址。
+func (p localOrigin) ResolveSeries(ctx context.Context, ref plugin.WorkRef, epNos []int) ([]plugin.Stream, error) {
+	streams, err := p.Plugin.ResolveSeries(ctx, ref, epNos)
+	if err != nil {
+		return nil, err
+	}
+	for i := range streams {
+		if streams[i], err = p.rewrite(streams[i]); err != nil {
+			return nil, err
+		}
+	}
+	return streams, nil
+}
+
+// rewrite 把直链的 scheme/host 换成本地假 CDN（真插件只算路径，夹具在本地提供字节）。
+func (p localOrigin) rewrite(st plugin.Stream) (plugin.Stream, error) {
 	u, err := url.Parse(st.URL)
 	if err != nil {
 		return plugin.Stream{}, err

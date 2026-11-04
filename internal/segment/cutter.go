@@ -27,6 +27,13 @@ import (
 // 本包不 import plugin，解析能力由上层以函数注入，错误原样透出。
 type ResolveFunc func(ctx context.Context, ep store.Episode) (stream.Direct, error)
 
+// ResolveManyFunc 一次解析同一部剧多集的直链（装配根注入 stream.Resolver.DirectMany）。
+//
+// 播放列表一次要解析整块成员：逐集调 ResolveFunc 会把「一次页面请求」放大成 M 次
+// （MKACG-677 的 502 来源之一）。批量能力由上层以函数注入，本包仍不 import plugin。
+// 返回顺序必须与 eps 一一对应；长度不符按上游故障处理。
+type ResolveManyFunc func(ctx context.Context, eps []store.Episode) ([]stream.Direct, error)
+
 // Cutter 是播放面的中枢：`/video/{id}.m3u8` 与 `/video/{id}/{seq}.m4s` 的 handler、
 // 每集的时长探测（episode.duration_sec）、segment 行的通道对齐、以及分片缓存共用
 // 同一个实例（store / settings / 缓存 / 并发闸只构造一次）。st / settings / caches /
@@ -37,7 +44,10 @@ type Cutter struct {
 	logger   *slog.Logger
 	caches   *cache.Cache
 	resolve  ResolveFunc
-	gate     chan struct{}
+	// resolveMany 是播放列表用的批量解析（一次页面请求解析整块成员）；单集兜底
+	// 路径（分片先到）仍用 resolve。
+	resolveMany ResolveManyFunc
+	gate        chan struct{}
 	// headers 是取直链时传给 ffmpeg / ffprobe 的出站身份，两个通道各一份；
 	// 用哪一份由本次解析出的直链决定（见 fetchHeaders）。本包不认识任何源，
 	// 两份都由装配根注入（见 NewCutter 的 headers）。
@@ -59,19 +69,20 @@ type Headers struct {
 }
 
 // NewCutter 装配播放面。caches 是本地缓存（分片落盘 + single-flight），
-// resolve 由装配根注入（stream.Resolver.DirectURL）。
+// resolve / resolveMany 由装配根注入（stream.Resolver.Direct / DirectMany）。
 //
 // headers 是 ffmpeg / ffprobe 取直链时要带的出站请求头，按通道两份：这两个子进程
 // 不走 http.Client，只能靠 `-headers`。空切片 = 该通道不带（见 Headers）。
-func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc, headers Headers) *Cutter {
+func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc, resolveMany ResolveManyFunc, headers Headers) *Cutter {
 	return &Cutter{
-		st:       st,
-		settings: settings,
-		logger:   logger,
-		caches:   caches,
-		resolve:  resolve,
-		gate:     make(chan struct{}, ffmpegSlots()),
-		headers:  headers,
+		st:          st,
+		settings:    settings,
+		logger:      logger,
+		caches:      caches,
+		resolve:     resolve,
+		resolveMany: resolveMany,
+		gate:        make(chan struct{}, ffmpegSlots()),
+		headers:     headers,
 
 		ensureTimeout: ensureDeadline,
 	}

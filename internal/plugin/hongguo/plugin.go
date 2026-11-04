@@ -75,9 +75,14 @@ func PlaybackHeaderLines(baseURL string) []string {
 
 const (
 	// defaultTimeout 是 HTTPClient 为 nil 时的兜底出站超时。契约的配置默认值
-	// plugin.web.request_timeout_sec = 30（docs/PLUGIN-CONTRACT.md「配置」），
+	// plugin.web.request_timeout_sec = 8（docs/PLUGIN-CONTRACT.md「配置」），
 	// 装配根按配置构造 client；这里是它的同一份默认值。
-	defaultTimeout = 30 * time.Second
+	//
+	// 8 秒而不是 30（MKACG-677）：一次 GET 现在最多试 fetchAttempts 次，单次超时
+	// 必须小到「挂了还能再试一次」——3×8s + 退避 0.6s = 24.6s，仍在播放面的
+	// ensureDeadline（30s）与工单给的 25s 预算内。30s 的单次超时会独占整个预算，
+	// 重试等于没有。
+	defaultTimeout = 8 * time.Second
 	// maxBodyBytes 是单次响应体读取上限：实测列表页 / 集页约 213 KB，`/category`
 	// 一页约 281 KB，4 MiB 足够且能挡住上游异常放大 / 无限流。超限按 ErrSchema
 	// （页面异常放大不是可重试故障）。
@@ -94,6 +99,25 @@ const (
 	// ErrRejected 处理让框架立刻中止本轮（docs/PLUGIN-CONTRACT.md 错误语义表
 	// 「429、403、风控页」那一行），而不是继续以 90 req/s 打上游。
 	statusDropped = 444
+)
+
+// 重试策略（MKACG-677）。
+//
+// 失败模式是实测过的具体事实：一次播放里的 10 次页面请求会有 1 次拿到「200 + 0 字节」
+// 并把连接挂到超时（30.03s ≈ 当时的 client Timeout），而同一地址下一次请求 234 KB /
+// 0.4s 就拿全。响应头已到、体一直不来，是连接/上游抓取被挂，不是页面结构变了；
+// GET 幂等，换一条连接再要一次就能拿到。
+//
+// 只重试这一类（空体、读体失败、传输超时）。404 / 结构不符 / 429、403、444 不重试：
+// 那是源侧的确定答复，重试只会把风控打成更多次请求（444 的判据见 statusDropped）。
+const (
+	// fetchAttempts 是一次 GET 的总尝试次数（首次 + 2 次重试）。
+	fetchAttempts = 3
+	// fetchRetryDelay 是第一次重试前的等待，之后每次翻倍（200ms → 400ms）。
+	// 与 appRetryDelay 一样是「等多久」的实现细节，不是可调参数：它只影响
+	// 「抓取被挂」这一条路径的等待，用户没有可调的业务语义（AGENTS.md 硬约束 5
+	// 的反面），总预算由 request_timeout_sec×attempts + 本项决定。
+	fetchRetryDelay = 200 * time.Millisecond
 )
 
 // Config 是构造期注入的不可变配置。
@@ -268,6 +292,42 @@ func (p *Plugin) Resolve(ctx context.Context, ref plugin.WorkRef, epNo int) (plu
 	if err != nil {
 		return plugin.Stream{}, err
 	}
+	return p.resolveFromSeries(ctx, ref, vids, protected, epNo)
+}
+
+// ResolveSeries 是框架侧（internal/stream）的可选能力接口：一次页面请求解析同一
+// series 的多集，返回顺序与 epNos 一一对应（MKACG-677）。
+//
+// 为什么要有它：Resolve 每次都要先取一次剧集页拿 vid 与 protectedPlayback，合并集
+// 播放 M 集就是 M+1 次页面请求；源侧实测约 1/10 的页面请求会「200 + 空体 + 挂到
+// 超时」，11 次里至少撞上一次的概率约 31%（502 的来源）。批量解析把页面请求压到
+// 1 次，与成员数无关。与 WorkWithEpisodeKeys 同一形态：不在 plugin.Plugin 里，
+// 别的插件不实现也不影响契约；插件实例仍然无状态——页面只活在这次调用的栈上。
+//
+// 任一集失败即整体失败（错误已带集号）：播放列表本来就是一集缺就整块放不了，
+// 部分成功没有用处。epNos 为空按空结果返回，不请求页面。
+func (p *Plugin) ResolveSeries(ctx context.Context, ref plugin.WorkRef, epNos []int) ([]plugin.Stream, error) {
+	if len(epNos) == 0 {
+		return nil, nil
+	}
+	_, vids, protected, err := p.workPage(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]plugin.Stream, len(epNos))
+	for i, epNo := range epNos {
+		st, err := p.resolveFromSeries(ctx, ref, vids, protected, epNo)
+		if err != nil {
+			return nil, fmt.Errorf("%s 第 %d 集: %w", ref.ID, epNo, err)
+		}
+		out[i] = st
+	}
+	return out, nil
+}
+
+// resolveFromSeries 是 Resolve / ResolveSeries 的共同实现：集表（vids）与
+// 「网页通道只给预览」（protected）由调用方取好，这里只按集号取一集的直链。
+func (p *Plugin) resolveFromSeries(ctx context.Context, ref plugin.WorkRef, vids []string, protected bool, epNo int) (plugin.Stream, error) {
 	if epNo < 1 || epNo > len(vids) {
 		return plugin.Stream{}, fmt.Errorf("%w: %s 没有第 %d 集（共 %d 集）",
 			plugin.ErrNotFound, ref.ID, epNo, len(vids))
@@ -383,62 +443,154 @@ func (p *Plugin) setOutboundHeaders(req *http.Request) {
 	req.Header.Set("Referer", referer(p.baseURL))
 }
 
+// fetchOutcome 是一次尝试的观测值。它只喂日志与错误文本，不参与任何业务判据：
+// 判据仍只有哨兵。
+type fetchOutcome struct {
+	status  int           // 上游状态码（0 = 没拿到响应）
+	bytes   int           // 读回的字节数
+	elapsed time.Duration // 这次尝试花了多久（含读体）
+	// retry 标记「这次失败值不值得换条连接再要一次」；reason 是给日志用的
+	// 具体原因（empty_body / read_error / timeout / transport），与 errorClass
+	// 的类别分开，日志里才分得清「抓取被挂」和「真结构错误」。
+	retry  bool
+	reason string
+}
+
 // fetch 发一次 GET 并读回响应体，把结果映射成契约哨兵：
 //
-//	429 / 403 / 444  → ErrRejected（可重试，需退避）
+//	429 / 403 / 444  → ErrRejected（不重试：限流/风控的确定答复）
 //	404              → ErrNotFound
-//	其余非 2xx、传输错误、读体失败、空响应 → ErrUpstream
-//	响应体超 limit                        → ErrSchema
+//	其余非 2xx       → ErrUpstream
+//	响应体超 limit   → ErrSchema
+//	空体 / 读体失败 / 传输超时 → 可重试的 ErrUpstream（最多 fetchAttempts 次）
 //
-// ctx 被取消 / 超时（用户点了取消）直接返回 ctx 的错误，不冒充源故障。
-// slog 一条出站记录（源 / 对象 / 状态 / 字节数），不记直链内容。
+// 重试只覆盖「抓取被挂」这一类，理由见 fetchAttempts 注释。耗尽后的错误文本写明
+// 尝试次数与最后一次耗时；日志里每次失败一条 WARN（带 attempt / 耗时 / 字节数 /
+// reason），重试成功补一条 INFO —— 看日志就能分清「上游挂了一下、重试拿到完整页面」
+// 和「源侧结构变了 / 被限流」。
+//
+// ctx 被取消 / 超时（用户点了取消）直接返回 ctx 的错误，不冒充源故障、也不重试。
+// slog 不记直链内容。
 func (p *Plugin) fetch(ctx context.Context, logPath, rawURL string, limit int64) ([]byte, error) {
+	var last error
+	var out fetchOutcome
+	for attempt := 1; attempt <= fetchAttempts; attempt++ {
+		start := time.Now()
+		body, o, err := p.fetchOnce(ctx, logPath, rawURL, limit)
+		o.elapsed = time.Since(start)
+		out = o
+		fields := []any{"plugin", Name, "path", logPath, "upstream_status", o.status,
+			"bytes", o.bytes, "duration_ms", o.elapsed.Milliseconds(), "attempt", attempt}
+		if err == nil {
+			if attempt == 1 {
+				p.logger.InfoContext(ctx, "上游请求", fields...)
+			} else {
+				p.logger.InfoContext(ctx, "上游请求重试成功", fields...)
+			}
+			return body, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		last = err
+		if !o.retry {
+			// 确定答复（404 / 限流 / 结构不符）：重试只会打更多次上游，直接报。
+			p.logger.WarnContext(ctx, "上游请求失败",
+				append(fields, "reason", errorClass(err))...)
+			return nil, err
+		}
+		if attempt == fetchAttempts {
+			break
+		}
+		p.logger.WarnContext(ctx, "上游抓取被挂，稍后重试",
+			append(fields, "reason", o.reason, "attempts", fetchAttempts)...)
+		if werr := sleepCtx(ctx, fetchRetryDelay<<(attempt-1)); werr != nil {
+			return nil, werr
+		}
+	}
+	p.logger.WarnContext(ctx, "上游请求重试次数用尽",
+		"plugin", Name, "path", logPath, "upstream_status", out.status, "bytes", out.bytes,
+		"duration_ms", out.elapsed.Milliseconds(), "attempts", fetchAttempts, "reason", out.reason)
+	return nil, fmt.Errorf("%w（已尝试 %d 次，最后一次耗时 %dms）",
+		last, fetchAttempts, out.elapsed.Milliseconds())
+}
+
+// fetchOnce 是 fetch 的一次尝试：不记日志、不等待，只把结果翻成哨兵并标出
+// 「这次失败值不值得重试」。
+func (p *Plugin) fetchOnce(ctx context.Context, logPath, rawURL string, limit int64) ([]byte, fetchOutcome, error) {
+	var out fetchOutcome
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 构造请求 %s: %v", plugin.ErrUpstream, logPath, err)
+		return nil, out, fmt.Errorf("%w: 构造请求 %s: %v", plugin.ErrUpstream, logPath, err)
 	}
 	// 出站身份：源侧要一个「像浏览器的请求」（常量与理由见包内 outbound* 注释）。
 	p.setOutboundHeaders(req)
 	resp, err := p.client.Do(req)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return nil, out, ctxErr
 		}
-		p.logger.WarnContext(ctx, "上游请求失败", "plugin", Name, "path", logPath, "upstream_status", 0, "bytes", 0)
-		return nil, fmt.Errorf("%w: GET %s: %v", plugin.ErrUpstream, logPath, err)
+		out.retry = true
+		if upstreamTimeout(err) {
+			// 只写「超时」与超时值：url.Error 全文带完整地址，错误文本不需要它。
+			out.reason = "timeout"
+			return nil, out, fmt.Errorf("%w: GET %s 超时（%s 内没有响应）",
+				plugin.ErrUpstream, logPath, p.client.Timeout)
+		}
+		out.reason = "transport"
+		return nil, out, fmt.Errorf("%w: GET %s: %v", plugin.ErrUpstream, logPath, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	out.status = resp.StatusCode
 
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	level := slog.LevelInfo
-	if readErr != nil || resp.StatusCode != http.StatusOK {
-		level = slog.LevelWarn
-	}
-	p.logger.Log(ctx, level, "上游请求",
-		"plugin", Name, "path", logPath, "upstream_status", resp.StatusCode, "bytes", len(body))
-
+	out.bytes = len(body)
 	if readErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return nil, out, ctxErr
 		}
-		return nil, fmt.Errorf("%w: 读取 %s 响应体: %v", plugin.ErrUpstream, logPath, readErr)
+		out.retry = true
+		out.reason = "read_error"
+		return nil, out, fmt.Errorf("%w: 读取 %s 响应体: %v", plugin.ErrUpstream, logPath, readErr)
 	}
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden ||
 		resp.StatusCode == statusDropped:
-		return nil, fmt.Errorf("%w: GET %s 返回 %d", plugin.ErrRejected, logPath, resp.StatusCode)
+		return nil, out, fmt.Errorf("%w: GET %s 返回 %d", plugin.ErrRejected, logPath, resp.StatusCode)
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("%w: GET %s 返回 404", plugin.ErrNotFound, logPath)
+		return nil, out, fmt.Errorf("%w: GET %s 返回 404", plugin.ErrNotFound, logPath)
 	case resp.StatusCode != http.StatusOK:
-		return nil, fmt.Errorf("%w: GET %s 返回 %d", plugin.ErrUpstream, logPath, resp.StatusCode)
+		return nil, out, fmt.Errorf("%w: GET %s 返回 %d", plugin.ErrUpstream, logPath, resp.StatusCode)
 	}
 	if len(body) == 0 {
-		return nil, fmt.Errorf("%w: GET %s 返回空响应体", plugin.ErrUpstream, logPath)
+		// 「响应头到了、体没来」那一族（MKACG-677 的 200+0 字节）。
+		out.retry = true
+		out.reason = "empty_body"
+		return nil, out, fmt.Errorf("%w: GET %s 返回 200 但没有响应体", plugin.ErrUpstream, logPath)
 	}
 	if int64(len(body)) > limit {
-		return nil, fmt.Errorf("%w: GET %s 响应体超过 %d 字节", plugin.ErrSchema, logPath, limit)
+		return nil, out, fmt.Errorf("%w: GET %s 响应体超过 %d 字节", plugin.ErrSchema, logPath, limit)
 	}
-	return body, nil
+	return body, out, nil
+}
+
+// upstreamTimeout 判断传输错误是不是「一次请求自己超时（client.Timeout）」。
+// ctx 到期在上层先判过，这里只剩这一种。
+func upstreamTimeout(err error) bool {
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
+}
+
+// sleepCtx 等 d，ctx 先到期就返回它的错误：重试不许把「用户取消」变成继续等。
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // yearFromUnix 把上游的 unix 秒（字符串）换成 UTC 年份，尽力而为：缺失或非法

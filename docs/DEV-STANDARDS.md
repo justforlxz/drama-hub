@@ -154,7 +154,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 | `cover_timeout_sec` | `5` | 1–60 | 即时（每次海报下载） | 海报（`artifact(kind='cover')`）的单次出站超时。**不跟插件 `base_url` / `request_timeout_sec` 走**：封面 URL 是上游页面里的三方 CDN 绝对地址（实测 `p3-novel.byteimg.com`），`base_url` 改不到它，而页面的 30 s 超时会让一张卡住的图拖住整部剧的同步。取不到只记一条 warn，该剧不算同步失败（MKACG-620） |
 | `plugin.<源>.enabled` | `true` | 布尔 | 即时（每轮调度现读） | 是否参与**刷新调度**（缺失按 `true`）；手动同步（`POST /api/dramas`）与播放（`/video`）不受影响 |
 | `plugin.<源>.base_url` | `""` | 带 host 的绝对 URL 或空 | **重启后**（构造期注入） | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
-| `plugin.<源>.request_timeout_sec` | `30` | 5–300 | **重启后**（构造期注入） | 单次出站请求超时 |
+| `plugin.<源>.request_timeout_sec` | `8` | 5–300 | **重启后**（构造期注入） | 单次出站请求超时（一次 GET 内部最多试 3 次，见 `docs/PLUGIN-CONTRACT.md`「出站重试」） |
 | `refresh_interval_sec` | `3600` | 300–86400 | ≤60 秒（调度器醒来） | 全局刷新间隔，一轮到期 = `last_run_at` + 本值 |
 | `plugin.<源>.refresh_interval_sec` | 空 = 继承全局 | 300–86400 | ≤60 秒（调度器醒来） | 源级间隔覆盖（用 `Settings.OptionalInt` 读，无行即「继承」） |
 | `refresh_batch` | `1000` | 0–10000 | 即时（每轮调度现读） | 每轮存量刷新的部数；`0` = 关闭存量轮转 |
@@ -416,7 +416,7 @@ DASH-CENC（`play_info`）时按 `ErrUnsupported` 上报，不回落。
   `api5-normal-sinfonlineb.fqnovel.com`）、`Config.AppVideoAltURL`（被拒后的备用域名，默认
   `api5-normal-hl.fqnovel.com`；注入了 `AppVideoURL` 的测试沿用同一个假上游）。四者都是
   构造期注入、默认值内置、**不进 settings**（MKACG-626 D2：上游换域名就发版）。`*http.Client`
-  由装配根按 `plugin.web.request_timeout_sec` 构造（默认 30s）。
+  由装配根按 `plugin.web.request_timeout_sec` 构造（默认 8s）。
 - 第四个注入缝是 `Config.Cookie func(ctx) string`（MKACG-676）：装配根把「现读
   `hongguo_cookie`」的闭包传进来，插件不 import `internal/store`；测试注入固定串或 `nil`
   （= 匿名）。它没有默认地址，所以除 `hongguo_cookie` 这一项外没有别的配置面。

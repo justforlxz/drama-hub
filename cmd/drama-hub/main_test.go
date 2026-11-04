@@ -940,6 +940,13 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 		func(_ context.Context, ep store.Episode) (stream.Direct, error) {
 			return stream.Direct{URL: urls[ep.ID]}, nil
 		},
+		func(_ context.Context, eps []store.Episode) ([]stream.Direct, error) {
+			out := make([]stream.Direct, len(eps))
+			for i, ep := range eps {
+				out[i] = stream.Direct{URL: urls[ep.ID]}
+			}
+			return out, nil
+		},
 		playbackHeaders(nil))
 	mux := http.NewServeMux()
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)

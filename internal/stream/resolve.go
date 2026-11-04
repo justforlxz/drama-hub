@@ -55,3 +55,75 @@ func (r *Resolver) Direct(ctx context.Context, ep store.Episode) (Direct, error)
 	}
 	return Direct{URL: s.URL, Key: s.Key}, nil
 }
+
+// SeriesResolver 是插件的可选能力：一次调用解析同一 series 的多集直链
+// （红果的 Plugin.ResolveSeries，MKACG-677）。
+//
+// 与 sync.WorkWithEpisodeKeys 同一形态——不在 plugin.Plugin 里，由框架侧按需
+// 断言。为什么要它：插件 Resolve 每集都要先取一次剧集页（拿 vid 与
+// protectedPlayback），合并集播放 M 集就是 M+1 次页面请求；源侧实测约 1/10 的
+// 页面请求会「200 + 空体 + 挂到超时」，请求数被放大等于 502 概率被放大。
+// 批量能力把页面请求压到 1 次；插件不实现它时 DirectMany 退回逐集 Direct。
+type SeriesResolver interface {
+	ResolveSeries(ctx context.Context, ref plugin.WorkRef, epNos []int) ([]plugin.Stream, error)
+}
+
+// DirectMany 解析同一部剧多集的直链（eps 按播放单元顺序）。返回顺序与 eps 一一对应。
+//
+// 与 Direct 一样不缓存：直链只活在本次调用的内存里。插件实现了 SeriesResolver 就
+// 一次解析（一次页面请求），否则逐集 Direct。错误原样透出，带剧集号便于定位。
+func (r *Resolver) DirectMany(ctx context.Context, eps []store.Episode) ([]Direct, error) {
+	if len(eps) == 0 {
+		return nil, nil
+	}
+	dramaID := eps[0].DramaID
+	for _, ep := range eps {
+		if ep.DramaID != dramaID {
+			return nil, fmt.Errorf("批量解析跨剧：剧集 %d 属于剧目 %d 而非 %d", ep.ID, ep.DramaID, dramaID)
+		}
+	}
+	d, err := r.st.DramaByID(ctx, dramaID)
+	if err != nil {
+		return nil, fmt.Errorf("查剧目 %d（%d 集）: %w", dramaID, len(eps), err)
+	}
+	p, ok := r.reg.Get(d.Provider)
+	if !ok {
+		return nil, fmt.Errorf("剧目 %d 的源 %q 未注册插件", dramaID, d.Provider)
+	}
+	host := func(ep store.Episode) string {
+		return fmt.Sprintf("剧集 %d（%s 第 %d 集）", ep.ID, d.ProviderID, ep.EpNo)
+	}
+
+	streams := make([]plugin.Stream, len(eps))
+	if sr, ok := p.(SeriesResolver); ok {
+		nos := make([]int, len(eps))
+		for i, ep := range eps {
+			nos[i] = ep.EpNo
+		}
+		streams, err = sr.ResolveSeries(ctx, plugin.WorkRef{Plugin: d.Provider, ID: d.ProviderID}, nos)
+		if err != nil {
+			return nil, err
+		}
+		if len(streams) != len(eps) {
+			return nil, fmt.Errorf("%w: %s 批量解析 %d 集却回来 %d 条",
+				plugin.ErrSchema, d.ProviderID, len(eps), len(streams))
+		}
+	} else {
+		for i, ep := range eps {
+			s, err := p.Resolve(ctx, plugin.WorkRef{Plugin: d.Provider, ID: d.ProviderID}, ep.EpNo)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", host(ep), err)
+			}
+			streams[i] = s
+		}
+	}
+
+	out := make([]Direct, len(eps))
+	for i, ep := range eps {
+		if streams[i].URL == "" {
+			return nil, fmt.Errorf("%s: %w", host(ep), plugin.ErrNoStream)
+		}
+		out[i] = Direct{URL: streams[i].URL, Key: streams[i].Key}
+	}
+	return out, nil
+}

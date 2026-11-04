@@ -59,7 +59,7 @@ HTTP 444（限流，无响应体、约 50 ms），约十几分钟后才恢复；
 | `plugin.<源>.refresh_interval_sec` | int | 空 = 继承全局 | 300–86400 | 源级覆盖 |
 | `refresh_batch` | int | `1000` | 0–10000 | 每轮存量刷新的部数；`0` = 关闭存量轮转（只剩枚举 + 新增 + 手动） |
 | `refresh_timeout_sec` | int | `900` | 60–86400 | 单轮预算（`context.WithTimeout`） |
-| `plugin.<源>.request_timeout_sec` | int | `30` | 5–300 | 单次出站请求超时（插件用） |
+| `plugin.<源>.request_timeout_sec` | int | `8` | 5–300 | 单次出站请求超时（插件用） |
 | `plugin.<源>.enabled` | bool | 内置源 `true` | — | 是否参与调度 |
 
 ### 粒度：全局 + 按源，**不做按剧**
@@ -150,8 +150,8 @@ worker 数不复用 `ffmpeg` 那个常量（`internal/segment` 的闸），但�
 
 | 层 | 谁负责 | 值 |
 |---|---|---|
-| 单次出站请求 | 插件（`http.Client.Timeout`） | `plugin.<源>.request_timeout_sec`，默认 30 s |
-| 单次插件调用 | 框架 | 在请求超时之上再包一层 `ctx`，取 `request_timeout_sec + 5s` 兜底 |
+| 单次出站请求 | 插件（`http.Client.Timeout`） | `plugin.<源>.request_timeout_sec`，默认 8 s |
+| 单次插件调用 | 框架 | 不另包 `ctx`：一次插件的出站重试（最多 3 次）共用调用方的 `ctx`（调度轮 `refresh_timeout_sec`、播放面 `ensureDeadline`） |
 | 一轮 | 框架 | `refresh_timeout_sec`，默认 900 s |
 
 超时归 `ErrUpstream`（可重试）。`ctx` 被取消（进程退出、用户手动取消）时直接向上传播，

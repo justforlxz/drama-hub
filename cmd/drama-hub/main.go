@@ -205,7 +205,7 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // （`名称: 值` 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624 / MKACG-638）：
 // 本函数不认识具体源。
 func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, jellyfinMgr web.Jellyfin, sources []web.Source, caches *cache.Cache, covers *cache.CoverCache, resolver *stream.Resolver, tree *vfs.Tree, playbackHeaders segment.Headers, adminToken string) http.Handler {
-	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, playbackHeaders)
+	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, resolver.DirectMany, playbackHeaders)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
@@ -289,7 +289,10 @@ func newSyncers(sources []plugin.Plugin, covers *cache.CoverCache, logger *slog.
 }
 
 // 插件配置的兜底值（契约默认值见 docs/PLUGIN-CONTRACT.md「配置」）。
-const defaultPluginTimeoutSec = 30
+//
+// 8 秒而不是 30（MKACG-677）：插件的 GET 内部最多试 3 次，单次超时过大等于
+// 没有重试预算（3×8s + 退避 0.6s = 24.6s，仍在播放面 30s 预算内）。
+const defaultPluginTimeoutSec = 8
 
 // pluginBoot 是一个源在启动时真正注入插件的构造期配置。
 //

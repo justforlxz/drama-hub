@@ -341,17 +341,30 @@ func newRig(t *testing.T) *rig {
 		resolveErr: map[int64]error{},
 	}
 	logger := slog.New(slog.NewJSONHandler(r.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	r.c = NewCutter(st, settings, logger, cache.New(st, settings, logger),
-		func(_ context.Context, ep store.Episode) (stream.Direct, error) {
-			r.resolves.Add(1)
-			if err := r.resolveErr[ep.ID]; err != nil {
-				return stream.Direct{}, err
+	resolveOne := func(_ context.Context, ep store.Episode) (stream.Direct, error) {
+		r.resolves.Add(1)
+		if err := r.resolveErr[ep.ID]; err != nil {
+			return stream.Direct{}, err
+		}
+		f, ok := r.cdn[ep.ID]
+		if !ok {
+			return stream.Direct{}, fmt.Errorf("测试没有给剧集 %d 配源", ep.ID)
+		}
+		return stream.Direct{URL: f.url(), Key: r.keys[ep.ID]}, nil
+	}
+	// 批量入口沿用单集语义逐条解析：rig 的假源没有「一次页面解析多集」的能力，
+	// 但生产入口（stream.Resolver.DirectMany）是一样的「一次调用解析一块成员」。
+	r.c = NewCutter(st, settings, logger, cache.New(st, settings, logger), resolveOne,
+		func(ctx context.Context, eps []store.Episode) ([]stream.Direct, error) {
+			out := make([]stream.Direct, len(eps))
+			for i, ep := range eps {
+				d, err := resolveOne(ctx, ep)
+				if err != nil {
+					return nil, fmt.Errorf("剧集 %d: %w", ep.ID, err)
+				}
+				out[i] = d
 			}
-			f, ok := r.cdn[ep.ID]
-			if !ok {
-				return stream.Direct{}, fmt.Errorf("测试没有给剧集 %d 配源", ep.ID)
-			}
-			return stream.Direct{URL: f.url(), Key: r.keys[ep.ID]}, nil
+			return out, nil
 		}, Headers{Web: testWebHeaders, App: testAppHeaders})
 	return r
 }

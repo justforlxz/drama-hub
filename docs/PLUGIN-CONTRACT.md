@@ -305,7 +305,7 @@ type Plugin interface {
 
 网页通道同一顺序：429/403/444 → `ErrRejected`，404 → `ErrNotFound`（`Resolve` 的集页
 404 再翻成 `ErrNoStream`），其余非 2xx → `ErrUpstream`；只有 200 才读体，200 + 空体
-按 `ErrUpstream`（重试有意义）。**不许**在状态码之前判空体：空体只在 200 这一格才是判据，
+按 `ErrUpstream`（同一请求内会重试，见「出站重试」）。**不许**在状态码之前判空体：空体只在 200 这一格才是判据，
 404 / 403 等格的空体照状态码归类。
 
 站点播放通道（`POST .../play-info`，MKACG-676）沿用同一顺序：`429/444` → `ErrRejected`；
@@ -333,6 +333,34 @@ type Plugin interface {
 `internal/segment` 报 `httpx.ErrUpstream`（502、下一轮重试），不是插件哨兵 ——
 `internal/segment` 不 import `internal/plugin`，产不出 `plugin.ErrSchema`。实现口径见
 `docs/DEV-STANDARDS.md`「播放面」。
+
+### 出站重试：只重试「抓取被挂」（MKACG-677）
+
+网页通道的 `fetch`（页面 / sitemap，全是幂等 GET）在一次调用内最多试 3 次
+（`fetchAttempts`），退避 200 ms → 400 ms，只对**空体、读体失败、传输超时**这一类重试：
+
+| 这次失败 | 重试 | 理由 |
+|---|---|---|
+| 200 + 空体 / 读体失败 / 传输超时（含 `http.Client.Timeout` 到点） | 是（共 3 次） | 响应头到了、体一直不来 = 连接或上游抓取被挂；实测同一地址下一次请求 0.4 s 拿全 234 KB |
+| 404 / `ErrSchema`（缺 `_ROUTER_DATA`、结构不符）/ 响应体超限 | 否 | 源侧确定答复，重试没有新信息 |
+| 429 / 403 / 444（`ErrRejected`） | 否 | 限流 / 风控：重试等于把风控打成更多次请求，退避是框架的事（下一周期） |
+| `ctx` 取消 / 上层 `context.DeadlineExceeded` | 否 | 用户取消或本次播放/刷新已超预算，继续重试只会更晚返回 |
+
+单次超时是 `plugin.<源>.request_timeout_sec`（默认 8 s），所以一次 GET 最坏
+3×8 s + 0.6 s = 24.6 s，落在播放面 `ensureDeadline`（30 s）内。日志口径：每次失败一条
+Warn（`上游抓取被挂，稍后重试` / `上游请求重试次数用尽`，字段 `attempt`、`attempts`、
+`duration_ms`、`bytes`、`upstream_status`、`reason` = `empty_body` / `read_error` /
+`timeout` / `transport`），重试成功补一条 Info（`上游请求重试成功`，`attempt` 为第几次
+成功）；确定答复走另一条 `上游请求失败`（`reason` 是错误类别）。两类在文案上分开，不都叫
+「上游失败」；耗尽后的错误文本写明「已尝试 3 次，最后一次耗时 …ms」。
+
+**批量解析（同一 series 只取一次页面）**：`Plugin.ResolveSeries(ctx, ref, epNos)` 是
+框架侧可选能力（与 `WorkWithEpisodeKeys` 同一形态，不在 `plugin.Plugin` 里），
+`internal/stream.Resolver.DirectMany` 在插件实现它时一次解析、否则退回逐集 `Resolve`；
+播放单元（合并集的整块成员）走 `DirectMany`。受保护剧一次播放的 `/player/` 请求数因此是
+1，与成员数无关（红果的 vid 与 `protectedPlayback` 都在同一个剧集页上，受保护剧本来也
+不请求集页）。未受保护的剧是例外：每集直链只能从各自的集页拿（源侧事实），M 集仍是
+M 次集页请求。
 
 ## 注册
 
@@ -372,7 +400,7 @@ if err := reg.Register(hongguo.New(hongguo.Config{
 |---|---|---|---|---|
 | `plugin.<源>.enabled` | bool | 内置源 `true` | — | 是否参与调度 |
 | `plugin.<源>.base_url` | string(URL) | 插件内置默认 | 带 scheme 的绝对 URL 或空 | 源地址（空 = 用插件默认） |
-| `plugin.<源>.request_timeout_sec` | int | `30` | 5–300 | 单次出站请求超时 |
+| `plugin.<源>.request_timeout_sec` | int | `8` | 5–300 | 单次出站请求超时 |
 
 - **App 通道的两个 host 不是 settings 键**（MKACG-626 D2，MKACG-628/630 落地）：
   `DeviceRegisterURL` 与 `AppVideoURL` 是 `hongguo.Config` 的构造期字段（默认值内置、

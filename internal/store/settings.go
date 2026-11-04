@@ -488,7 +488,9 @@ func pluginSpecFor(key string) (settingSpec, bool) {
 		// 空 = 用插件内置默认地址，与「未设置」等价。
 		return settingSpec{kind: kindURL}, true
 	case PluginItemRequestTimeout:
-		return settingSpec{kind: kindInt, def: "30", min: 5, max: 300}, true
+		// 8 秒是 MKACG-677 的取值：一次 GET 会在内部重试（3 次），单次超时必须小到
+		// 「挂了还能再试」——3×8s + 退避 0.6s = 24.6s，在播放面 30s 预算内。
+		return settingSpec{kind: kindInt, def: "8", min: 5, max: 300}, true
 	case PluginItemRefreshInterval:
 		// 无默认值：空 = 继承全局 refresh_interval_sec，因此没有行就是「未设置」，
 		// 不用某个数字冒充继承（用 OptionalInt 读）。

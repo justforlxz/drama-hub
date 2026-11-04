@@ -470,8 +470,9 @@ func TestPluginSettingDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Int(plugin.web.request_timeout_sec): %v", err)
 	}
-	if timeout != 30 {
-		t.Errorf("plugin.web.request_timeout_sec 默认应为 30，实际 %d", timeout)
+	// 默认 8 秒（MKACG-677）：单次出站超时要给「内部重试 2 次」留预算。
+	if timeout != 8 {
+		t.Errorf("plugin.web.request_timeout_sec 默认应为 8，实际 %d", timeout)
 	}
 }
 

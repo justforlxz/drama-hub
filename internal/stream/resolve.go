@@ -214,6 +214,43 @@ func (r *Resolver) persist(ctx context.Context, episodeID int64, s plugin.Stream
 	return nil
 }
 
+// 预取失败的稳定分类（episode_stream_fail.reason 的取值）。
+//
+// 分类只在本包做一次：调用方（internal/segment 的预取器）不认识插件哨兵，
+// 免得以后多一处「哪些错误算什么原因」的第二套判据（ADR-0017）。
+const (
+	FailureRejected    = "rejected"    // 上游明确拒绝（401/403/404 等，plugin.ErrRejected）
+	FailureUpstream    = "upstream"    // 上游故障（超时、5xx、空响应，plugin.ErrUpstream）
+	FailureSchema      = "schema"      // 上游结构不符契约（plugin.ErrSchema）
+	FailureNoStream    = "no_stream"   // 该集没有可播直链（plugin.ErrNoStream）
+	FailureLogin       = "login"       // 需要登录态或无权限（plugin.ErrLoginRequired）
+	FailureUnsupported = "unsupported" // 仅提供不支持的流形态（plugin.ErrUnsupported）
+	FailureOther       = "other"       // 其余（含库/注册表故障等无法归类的失败）
+)
+
+// FailureReason 把一次解析失败折成 episode_stream_fail.reason 的稳定取值。
+//
+// 判据只有 errors.Is 一次，幂等、可重放；未识别的错误归 other（不丢记录，
+// 只丢精度）。前台错误矩阵（segment.playErr）按自己的语义映射状态码，
+// 两者互不影响。
+func FailureReason(err error) string {
+	switch {
+	case errors.Is(err, plugin.ErrRejected):
+		return FailureRejected
+	case errors.Is(err, plugin.ErrUpstream):
+		return FailureUpstream
+	case errors.Is(err, plugin.ErrSchema):
+		return FailureSchema
+	case errors.Is(err, plugin.ErrNoStream):
+		return FailureNoStream
+	case errors.Is(err, plugin.ErrLoginRequired):
+		return FailureLogin
+	case errors.Is(err, plugin.ErrUnsupported):
+		return FailureUnsupported
+	}
+	return FailureOther
+}
+
 // SeriesResolver 是插件的可选能力：一次调用解析同一 series 的多集直链
 // （红果的 Plugin.ResolveSeries，MKACG-677）。
 //

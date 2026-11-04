@@ -120,6 +120,24 @@ func (s *Store) ListEmbyItems(ctx context.Context, dramaID int64) ([]EmbyItem, e
 	return deriveEmbyItems(dramaID, eps, n), nil
 }
 
+// DramaBlocks 返回某部剧的原始集按**当前** merge_chunk_size 切好的块（每块按 ep_no 升序）。
+//
+// 只是 chunkEpisodes 的导出入口：分块只有一份实现（与 deriveEmbyItems /
+// PlaybackEpisodes 同一套规则，硬约束 6），预取需要「当前块 / 下一块 / 其余块」，
+// 不能自己再按 merge_chunk_size 切一遍（docs/adr/0017-prefetch-and-stream-health.md）。
+// 返回值是 ListEpisodes 结果切出的子切片，调用方只读。
+func (s *Store) DramaBlocks(ctx context.Context, dramaID int64) ([][]Episode, error) {
+	n, err := s.mergeChunkSize(ctx)
+	if err != nil {
+		return nil, err
+	}
+	eps, err := s.ListEpisodes(ctx, dramaID)
+	if err != nil {
+		return nil, err
+	}
+	return chunkEpisodes(eps, n), nil
+}
+
 // PlaybackEpisodes 把一个播放单元 uid 展开成成员集（按播放顺序）。
 //
 // 「合法 uid」由当前派生规则决定，不再查任何派生表（docs/adr/0014）：

@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/cache"
@@ -67,6 +68,11 @@ type Cutter struct {
 	// ensureTimeout 是「补齐播放列表所需信息」（每个成员的直链 + 时长）的硬上限，
 	// 生产固定 ensureDeadline；测试把它调短，才能在 5 分钟测试预算里验证 503 那条路径。
 	ensureTimeout time.Duration
+	// 预取（ADR-0017）：pfCtx 是进程级 ctx（StartPrefetch 注入），pfRun 是当前剧的
+	// 预取任务。两者都由 pfMu 保护；pfCtx 为 nil 时 kickPrefetch 是空操作。
+	pfCtx context.Context
+	pfMu  sync.Mutex
+	pfRun *prefetchRun
 }
 
 // Headers 是 `ffmpeg` / `ffprobe` 取直链时的出站身份（`名称: 值` 每项一行），

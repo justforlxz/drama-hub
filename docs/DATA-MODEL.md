@@ -237,6 +237,31 @@ ALTER TABLE episode_stream ADD PRIMARY KEY (episode_id, channel);
 |---|---|
 | `episode_stream` | 某集某通道的直链快照：未过期直接复用，过期/失效才重解析（`internal/stream`） |
 
+### 0011：预取失败与退避（ADR-0017）
+
+```sql
+-- 0011_episode_stream_fail.sql
+CREATE TABLE IF NOT EXISTS episode_stream_fail (
+    episode_id  BIGINT PRIMARY KEY REFERENCES episode (id) ON DELETE CASCADE,
+    reason      TEXT NOT NULL,   -- rejected|upstream|schema|no_stream|login|unsupported|other
+    failed_at   TEXT NOT NULL,   -- UTC RFC3339
+    retry_after TEXT NOT NULL    -- UTC RFC3339：到这个时刻之后才允许再预取
+);
+```
+
+后台预取（`internal/segment/prefetch.go`）失败后的退避记录，一集一行。与 `episode_stream`
+**分表**：失败时通常还没有可信的通道（web / app），而那张表的主键带通道、`url NOT NULL`；
+分表还让「作废直链」不连带删掉失败记录。`reason` 由 `stream.FailureReason` 一处判定，
+时间是 UTC RFC3339 的不透明 TEXT（与 0001 一致）。
+
+**前台播放路径从不读这张表**：它只决定后台预取的「哪些集现在可以再试」；正在播的那一集
+仍然按 `episode_stream` / 现解析走，失败记录不会变成 502。预取成功一批就清掉对应记录
+（`ClearStreamFailures`），失败是批级的（一个合并块共享同一条退避时刻）。
+
+| 对象 | 用途 |
+|---|---|
+| `episode_stream_fail` | 某集预取失败的原因与下次可重试时刻：预取计划的退避依据（`internal/segment` 写、`internal/segment` 读） |
+
 ## 字段来源逐个定稿
 
 ### 类型 / 分类

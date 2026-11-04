@@ -891,3 +891,35 @@ func TestPlaySessionTTLSettings(t *testing.T) {
 		t.Errorf("Set(600) 后读回 = %d, %v, 期望 600", got, err)
 	}
 }
+
+// 预取两项（MKACG-681 / ADR-0017）：并发默认 1、范围 0–4（0 = 关闭）；
+// 退避默认 900 秒、范围 60–86400。默认值与范围的真值在 docs/DEV-STANDARDS.md。
+func TestPrefetchSettings(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	if got, err := s.Int(ctx, KeyPrefetchConcurrency); err != nil || got != 1 {
+		t.Fatalf("prefetch_concurrency 默认 = %d, %v, 期望 1", got, err)
+	}
+	if err := s.Set(ctx, KeyPrefetchConcurrency, "0"); err != nil {
+		t.Errorf("Set(prefetch_concurrency, 0) = %v, 期望通过（0 = 关闭）", err)
+	}
+	for _, raw := range []string{"-1", "5"} {
+		if err := s.Set(ctx, KeyPrefetchConcurrency, raw); !errors.Is(err, ErrInvalidSetting) {
+			t.Errorf("Set(prefetch_concurrency, %q) = %v, 期望 ErrInvalidSetting", raw, err)
+		}
+	}
+
+	if got, err := s.Int(ctx, KeyPrefetchRetrySec); err != nil || got != 900 {
+		t.Fatalf("prefetch_retry_sec 默认 = %d, %v, 期望 900", got, err)
+	}
+	for _, raw := range []string{"59", "86401", "15m"} {
+		if err := s.Set(ctx, KeyPrefetchRetrySec, raw); !errors.Is(err, ErrInvalidSetting) {
+			t.Errorf("Set(prefetch_retry_sec, %q) = %v, 期望 ErrInvalidSetting", raw, err)
+		}
+	}
+	if err := s.Set(ctx, KeyPrefetchRetrySec, "60"); err != nil {
+		t.Errorf("Set(prefetch_retry_sec, 60) = %v, 期望通过（闭区间端点）", err)
+	}
+}

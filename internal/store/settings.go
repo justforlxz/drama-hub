@@ -75,6 +75,11 @@ const (
 	// KeyPlaySessionTTL 是「正在播放」会话的保留时长（秒，默认 120，范围 30–3600）。
 	// 每次播放请求现读：改完下一片即按新值回收（MKACG-683）。
 	KeyPlaySessionTTL SettingKey = "play_session_ttl_sec"
+	// 播放触发的整剧直链预取两项（ADR-0017）：每个预取任务开始时读一次。
+	//   - prefetch_concurrency：同时在途的预取批次上限（0 = 关闭预取）。
+	//   - prefetch_retry_sec：某集预取失败后的固定退避秒数（不做指数退避）。
+	KeyPrefetchConcurrency SettingKey = "prefetch_concurrency"
+	KeyPrefetchRetrySec    SettingKey = "prefetch_retry_sec"
 )
 
 // 插件配置的项名（docs/PLUGIN-CONTRACT.md「配置」）。
@@ -478,6 +483,16 @@ func specFor(key SettingKey) (settingSpec, bool) {
 		// 「正在播放」会话的保留时长：短于 30 s 会把正常缓冲误判成停止，
 		// 长于 1 h 则过期会话长期占着页面（MKACG-683）。
 		return settingSpec{kind: kindInt, def: "120", min: 30, max: 3600}, true
+	case KeyPrefetchConcurrency:
+		// 预取同时最多几批在途（一批 = 一个合并块）。默认 1 = 串行：源侧 App 通道
+		// 换身份有 ≤1 次/分钟的限流，预取是后台收益，不值得和前台抢配额；
+		// 0 = 整段关闭（与 refresh_batch / cache_max_mb 的「0 = 关」同一约定）。
+		return settingSpec{kind: kindInt, def: "1", min: 0, max: 4}, true
+	case KeyPrefetchRetrySec:
+		// 失败集的下次可预取时刻 = 失败时刻 + 本值。固定退避、不做指数：源侧
+		// 「200 + 空体」是偶发抖动，退避拉长到小时级反而不如让前台同步兜底
+		// （ADR-0017「为什么不做指数退避」）。
+		return settingSpec{kind: kindInt, def: "900", min: 60, max: 86400}, true
 	}
 	return pluginSpecFor(string(key))
 }

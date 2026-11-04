@@ -106,15 +106,21 @@ func main() {
 		logger.Warn("未设置 DRAMA_HUB_ADMIN_TOKEN：后台写操作（同步/改配置）一律 401")
 	}
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
-	srv := &http.Server{
-		Addr: addr,
-		Handler: newHandler(logger, st, settings, syncer, sched, jellyfinMgr, sourceList(plugins, boots), caches, covers, resolver,
-			tree, playbackHeaders(boots), adminToken),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
+	// 信号 ctx 要在装配播放面之前建好：预取任务挂在进程 ctx 上（不是请求 ctx），
+	// 请求结束不影响它，关机时才随 ctx 取消（ADR-0017）。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	handler, cutter := newHandler(logger, st, settings, syncer, sched, jellyfinMgr, sourceList(plugins, boots), caches, covers, resolver,
+		tree, playbackHeaders(boots), adminToken)
+	// 预取器的启停是进程级的：启动只记下 ctx（幂等），停机等当前任务收尾。
+	cutter.StartPrefetch(ctx)
+	defer cutter.StopPrefetch()
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 
 	// 缓存淘汰与 HTTP 服务同寿命：启动即跑一轮，之后每 5 分钟一轮，ctx 一取消就停
 	// （docs/CACHE-MODEL.md「淘汰」）。与请求路径无关，失败只记录、下一轮重试。
@@ -191,6 +197,10 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // newHandler 装配顶层路由。cmd 是唯一的装配根：路由表在这里一眼可见，
 // 领域包只提供自己的 handler，不关心挂载点。
 //
+// 返回 Cutter 是为了让 main 能启停播放面自己的后台预取器（StartPrefetch /
+// StopPrefetch，ADR-0017）：预取不是路由，但它属于播放面的生命周期，而生命周期
+// 只有装配根知道。不新增构造参数——依赖仍然全在函数内造好。
+//
 // 播放面（docs/PLAYBACK-CONTRACT.md）只有两个口子：`/video/{id}.m3u8` 与
 // `/video/{id}/{seq}.m4s`，单集与合并集同一路径形态，id 自带 HMAC 签名、不要 Basic。
 // `/webdav/` 是只读元数据面。1.0 的 `/dav/` 与 `/s/{token}/*` 已退役，不留兼容层
@@ -205,7 +215,7 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // playbackHeaders 是播放面取直链时 ffmpeg / ffprobe 要带的出站身份，两个通道各一份
 // （`名称: 值` 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624 / MKACG-638）：
 // 本函数不认识具体源。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, jellyfinMgr web.Jellyfin, sources []web.Source, caches *cache.Cache, covers *cache.CoverCache, resolver *stream.Resolver, tree *vfs.Tree, playbackHeaders segment.Headers, adminToken string) http.Handler {
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, jellyfinMgr web.Jellyfin, sources []web.Source, caches *cache.Cache, covers *cache.CoverCache, resolver *stream.Resolver, tree *vfs.Tree, playbackHeaders segment.Headers, adminToken string) (http.Handler, *segment.Cutter) {
 	// 播放会话表（MKACG-683）：播放面写、管理面读，同一实例在装配根创建。
 	playbackTracker := playback.NewTracker(time.Now)
 	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, resolver.DirectMany, resolver.Invalidate, playbackHeaders, playbackTracker)
@@ -221,7 +231,7 @@ func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, 
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
 	mux.HandleFunc(segment.SegmentRoute, cutter.ServeSegment)
 	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, jellyfinMgr, sources, playbackTracker, covers, signID, treePath(tree), adminToken, logger))
-	return httpx.RequestLogger(logger, mux)
+	return httpx.RequestLogger(logger, mux), cutter
 }
 
 // readJellyfinConfig 现读 Jellyfin 的五项配置（键名与校验的真值都在 store 的注册表）。

@@ -68,6 +68,9 @@ func (c *Cutter) ServePlaylist(w http.ResponseWriter, r *http.Request) {
 		writeVideoError(w, err)
 		return
 	}
+	// 时间轴已就绪：为整部剧起一次后台预取（非阻塞、失败不影响本次响应，ADR-0017）。
+	// 分片端点不触发：拖动会让它反复重启任务，而播放列表本来就是一次播放的起点。
+	c.kickPrefetch(u.eps[0].DramaID, u.eps)
 
 	body := BuildPlaylist(id, tl.slices)
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")

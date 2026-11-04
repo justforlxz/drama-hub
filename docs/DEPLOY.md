@@ -1,7 +1,10 @@
 # DEPLOY — 从零到能播的最短路径
 
 这份文档只讲一件事：**拿到镜像之后，用最少几步把它跑起来、同步一部剧、让 `/video` 出流、
-被 rclone / Emby 读到**。每一步都能照抄执行。
+`/webdav/` 能被任意 WebDAV 客户端读到**。每一步都能照抄执行。
+
+本服务只提供 HTTP（只读 WebDAV + 播放接口），**不含任何挂载客户端**：把服务跑到「可用」
+不需要 rclone 之类的工具，挂载 / 接入由使用方自选（见第 5a 节，可选）。
 
 验收口径与逐项结论见 MKACG-625；自动化判定用 `scripts/acceptance.sh`（见文末）。
 
@@ -11,8 +14,11 @@
 - PostgreSQL 16（容器即可；本服务**不建库**，只连库并自动迁移）。
 - 出站能到 `hongguoduanju.com`（元数据）与 `*.fqnovel.com` / `*.qznovelvod.com`
   （App 通道取完整片源）。
-- 宿主机上用于验收的工具：`curl`、`rclone`、`ffmpeg`、`ffprobe`、`python3`。
+- 宿主机上用于验收的工具：`curl`、`ffmpeg`、`ffprobe`、`python3`。
   服务自己的 `ffmpeg` 在镜像里，不需要宿主机装。
+- 可选：任意 WebDAV 客户端（浏览器即可列目录）。第 5a 节的 rclone 只是示例，
+  **服务不依赖它**，镜像里也不包含任何挂载客户端。一个例外是 §7 的验收脚本：
+  脚本自己用 rclone 当 WebDAV 客户端（可用 `RCLONE=` 指定路径），只影响跑脚本。
 
 ## 1. 环境变量（只给这四个）
 
@@ -134,7 +140,29 @@ curl -sS http://127.0.0.1:8080/api/dramas | python3 -m json.tool | head -20
 
 `episode_total` 是上游声明的集数，`episodes` 是库里落库的集数，两者应相等。
 
-## 5. 接到 rclone / Emby
+## 5. 服务侧到此为止
+
+到这里部署就结束了。本服务的交付面只有 HTTP：只读 WebDAV（元数据）+ `/video`（播放字节）。
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' localhost:8080/healthz   # 200
+curl -sS -o /dev/null -w '%{http_code}\n' -u emby:'<密码>' \
+  -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8080/webdav/   # 207
+```
+
+两条都对 = 服务可用；也可用浏览器带凭据打开 `http://127.0.0.1:8080/webdav/`，目录页能一层层
+点进去（集合 GET 返回 HTML 列表，MKACG-671）。播放面自检见第 6 节，同样不需要挂载。
+
+WebDAV 的 `Depth` 只认 `0` / `1` / `infinity`（数值深度 ≥2 由 `x/net/webdav` 回 400），
+WebDAV 客户端本来都是逐层 `Depth: 1` 扫，不是缺陷。**注意省略 `Depth` 头等于
+`infinity`（递归整棵树）**：21.6 万剧的分类目录实测 369 MB / 116 s / 服务端 RSS +501 MB，
+所以手工 `curl` 排障必须显式带 `-H 'Depth: 1'`（`docs/DIRECTORY-CONTRACT.md`「单目录子项上限」）。
+
+## 5a. 客户端挂载（可选，示例为 rclone）
+
+本服务不提供、也不要求任何挂载客户端。Emby / Jellyfin 需要一个能读到 WebDAV 目录的本地
+路径，这一步由使用方自选：rclone、RaiDrive、davfs2、系统文件管理器的「连接服务器」都行。
+下面只是**一种**做法（示例，不是依赖）。
 
 ```bash
 rclone config create dramahub webdav url http://127.0.0.1:8080/webdav vendor other \
@@ -144,15 +172,10 @@ rclone lsf --files-only -R dramahub:/ | wc -l    # = 对外集数×2 + 每剧 1 
 rclone mount dramahub:/ /mnt/dramahub --dir-cache-time 30s
 ```
 
-Emby / Jellyfin 的库**必须按分类目录分挂**：一个「电视节目」库，媒体文件夹加
+挂载好之后，Emby / Jellyfin 的库**必须按分类目录分挂**：一个「电视节目」库，媒体文件夹加
 `/mnt/dramahub/<分类>`（每个分类一个，真实 `genre` 词表 68 个）。库根直接挂
 `/mnt/dramahub` 会把分类目录当 Series（1436 部剧只识别出 59 部），见
 `docs/DIRECTORY-CONTRACT.md`「被推翻的做法」。
-
-`PROPFIND` 的 `Depth` 只认 `0` / `1` / `infinity`（数值深度 ≥2 由 `x/net/webdav` 回 400），
-rclone 与 Emby 本来都是逐层 `Depth: 1` 扫，不是缺陷。**注意省略 `Depth` 头等于
-`infinity`（递归整棵树）**：21.6 万剧的分类目录实测 369 MB / 116 s / 服务端 RSS +501 MB，
-所以手工 `curl` 排障必须显式带 `-H 'Depth: 1'`（`docs/DIRECTORY-CONTRACT.md`「单目录子项上限」）。
 
 ## 5b. 接 Jellyfin：一分类一媒体库（ADR-0012）
 
@@ -213,8 +236,9 @@ curl -sS -H "Authorization: MediaBrowser Token=\"<Jellyfin API key>\"" \
 - **API key 不外泄**：`/api/status` 只给 `api_key_set`，日志与错误文本里没有 key。
 - **`failed[]` 是路径问题**：分类列在 `jellyfin.failed` 里 = Jellyfin 拒绝建这个库，实测
   12.1 的原文是 `The specified path does not exist: <path>`。三个常见原因：目录还没被
-  rclone 刷出来（`--dir-cache-time`）、分类只存在于数据库而挂载上没有对应目录、
-  `jellyfin_library_root` 填错了一层。修好后下次同步会自动补上，不用清状态。
+  挂载客户端刷出来（目录缓存未过期，示例 rclone 看 `--dir-cache-time`）、分类只存在于
+  数据库而挂载上没有对应目录、`jellyfin_library_root` 填错了一层。修好后下次同步会自动
+  补上，不用清状态。
 - **库内是剧目录而不是分片目录**：这依赖**去掉分片层**（MKACG-651）先合入。分片层还在时
   库根的直接子目录是 `00`–`7f`，Jellyfin 会把分片目录认成 Series、真剧目录退化成普通
   目录 —— 本服务建库正确也照样如此（12.1 实测复现）。所以 651 必须先合并。
@@ -222,14 +246,15 @@ curl -sS -H "Authorization: MediaBrowser Token=\"<Jellyfin API key>\"" \
 ## 6. 播放面自检
 
 ```bash
-# 取任意一条 .strm 里的 URL
-STRM=$(rclone cat "dramahub:/<分类>/<剧>/Season 01/<剧> - S01E01 - 第1集.strm")
+# 从 /webdav/ 目录页（浏览器，带凭据）点进任一 .strm，复制地址栏里的完整 URL（已编码）
+URL='http://127.0.0.1:8080/webdav/<分类>/<剧>/Season%2001/<剧>%20-%20S01E01%20-%20第1集.strm'
+STRM=$(curl -sS -u emby:'<密码>' "$URL")
 curl -sS "$STRM" | head -12         # #EXTM3U … #EXT-X-ENDLIST；单集就是一条 playlist
 ID=$(echo "$STRM" | sed -E 's#.*/video/([^/]+)\.m3u8#\1#')
-curl -sS -o /tmp/0.m4s -w '%{http_code}\n' "http://127.0.0.1:8080/video/$ID/0.m4s"
+curl -sS -o ./0.m4s -w '%{http_code}\n' "http://127.0.0.1:8080/video/$ID/0.m4s"
 # 每集一片的 fMP4：片头是 ftyp，且单看这一片就能 ffprobe 出视频流与完整时长
-head -c 8 /tmp/0.m4s | tail -c 4
-ffprobe -v error -show_streams -show_entries format=duration /tmp/0.m4s | head -20
+head -c 8 ./0.m4s | tail -c 4
+ffprobe -v error -show_streams -show_entries format=duration ./0.m4s | head -20
 ffmpeg -v error -i "$STRM" -t 60 -f null - && echo "播了 60 秒"
 ```
 
@@ -252,6 +277,9 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 
 - `SKIP` 表示「当前条件下无法判定」（没给容器名、上游不可达、无法观测兜底分类），
   **不是通过**。
+- 脚本自己用 rclone 当 WebDAV 客户端（`RCLONE=${RCLONE:-rclone}`，可用 `RCLONE=`
+  指定路径），所以跑这一节需要能执行 rclone；这只服务验收脚本，与服务「只提供
+  HTTP、不含挂载客户端」的边界无关——起服务、看 `/webdav/`、放 `/video` 都不需要它。
 - 任何 `FAIL` 让脚本退出码为 1；`FAIL` 就是判据不满足，不要改判据让它变绿。
 - F 段默认实播 60 秒（`PLAY_SECONDS`），并用 ffmpeg 的 `out_time` 证明**真的拉了 60 秒内容**
   ——只看退出码 0 不行：10 秒的 playlist 也会正常结束。
@@ -303,7 +331,7 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 | 现象 | 事实 |
 |---|---|
 | 首启后 PATCH 关调度，库还在涨 | 第一轮在启动后约 0.15 秒已派出，PATCH 只拦下一轮；本轮会跑到 `refresh_timeout_sec`（默认 900 秒）。见 3.1 |
-| `rclone lsf -R` 文件数 ≠ `对外集数×2 + 剧数` | 若首轮仍在灌库，清单与库是两个时刻的快照。等 `/api/status` 的 `running=false` 再比 |
+| 客户端列出的文件数 ≠ `对外集数×2 + 剧数` | 若首轮仍在灌库，清单与库是两个时刻的快照。等 `/api/status` 的 `running=false` 再比 |
 | App 通道连续几分钟全是 `/video` 502，日志 `App 取流 … "bytes":0` + `reason:"ErrSchema"` | 上游端点 `200 + 空响应体`。实测连续 25 分钟后自行恢复（同期同一 vid 之前是 18 KB 正常体）。按契约回 502 且不回落预览是正确行为；重试即可，不要当代码缺陷 |
 
 `docs/SCHEDULER-MODEL.md` 把「首启立刻跑一轮」写成既定行为；本文件的 3.1 只讲怎么在验收时

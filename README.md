@@ -2,12 +2,17 @@
 
 短剧媒体管理器。把红果短剧的数据整理成 Emby 能直接识别的剧集库。
 
-- 只读虚拟 WebDAV：按需渲染 `.strm` / `.nfo` / 封面，Emby 通过 `rclone mount` 扫描
+- 只读虚拟 WebDAV：按需渲染 `.strm` / `.nfo` / 封面，任何 WebDAV 客户端都能直接读
 - 出流服务：单集 MP4 透传（支持 Range），合并集自造 HLS 播放列表，按分片回源
 - 合并集：N 集合成 1 条剧集，时间轴精确到关键帧，**不落物化文件**
 - 缓存：分片级 LRU，上限与保留期后台可调
 - Jellyfin 媒体库：一个分类一个库（库根 = `<媒体库根>/<分类>`），配好 API key 后由服务
   自动创建与维护；分类开关决定哪些库保留（ADR-0012）
+
+> **服务边界**：本项目只提供 HTTP —— 只读 WebDAV（元数据）与 `/video`（播放字节）。
+> 挂载 / 客户端接入由使用方自选（rclone、RaiDrive、davfs2、系统文件管理器、浏览器均可），
+> **不属于本项目的交付物**；镜像里不含任何挂载客户端，把服务跑起来也不需要它。
+> 想让 Emby / Jellyfin 读到目录时再看「客户端接入（示例）」。
 
 ## 快速开始
 
@@ -120,7 +125,8 @@ PTS（ADR-0011）。
 
 缓存由本服务自己负责（ADR-0007）：海报与分片落 `<cache_dir>`，按
 `cache_max_mb` / `cache_lru_days` 淘汰，规则见 `docs/CACHE-MODEL.md`；播放字节一律经本
-服务的 `/video/…`，rclone 只剩 WebDAV 只读挂载，不再需要 `--vfs-cache-mode full`。
+服务的 `/video/…`，客户端只读 WebDAV，不需要任何缓存模式（示例里的 rclone 也不必再开
+`--vfs-cache-mode full`）。
 （`/api/status` 原先那份 rclone 建议参数属 ADR-0004 遗留，已在 MKACG-616 删除：
 页面只展示真正参与运行的配置，缓存目录/上限/保留天数都在设置页里。）
 
@@ -144,7 +150,12 @@ curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8
 
 需要的运行环境：`ffmpeg`、`ffprobe` 在 `PATH` 里。
 
-## 接到 Emby
+## 客户端接入（示例）
+
+**示例，不是依赖**：本服务只提供 HTTP（只读 WebDAV + `/video`），镜像里没有 rclone，也
+不需要装它才能把服务跑起来。下面用 rclone 演示「给 Emby / Jellyfin 一个本地目录」这一步，
+换成 RaiDrive、davfs2、文件管理器「连接服务器」，或直接用浏览器打开 `/webdav/` 的目录页
+（集合 GET 返回可浏览的 HTML 列表）同样成立。
 
 ```bash
 rclone config create dramahub webdav url http://127.0.0.1:8080/webdav vendor other \

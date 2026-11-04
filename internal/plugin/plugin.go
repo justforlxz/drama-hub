@@ -85,8 +85,8 @@ type Page struct {
 type Stream struct {
 	URL string
 	// Key 是 URL 指向内容的 AES-128 解密密钥（16 字节，CENC-AES-CTR），
-	// nil = 明文。只在内存里存在：MUST NOT 落库、MUST NOT 进日志与错误文本
-	// （docs/PLUGIN-CONTRACT.md「加密切片与 Key」）。
+	// nil = 明文。与 URL 同生命周期：框架一起落库以复用（ADR-0016），
+	// 但 MUST NOT 进日志与错误文本（docs/PLUGIN-CONTRACT.md「加密切片与 Key」）。
 	Key       []byte
 	ExpiresAt time.Time // 零值 = 不知道或不过期
 }
@@ -115,8 +115,9 @@ type Plugin interface {
 	// Resolve 解析某一集的可播放直链。
 	//
 	// epNo 超出该作品集数 → ErrNotFound；集存在但源侧不公开直链 → ErrNoStream。
-	// 返回值只在本次请求内有意义，框架不持久化（docs/DATA-MODEL.md「播放入口」）。
-	// Key 与 URL 同生命周期：由播放面在本次请求内交给 ffmpeg，用完即弃。
+	// 框架把返回值连同过期时刻落 episode_stream、按 expires_at 复用（ADR-0016、
+	// docs/DATA-MODEL.md「播放入口」）；插件自己 MUST NOT 缓存。
+	// Key 与 URL 同生命周期：一起复用、一起失效。
 	Resolve(ctx context.Context, ref WorkRef, epNo int) (Stream, error)
 
 	// Health 做一次最小可用性自检：能连上、能认出一个已知对象。

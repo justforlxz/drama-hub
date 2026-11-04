@@ -84,7 +84,10 @@ CREATE TABLE IF NOT EXISTS source_state (
 游标 + 三个时间 + 错误、状态页读五列）都只用上面五列，**够用，不需要新增或修改列**；
 `next_due` 继续不落库（请求时由 `last_run_at` + 现读 `refresh_interval_sec` 算出）。
 
-### 0003：直链不落库
+### 0003：直链不落库（历史；ADR-0016 之后改为带过期判定地入库）
+
+> 本节保留 0004 的原始理由。0004 防的是「无过期判定的永久链接」；0010 存的是带
+> `expires_at` 的短时凭据，并新增「CDN 拒绝即作废重取」，两者不矛盾（ADR-0016）。
 
 ```sql
 -- 0003_drop_play_url.sql
@@ -147,8 +150,9 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
 | `artifact(kind='cover')` | 海报（刷新时下载并本地化） |
 | `idx_artifact_kind_last_used` | `WHERE kind=? ORDER BY last_used_at` 的淘汰查询；也覆盖按 `kind` 的计数/求和 |
 
-**缓存里也不存直链**：`key` 是内容哈希，`path` 是本地路径，两者都不含上游 URL。
-换成 `stream_secret` 或上游换链都不会在缓存索引里留下痕迹。
+**缓存索引里不存直链**：`key` 是内容哈希，`path` 是本地路径，两者都不含上游 URL。
+换成 `stream_secret` 或上游换链都不会在缓存索引里留下痕迹（直链本身在 0010 的
+`episode_stream`，按 `expires_at` 复用，与缓存键无关）。
 
 ### 0006：每集一片 fMP4（ADR-0011）
 
@@ -204,6 +208,34 @@ CREATE INDEX IF NOT EXISTS idx_drama_genre_title ON drama (genre, title);
 | `drama.shard` | **删除**（`DROP COLUMN`，不可回滚；同一二进制既迁移也不再读该列） |
 | `idx_drama_genre_shard_title` | 随 `shard` 列一起消失 |
 | `idx_drama_genre_title` | **新增**，服务分类目录列举与 `DISTINCT genre` |
+
+### 0010：直链入库（ADR-0016）
+
+```sql
+-- 0010_episode_stream.sql
+CREATE TABLE IF NOT EXISTS episode_stream (
+    episode_id BIGINT NOT NULL REFERENCES episode (id) ON DELETE CASCADE,
+    channel    TEXT   NOT NULL CHECK (channel IN ('web','app')),
+    url        TEXT   NOT NULL,
+    key        BYTEA,                        -- NULL = 明文；与 url 同生命周期
+    expires_at TEXT   NOT NULL,              -- UTC RFC3339，过了不再复用
+    fetched_at TEXT   NOT NULL,
+    last_ok_at TEXT   NOT NULL DEFAULT ''    -- 空串 = 还没有确认过能用
+);
+ALTER TABLE episode_stream ADD PRIMARY KEY (episode_id, channel);
+```
+
+`channel` 与 `segment.channel` 同一判据（`stream.ChannelOf`：带内容密钥的是 `app`），
+决定这一行属于哪条字节流；`url` 与 `key` 一起失效、一起重取。业务时间列沿用 0001 的
+不透明 TEXT（UTC RFC3339），不引入 TIMESTAMPTZ。
+
+这不是 0004 的反悔：0004 防的是「无过期判定的永久链接」，本表的每一行都必须带
+`expires_at`，且 CDN 401/403/404 会触发「作废这一集 + 重解析一次」（ADR-0016）。
+`last_ok_at` 只作排障信息，不参与过期判定。
+
+| 对象 | 用途 |
+|---|---|
+| `episode_stream` | 某集某通道的直链快照：未过期直接复用，过期/失效才重解析（`internal/stream`） |
 
 ## 字段来源逐个定稿
 
@@ -271,14 +303,16 @@ CREATE INDEX IF NOT EXISTS idx_drama_genre_title ON drama (genre, title);
 - 需要 Review 的一条：不再有「什么时候重建派生数据」这个问题——任何写路径都不得写
   派生结果，对外形态只由 `episode` + `merge_chunk_size` 决定。
 
-### 播放入口（直链不落库）
+### 播放入口（直链按过期时间复用）
 
-- 库中**没有任何一列**保存直链（0004 删两列后），缓存索引里也没有（见 0004）。
-- 请求路径：`/video/{id}.m3u8` → 读 `episode.duration_sec` + `segment.channel` 出 playlist；
-  `/video/{id}/{seq}.m4s` → 查本地分片缓存 → 未命中则 `plugin.Resolve` 取直链、
+- 直链只在 `episode_stream` 里（0010，ADR-0016）：未过期直接复用、零外呼；过期或
+  CDN 拒绝才重解析一次。缓存索引里没有直链（`key` 是内容哈希，见 0004）。
+- 请求路径：`/video/{id}.m3u8` → 读 `episode.duration_sec` + `segment.channel` 出 playlist，
+  整块成员的直链一次批量解析（已在库内未过期的直接命中）；
+  `/video/{id}/{seq}.m4s` → 查本地分片缓存 → 未命中则取直链、
   ffmpeg 整集转封装、落缓存、回字节。
   详见 `docs/PLAYBACK-CONTRACT.md` 与 `docs/CACHE-MODEL.md`。
-- 失败语义：`ErrNoStream` / `ErrNotFound` → **502，不写库、不写缓存**。
+- 失败语义：`ErrNoStream` / `ErrNotFound` → **502，失败结果不写库、不写缓存**。
 - 红果实况：只有第 1 集有直链且是 10 秒预览，第 2..N 集 `ErrNoStream`，
   第 4 集起 `ErrNotFound`。这是源侧事实，不是本服务缺陷。
 

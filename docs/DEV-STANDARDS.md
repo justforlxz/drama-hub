@@ -145,6 +145,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 |---|---|---|---|---|
 | `strm_prefix` | `""` | 带 host 的绝对 URL 或空 | 即时（每次渲染 `.strm`） | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，尾 `/` 写入时归一掉）；空 = 按请求 `Host` 推导绝对地址（见上「`.strm` 的绝对地址」）。不指向 rclone/openlist |
 | `stream_secret` | 必填 | ≥ 32 字节 | 即时（每请求） | 出流 HMAC 签名密钥（见 ADR-0003）；换了之后所有旧 URL 失效 |
+| `stream_url_ttl_sec` | `900` | 60–86400 | 即时（下一次解析直链） | 直链的默认有效期（秒）：插件给了 `Stream.ExpiresAt` 时以上游为准，没给就用「解析时刻 + 本值」写进 `episode_stream.expires_at`。未过期的直链直接复用、零外呼；过期或 CDN 拒绝（401/403/404）才重解析（ADR-0016）。默认 900 s 的取值理由见 ADR-0016「决策」 |
 | `merge_chunk_size` | `10` | 1–500 | 即时（每次派生对外剧集） | 每 N 集并成 1 条对外剧集（ADR-0010 / 0014）。库里只存原始集，列举与播放每次现读本值重算，改完下一次读取即生效、不用重启也不用同步；改 N 会重排全库对外集号，旧合并 uid 随即 404（分片缓存靠 LRU 过期，不主动清） |
 | `webdav_user` / `webdav_pass` | 必填 | 非空字符串 | 即时（每请求） | WebDAV Basic 认证 |
 | `webdav_page_size` | `1000` | 1–100000 | 即时（每次目录页请求） | WebDAV 集合 GET 目录页的单页条数：超出部分不渲染，页面上写「共 M 项，已显示前 N」。分类层有 21.8 万项目录，整页铺开会生成百 MB 级 HTML（MKACG-671；语义见 `docs/DIRECTORY-CONTRACT.md`「集合 GET」） |
@@ -218,9 +219,10 @@ ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（�
 - `/dav/`、`/s/{token}/*` 与 `/s/*/master.m3u8` **已退役、不留兼容层**：`.strm` 是按
   请求渲染的，下一次读取就是新内容，没有存量文件需要兼容。
 - `internal/stream`（rank 20）只剩两件事：`ID` / `ParseID`（对外 id 的 HMAC 签名）与
-  `Resolver`（请求时向插件解析直链，返回 `stream.Direct{URL, Key}`；`Key` 是插件给的
-  内容密钥，原样透传给播放面，见 `docs/PLUGIN-CONTRACT.md`「加密切片与 Key」）。
-  它不碰 HTTP —— 状态码映射在 `internal/segment`。
+  `Resolver`（按 `episode_stream` 复用或解析直链，返回 `stream.Direct{URL, Key}`；
+  `Key` 是插件给的内容密钥，原样透传给播放面，见 `docs/PLUGIN-CONTRACT.md`
+  「加密切片与 Key」）。直链与 key 按 `expires_at` 复用、CDN 拒绝时作废重取
+  （ADR-0016）。它不碰 HTTP —— 状态码映射在 `internal/segment`。
 
 ### id 规则
 
@@ -279,11 +281,11 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
 | 时长探测超时 | 503 + `Retry-After: 5` | 503 + `Retry-After: 5` |
 | secret 读失败 | 500（响应体与日志都不含 secret） | 500 |
 
-- **直链只在请求时解析**（`stream.Resolver.Direct`）：不落库（0004 已删
-  `episode.play_url` / `play_url_at`）、不缓存、不跨请求复用 —— 上游换链后下一次请求
-  自然拿到新链。解析失败一律 502，且不写库、不写缓存。返回的 `Key`（加密片源的内容
-  密钥，`nil` = 明文）与直链同生命周期：只在本次请求的内存里，不落库、不进日志、
-  不进缓存键。
+- **直链按过期时间复用**（`stream.Resolver.Direct`，ADR-0016）：解析结果与
+  `expires_at` 一起写进 `episode_stream`，未过期直接返回、零外呼；过期或 CDN 明确
+  拒绝（401/403/404）才作废这一集并重解析一次。同一集的并发请求单飞。解析失败一律
+  502，失败结果不写库。`Key`（加密片源的内容密钥，`nil` = 明文）与直链同生命周期：
+  一起落库、一起失效；两者都 MUST NOT 进日志、错误文本与缓存键。
 - **加密片源解密归 ffmpeg**（MKACG-626 契约 1/6，MKACG-629 落地）：`Key` 非空时整集转封装与时长
   探测的命令 MUST 把 `-decryption_key <hex>` 放在**源地址（`-i`）之前** —— 放到后面 ffmpeg
   只会把它当输出选项静默忽略。明文流的 argv 里不出现这个参数（空值会被 ffmpeg 判非法）。
@@ -345,7 +347,8 @@ DISCONTINUITY 表达，不再需要 `-output_ts_offset` 平移 PTS。分片端�
 
 - `slog` 结构化字段，键用小写下划线：`drama_id`、`ep_no`、`uid`、`seq`、`duration_ms`、`upstream_status`。
 - **禁止记录**：完整带签名的播放直链、token 明文、WebDAV 密码、解密 key（`plugin.Stream.Key`，
-  也不许出现在错误文本与缓存键里）。需要定位时记 `vid` + `host` + 路径前 32 字符。
+  也不许出现在错误文本与缓存键里）。直链与 key 虽然落库（ADR-0016），日志纪律不变：
+  需要定位时记 `episode_id` + `channel` + `host` + 路径前 32 字符。
 - 每个请求一条入口日志（方法、路径、状态、耗时），出站上游一条（源、状态、字节数；传输错误时该条额外带 `err` 底层原因，不含 URL）。
 
 ### 请求访问日志中间件
@@ -447,20 +450,22 @@ DASH-CENC（`play_info`）时按 `ErrUnsupported` 上报，不回落。
   可选接口 `sync.WorkWithEpisodeKeys` —— 插件实现就一次调用同时拿到详情与每集源侧标识，
   不实现则 `episode.vid` 留空（不编造）。红果实现了它。
 
-### 直链不落库的契约（0004 之后）
+### 直链复用与失败自愈（ADR-0016，推翻 0004 的「不落库」）
 
-**库里没有直链列。** `0004_drop_play_url.sql` 删掉了 `episode.play_url` /
-`play_url_at`：直链是请求时向插件解析的短时凭据，持久化等于把过期链接写进库。
+**库里存的是带过期的短时凭据，不是永久链接。** `0004_drop_play_url.sql` 删掉
+`episode.play_url` / `play_url_at` 防的是「1.0 把很久以前存的 URL 当作永久有效」；
+`0010_episode_stream.sql` 存的每一行都必须带 `expires_at`，并有第二条失效路径
+（CDN 401/403/404 → 作废 + 重解析一次）。两条路径任一命中都要重新向插件申请，
+不存在「旧链接被当永久有效」的可能。
 
 实测（2026-10-29，9 部剧逐一 ffprobe，**网页通道**）：列表页 `vid_list` 给全全部集，但单集页
 SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **实际时长恒为 10.08 秒**
 （JSON-LD 却声明整集时长）。受保护剧的完整片源走站点播放通道（MKACG-676，站点登录态），
 App 通道退为兜底（MKACG-626/630）——同一集换通道就是另一条字节流，所以分片身份带通道段
 （见「分片缓存」）。出流面把 `ErrLoginRequired` 映射为 403、`ErrUnsupported` 映射为 501，
-其余解析失败仍是 502（`internal/segment` 的 `resolveFailure`）。三条通道都不落库：
-1.0 从不写这两列，读它们的出流端点（`/s/{token}/e/{uid}`）在真实
-库上恒 502 —— 那条断链在 S8 直接接在 `/video` 上：**每次播放请求现调
-`plugin.Resolve`**（`internal/stream` 的 `Resolver`），失败一律 502、不写库不缓存。
+其余解析失败仍是 502（`internal/segment` 的 `resolveFailure`）。三条通道都要走
+`plugin.Resolve` 才拿得到直链：**解析结果按 `expires_at` 复用**，1.0 的
+`/s/{token}/e/{uid}` 之所以恒 502，是因为它读的 `play_url` 列从来没人写过。
 
 同步只保证「剧与集齐全、`vid` / `ep_no` 正确」；`/api/dramas` 也不再报「可播集数」：
 那个数字在当前实现里恒为 0，删列只是让它别再骗人。

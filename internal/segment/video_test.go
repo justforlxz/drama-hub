@@ -277,6 +277,15 @@ func (f *fakeCDN) setHang() {
 	f.mu.Unlock()
 }
 
+// heal 模拟「上游换了一条能用的直链」：不再拒绝，并给 url() 换一个查询串。
+// rig 的 invalidate 钩子用它，让「作废 + 重解析一次」拿到与旧链不同的新链。
+func (f *fakeCDN) heal() {
+	f.mu.Lock()
+	f.reject = 0
+	f.query = "?gen=2"
+	f.mu.Unlock()
+}
+
 // rejectWith 让假源站以 status 拒绝请求，并把自身地址换成带签名的直链：
 // 复现「媒体 CDN 回 403、直链带 n80_tk 查询串」那种失败（MKACG-639）。
 func (f *fakeCDN) rejectWith(status int, query string) {
@@ -303,6 +312,13 @@ type rig struct {
 	resolveErr map[int64]error
 	// resolves 数「直链解析次数」：命中缓存的分片请求不该增加它（零外呼的直接证据）。
 	resolves atomic.Int64
+	// invalidates 数「作废直链」次数：CDN 拒绝后的自愈路径必须只动这一集。
+	invalidates atomic.Int64
+	// invalidate 是注入 Cutter 的作废入口（生产是 stream.Resolver.Invalidate）。
+	invalidate func(ctx context.Context, episodeID int64) error
+	// healOnInvalidate 打开的集，在作废时让假源站「换一条能用的链」：验证自愈路径
+	// 只重解析一次就能播。默认关闭，403 类用例仍拿到 502。
+	healOnInvalidate map[int64]bool
 }
 
 // newRig 建临时库并写一部剧。
@@ -338,7 +354,7 @@ func newRig(t *testing.T) *rig {
 	r := &rig{
 		db: db, st: st, settings: settings, logs: &bytes.Buffer{},
 		dramaID: dramaID, cacheRoot: root, cdn: map[int64]*fakeCDN{}, keys: map[int64][]byte{},
-		resolveErr: map[int64]error{},
+		resolveErr: map[int64]error{}, healOnInvalidate: map[int64]bool{},
 	}
 	logger := slog.New(slog.NewJSONHandler(r.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	resolveOne := func(_ context.Context, ep store.Episode) (stream.Direct, error) {
@@ -354,6 +370,17 @@ func newRig(t *testing.T) *rig {
 	}
 	// 批量入口沿用单集语义逐条解析：rig 的假源没有「一次页面解析多集」的能力，
 	// 但生产入口（stream.Resolver.DirectMany）是一样的「一次调用解析一块成员」。
+	// invalidate 模拟生产里的 stream.Resolver.Invalidate：只作废这一集，并让假源站
+	// 「换一条能用的链」，好验证重解析后重试一次就成功。
+	r.invalidate = func(_ context.Context, id int64) error {
+		r.invalidates.Add(1)
+		if r.healOnInvalidate[id] {
+			if f, ok := r.cdn[id]; ok {
+				f.heal()
+			}
+		}
+		return nil
+	}
 	r.c = NewCutter(st, settings, logger, cache.New(st, settings, logger), resolveOne,
 		func(ctx context.Context, eps []store.Episode) ([]stream.Direct, error) {
 			out := make([]stream.Direct, len(eps))
@@ -365,7 +392,7 @@ func newRig(t *testing.T) *rig {
 				out[i] = d
 			}
 			return out, nil
-		}, Headers{Web: testWebHeaders, App: testAppHeaders})
+		}, r.invalidate, Headers{Web: testWebHeaders, App: testAppHeaders})
 	return r
 }
 
@@ -877,9 +904,9 @@ func TestSegment_RemuxFailureIs502AndNotCached(t *testing.T) {
 	}
 }
 
-// TestSegment_SourceLinkRotated 覆盖 AC「源直链失效后重新 Resolve 仍可出流」：
-// 换掉解析结果（模拟直链过期换链）后，新的分片请求用的是新链、并落新缓存。
-func TestSegment_SourceLinkRotated(t *testing.T) {
+// TestSegment_CDNRejectsThenHeals 覆盖 ADR-0016 的失败自愈：CDN 回 403 时只作废
+// 这一集的直链、重解析一次、重试一次；重试成功后落缓存，下一次请求零外呼。
+func TestSegment_CDNRejectsThenHeals(t *testing.T) {
 	r := newRig(t)
 	ep := r.addEpisode(t, 1, 8)
 	uid := "e" + strconv.FormatInt(ep.ID, 10)
@@ -888,26 +915,38 @@ func TestSegment_SourceLinkRotated(t *testing.T) {
 		t.Fatalf("基线 playlist 状态码 = %d, 期望 200", rec.Code)
 	}
 
-	old := r.cdn[ep.ID]
-	path := filepath.Join(t.TempDir(), "rot.mp4")
-	makeVideo(t, path, 8)
-	body, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("读取 fixture: %v", err)
-	}
-	rotated := newFakeCDN(t, body)
-	oldHits := old.hits()
-	r.cdn[ep.ID] = rotated
+	cdn := r.cdn[ep.ID]
+	cdn.rejectWith(http.StatusForbidden, appSignedQuery)
+	r.healOnInvalidate[ep.ID] = true
+	resolvesBefore := r.resolves.Load()
 
+	rec := r.do(t, http.MethodGet, "/video/"+id+"/0.m4s")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("403 自愈后状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	if got := r.invalidates.Load(); got != 1 {
+		t.Errorf("作废次数 = %d, 期望 1（只作废这一集，重试一次）", got)
+	}
+	if got := r.resolves.Load() - resolvesBefore; got != 2 {
+		t.Errorf("解析次数增量 = %d, 期望 2（首次 + 作废后重解析一次）", got)
+	}
+	// 自愈后的新链被缓存：再请求一次分片零解析、零作废。
+	resolvesBefore = r.resolves.Load()
 	if rec := r.do(t, http.MethodGet, "/video/"+id+"/0.m4s"); rec.Code != http.StatusOK {
-		t.Fatalf("换链后状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+		t.Fatalf("第二次分片状态码 = %d, 期望 200", rec.Code)
 	}
-	if rotated.hits() == 0 {
-		t.Error("换链后仍打旧源：请求没有重新 Resolve（直链被缓存了）")
+	if got := r.resolves.Load(); got != resolvesBefore {
+		t.Errorf("命中缓存的分片又解析了 %d 次直链, 期望 0", got-resolvesBefore)
 	}
-	if got := old.hits(); got != oldHits {
-		t.Errorf("旧源被打了 %d 次（换链后新增 %d）, 期望 0（每次都重新解析直链）", got, got-oldHits)
+	if got := r.invalidates.Load(); got != 1 {
+		t.Errorf("作废次数 = %d, 期望仍是 1", got)
 	}
+	// 自愈路径的日志只带集标识，不带直链与签名查询串。
+	logs := r.logs.String()
+	if strings.Contains(logs, "n80_tk") || strings.Contains(logs, "deadbeefcafebabe") {
+		t.Errorf("日志里出现了直链签名查询串：%s", logs)
+	}
+	t.Logf("自愈路径实际日志：%s", logs)
 }
 
 // appSignedQuery 是假 App 直链的签名查询串：它的任何一个参数名都不许出现在

@@ -36,6 +36,10 @@ type SettingKey string
 const (
 	KeyStrmPrefix   SettingKey = "strm_prefix"
 	KeyStreamSecret SettingKey = "stream_secret"
+	// KeyStreamURLTTL 是直链的默认有效期（秒，默认 900）。只在插件没给 ExpiresAt 时
+	// 用于 expires_at = fetched_at + 本值；每次解析现读，改完下一次解析即生效
+	// （docs/adr/0016-episode-stream-cache.md）。
+	KeyStreamURLTTL SettingKey = "stream_url_ttl_sec"
 	KeyWebDAVUser   SettingKey = "webdav_user"
 	KeyWebDAVPass   SettingKey = "webdav_pass"
 	// KeyWebDAVPageSize 是浏览器目录页的单页条数（默认 1000，范围 1–100000）。分类层
@@ -411,6 +415,10 @@ func specFor(key SettingKey) (settingSpec, bool) {
 		return settingSpec{kind: kindURL}, true
 	case KeyStreamSecret:
 		return settingSpec{kind: kindSecret, required: true}, true
+	case KeyStreamURLTTL:
+		// 直链默认有效期：单集 remux 上限 300 s，块首播逐集取流，900 s 兼顾复用
+		// 与签名过期风险；上游给了 ExpiresAt 时以上游为准（ADR-0016）。
+		return settingSpec{kind: kindInt, def: "900", min: 60, max: 86400}, true
 	case KeyWebDAVUser:
 		return settingSpec{kind: kindString, required: true}, true
 	case KeyWebDAVPass:

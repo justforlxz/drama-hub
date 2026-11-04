@@ -67,7 +67,7 @@ func newAssembly(logger *slog.Logger, st *store.Store, settings *store.Settings,
 	)
 	return newHandler(logger, st, settings, syncer, schedule, jellyfinMgr, sources,
 		cache.New(st, settings, logger), cache.NewCoverCache(st, settings, &http.Client{}, logger),
-		stream.NewResolver(st, reg), tree, playbackHeaders(map[string]pluginBoot{}), testAdminToken)
+		stream.NewResolver(st, settings, reg), tree, playbackHeaders(map[string]pluginBoot{}), testAdminToken)
 }
 
 // testAdminToken 是装配测试用的管理令牌：生产里来自 DRAMA_HUB_ADMIN_TOKEN。
@@ -947,6 +947,7 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 			}
 			return out, nil
 		},
+		func(context.Context, int64) error { return nil },
 		playbackHeaders(nil))
 	mux := http.NewServeMux()
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)

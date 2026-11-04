@@ -132,9 +132,19 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			out, err := remux(ctx, c.logger, src, c.fetchHeaders(src))
+			if err != nil && errors.Is(err, errRejected) {
+				// CDN 拒绝：作废这一集的直链、重解析一次、重试一次（ADR-0016）。
+				fresh, refreshErr := c.refreshRejected(ctx, ep, channel)
+				if refreshErr != nil {
+					return nil, refreshErr
+				}
+				src = fresh
+				out, err = remux(ctx, c.logger, src, c.fetchHeaders(src))
+			}
 			if err != nil {
 				return nil, err
 			}
+			c.touchStream(ctx, ep.ID)
 			// 每次真实生成一条 Info：AC「同一集第二次播放 ffmpeg 调用 0 次」的计次依据。
 			c.logger.InfoContext(ctx, "segment generated",
 				"episode_id", ep.ID, "channel", channel, "bytes", len(out))

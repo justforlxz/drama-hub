@@ -96,7 +96,7 @@ func main() {
 	if err := caches.EnsureLayout(context.Background()); err != nil {
 		logger.Warn("缓存目录不可用", "err", err)
 	}
-	resolver := stream.NewResolver(st, plugins)
+	resolver := stream.NewResolver(st, settings, plugins)
 
 	// 后台写操作的令牌（POST / PATCH）。没配就 fail closed：写端点一律 401，
 	// 状态页会说明「未设置 DRAMA_HUB_ADMIN_TOKEN，后台改配置不可用」。
@@ -205,7 +205,7 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // （`名称: 值` 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624 / MKACG-638）：
 // 本函数不认识具体源。
 func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, jellyfinMgr web.Jellyfin, sources []web.Source, caches *cache.Cache, covers *cache.CoverCache, resolver *stream.Resolver, tree *vfs.Tree, playbackHeaders segment.Headers, adminToken string) http.Handler {
-	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, resolver.DirectMany, playbackHeaders)
+	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, resolver.DirectMany, resolver.Invalidate, playbackHeaders)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)

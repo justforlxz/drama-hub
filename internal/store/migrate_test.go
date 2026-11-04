@@ -102,7 +102,7 @@ func TestMigrateToLatest(t *testing.T) {
 	}
 
 	want := []string{
-		"artifact", "drama", "episode", "jellyfin_category_switch",
+		"artifact", "drama", "episode", "episode_stream", "jellyfin_category_switch",
 		"schema_migrations", "segment", "settings", "source_state",
 	}
 	if got := tableNames(t, db); !reflect.DeepEqual(got, want) {

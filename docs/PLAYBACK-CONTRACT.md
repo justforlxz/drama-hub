@@ -138,6 +138,21 @@ App 通道也不可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `
 列举时现算，`.nfo` 的 `<runtime>` 与 playlist 的 `#EXTINF` 下一次读取就是真实值；没播过
 的集仍是 0。细节见 `docs/DEV-STANDARDS.md`「时长探测」。
 
+## 直链复用与失败自愈（ADR-0016）
+
+直链与解密 key 存在 `episode_stream(episode_id, channel)`，每行带 `expires_at`：
+
+- **未过期直接复用、零外呼**：`Resolver.Direct` / `DirectMany` 先读库；播放列表与分片
+  生成共用这份缓存，一个合并块首播之后的请求不再重复申请。
+- **过期才重解析一次**：`expires_at` = 插件给的 `Stream.ExpiresAt`，没给就是
+  `fetched_at + stream_url_ttl_sec`（默认 900 s，可调、即时生效）。
+- **CDN 拒绝（401/403/404）**：作废**这一集**的直链（不是整部剧）→ 重解析一次 →
+  重试一次；再失败按上面的状态码矩阵上报，不静默重试到超时。重解析后通道翻转则上报，
+  不把新通道的字节写进旧通道的缓存键。
+- **单飞**：同一集的并发请求只解析一次，其余等同一份结果。
+- **敏感面**：`url` 与 `key` 都不进日志、不进错误文本；错误只说「某集某通道的直链」。
+  换 `stream_secret` 不会让直链缓存失效（直链与出流签名无关）。
+
 ## `GET /video/{id}/{seq}.m4s`
 
 返回**一整集**的自包含 fMP4。顺序是：**查本地缓存 → 命中即回文件；未命中 → 生成、
@@ -161,8 +176,8 @@ App 通道也不可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `
   `TestMergedPlaylist_DecodesEveryFrame` 与 `TestSegmentDirectRequestFillsDuration`。
 - 加密片源：`Resolve` 带 `Key`（`plugin.Stream.Key`，16 字节 AES-128）时，转封装与
   时长探测的命令 MUST 在 `-i` **之前**加 `-decryption_key <hex>`，交给 ffmpeg 的
-  CENC-AES-CTR 原生解密；本服务不实现解密、不落整集明文。key 只在本次请求的内存里
-  过一手：不进日志、不进错误文本、不落库、不进缓存键
+  CENC-AES-CTR 原生解密；本服务不实现解密、不落整集明文。key 与直链一起落库
+  （`episode_stream`，ADR-0016）、一起失效重取，但 MUST NOT 进日志、错误文本与缓存键
   （`docs/PLUGIN-CONTRACT.md`「加密切片与 Key」）。
 - 出站身份**按通道两份**（MKACG-638）：`ffmpeg` / `ffprobe` 取直链 MUST 带 `-headers`，
   但同一份头不能同时喂给两个通道 —— 网页通道（明文直链 `hongguoduanju.com/video/public/…`）

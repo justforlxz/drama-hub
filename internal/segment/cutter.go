@@ -23,7 +23,7 @@ import (
 
 // ResolveFunc 在请求时解析一集的直链与解密 key（装配根注入 stream.Resolver.Direct）。
 //
-// 契约要求直链只在请求时解析、任何列都不存（docs/PLAYBACK-CONTRACT.md）：
+// 直链的复用与落库由 stream.Resolver 负责（episode_stream，按 expires_at 判定）；
 // 本包不 import plugin，解析能力由上层以函数注入，错误原样透出。
 type ResolveFunc func(ctx context.Context, ep store.Episode) (stream.Direct, error)
 
@@ -33,6 +33,12 @@ type ResolveFunc func(ctx context.Context, ep store.Episode) (stream.Direct, err
 // （MKACG-677 的 502 来源之一）。批量能力由上层以函数注入，本包仍不 import plugin。
 // 返回顺序必须与 eps 一一对应；长度不符按上游故障处理。
 type ResolveManyFunc func(ctx context.Context, eps []store.Episode) ([]stream.Direct, error)
+
+// InvalidateFunc 作废某集的直链（装配根注入 stream.Resolver.Invalidate）。
+//
+// CDN 明确拒绝（401/403/404）时用一次：只作废这一集，下一次解析拿新链
+// （docs/adr/0016-episode-stream-cache.md「失败自愈」）。
+type InvalidateFunc func(ctx context.Context, episodeID int64) error
 
 // Cutter 是播放面的中枢：`/video/{id}.m3u8` 与 `/video/{id}/{seq}.m4s` 的 handler、
 // 每集的时长探测（episode.duration_sec）、segment 行的通道对齐、以及分片缓存共用
@@ -47,7 +53,9 @@ type Cutter struct {
 	// resolveMany 是播放列表用的批量解析（一次页面请求解析整块成员）；单集兜底
 	// 路径（分片先到）仍用 resolve。
 	resolveMany ResolveManyFunc
-	gate        chan struct{}
+	// invalidate 作废某集的直链（CDN 拒绝时用一次，只作废这一集）。
+	invalidate InvalidateFunc
+	gate       chan struct{}
 	// headers 是取直链时传给 ffmpeg / ffprobe 的出站身份，两个通道各一份；
 	// 用哪一份由本次解析出的直链决定（见 fetchHeaders）。本包不认识任何源，
 	// 两份都由装配根注入（见 NewCutter 的 headers）。
@@ -69,11 +77,11 @@ type Headers struct {
 }
 
 // NewCutter 装配播放面。caches 是本地缓存（分片落盘 + single-flight），
-// resolve / resolveMany 由装配根注入（stream.Resolver.Direct / DirectMany）。
+// resolve / resolveMany / invalidate 由装配根注入（stream.Resolver 的同名方法）。
 //
 // headers 是 ffmpeg / ffprobe 取直链时要带的出站请求头，按通道两份：这两个子进程
 // 不走 http.Client，只能靠 `-headers`。空切片 = 该通道不带（见 Headers）。
-func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc, resolveMany ResolveManyFunc, headers Headers) *Cutter {
+func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc, resolveMany ResolveManyFunc, invalidate InvalidateFunc, headers Headers) *Cutter {
 	return &Cutter{
 		st:          st,
 		settings:    settings,
@@ -81,6 +89,7 @@ func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, c
 		caches:      caches,
 		resolve:     resolve,
 		resolveMany: resolveMany,
+		invalidate:  invalidate,
 		gate:        make(chan struct{}, ffmpegSlots()),
 		headers:     headers,
 
@@ -136,6 +145,9 @@ const ensureDeadline = 30 * time.Second
 // 这一集还没人播过）时现 ffprobe 一次并回填 —— 回填只填 0，之后 playlist 的
 // EXTINF、TARGETDURATION 与 .nfo 的 <runtime> 都从这一个值派生（docs/adr/0014）。
 //
+// CDN 明确拒绝（401/403/404）时按 ADR-0016 自愈：作废这一集的直链、重解析一次、
+// 重试一次；再失败才上报。重解析后通道变了就报错，不把 App 字节当网页字节用。
+//
 // 探测失败不写任何东西；超时（ensureDeadline）返回 httpx.ErrUnavailable，边界包据此
 // 回 503 + Retry-After，不出半截时间轴。
 func (c *Cutter) ensureDuration(ctx context.Context, ep store.Episode, d stream.Direct) (float64, error) {
@@ -147,6 +159,18 @@ func (c *Cutter) ensureDuration(ctx context.Context, ep store.Episode, d stream.
 	}
 	seconds, probeErr := probeDuration(ctx, c.logger, d, c.fetchHeaders(d))
 	c.release()
+	if probeErr != nil && errors.Is(probeErr, errRejected) {
+		fresh, refreshErr := c.refreshRejected(ctx, ep, channelOf(d))
+		if refreshErr != nil {
+			return 0, refreshErr
+		}
+		d = fresh
+		if err := c.acquire(ctx); err != nil {
+			return 0, err
+		}
+		seconds, probeErr = probeDuration(ctx, c.logger, d, c.fetchHeaders(d))
+		c.release()
+	}
 	if probeErr != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return 0, fmt.Errorf("剧集 %d 的时长探测超时: %w", ep.ID, httpx.ErrUnavailable)
@@ -157,9 +181,44 @@ func (c *Cutter) ensureDuration(ctx context.Context, ep store.Episode, d stream.
 	if _, err := c.st.BackfillEpisodeDuration(ctx, ep.ID, rounded); err != nil {
 		return 0, fmt.Errorf("回填剧集 %d 时长: %w", ep.ID, err)
 	}
+	c.touchStream(ctx, ep.ID)
 	c.logger.InfoContext(ctx, "episode duration probed",
 		"episode_id", ep.ID, "duration_sec", rounded, "channel", channelOf(d))
 	return float64(rounded), nil
+}
+
+// refreshRejected 在 CDN 明确拒绝后作废这一集的直链并重解析一次。
+//
+// 只动这一集（不因为一条失败清掉整部剧）；重解析失败按播放面错误矩阵上报，
+// 不静默重试到超时。重解析后通道若翻转就报错：本次缓存的键与出站身份是旧通道的，
+// 把新通道的字节写进去会串味，下一次播放列表请求会按新通道重建。
+func (c *Cutter) refreshRejected(ctx context.Context, ep store.Episode, channel string) (stream.Direct, error) {
+	if err := c.invalidate(ctx, ep.ID); err != nil {
+		// 作废失败不阻断重解析：重解析会覆盖同一行（也许这次就成功了）。
+		c.logger.WarnContext(ctx, "episode stream invalidate failed",
+			"episode_id", ep.ID, "channel", channel, "err", err)
+	}
+	fresh, err := c.resolve(ctx, ep)
+	if err != nil {
+		return stream.Direct{}, resolveFailure(ep.ID, err)
+	}
+	if got := channelOf(fresh); got != channel {
+		return stream.Direct{}, fmt.Errorf("剧集 %d 的通道由 %s 变为 %s: %w",
+			ep.ID, channel, got, httpx.ErrUpstream)
+	}
+	c.logger.InfoContext(ctx, "episode stream refreshed",
+		"episode_id", ep.ID, "channel", channel)
+	return fresh, nil
+}
+
+// touchStream 记下「这一集的直链刚被确认能用」。写失败只记 warn：它不影响本次播放，
+// 只是排障信息（ADR-0016 的 last_ok_at）。
+func (c *Cutter) touchStream(ctx context.Context, episodeID int64) {
+	at := time.Now().UTC().Format(time.RFC3339)
+	if err := c.st.TouchEpisodeStream(ctx, episodeID, at); err != nil {
+		c.logger.WarnContext(ctx, "episode stream touch failed",
+			"episode_id", episodeID, "err", err)
+	}
 }
 
 // ensureChannel 让 segment 行与本次解析出的通道一致：没行才插入，通道翻了才更新。
@@ -206,13 +265,32 @@ const (
 	classRejected      = "upstream rejected"
 )
 
-// failureClass 把子进程 stderr 折成稳定类别。上游拒绝（403 / Forbidden）单列一类：
-// 它与「源本身坏了」的处置不同（换直链/换身份 vs 换源），排障时要能分开。
+// failureClass 把子进程 stderr 折成稳定类别。上游拒绝（401 / 403 / 404 / Forbidden）
+// 单列一类：它与「源本身坏了」的处置不同（换直链/换身份 vs 换源），排障时要能分开，
+// 也是 ADR-0016「标记失效并重解析一次」的唯一触发条件。
 func failureClass(fallback string, stderr []byte) string {
-	if bytes.Contains(stderr, []byte("403")) || bytes.Contains(stderr, []byte("Forbidden")) {
+	rejected := bytes.Contains(stderr, []byte("401")) ||
+		bytes.Contains(stderr, []byte("403")) ||
+		bytes.Contains(stderr, []byte("404")) ||
+		bytes.Contains(stderr, []byte("Forbidden")) ||
+		bytes.Contains(stderr, []byte("Unauthorized")) ||
+		bytes.Contains(stderr, []byte("Not Found"))
+	if rejected {
 		return classRejected
 	}
 	return fallback
+}
+
+// errRejected 是「上游明确拒绝」的哨兵：类别文本仍是 classRejected，但调用方可以用
+// errors.Is 判定并触发一次「作废 + 重解析」（ADR-0016），不用比对错误字符串。
+var errRejected = errors.New(classRejected)
+
+// subprocessError 按稳定类别构造子进程失败错误：类别进文本，哨兵可判定。
+func subprocessError(class string) error {
+	if class == classRejected {
+		return fmt.Errorf("%w: %w", errRejected, httpx.ErrUpstream)
+	}
+	return fmt.Errorf("%s: %w", class, httpx.ErrUpstream)
 }
 
 // stderrTail 取子进程 stderr 的尾部（**只给日志用，绝不进错误文本**）。
@@ -324,13 +402,13 @@ func probeDuration(ctx context.Context, logger *slog.Logger, src stream.Direct, 
 		logger.WarnContext(ctx, "ffprobe failed",
 			"host", safeHost(src.URL), "class", class,
 			"stderr", loggableStderr(stderrTail(err, stderr.Bytes())))
-		return 0, fmt.Errorf("%s: %w", class, httpx.ErrUpstream)
+		return 0, subprocessError(class)
 	}
 	if len(src.Key) > 0 && stderr.Len() > 0 {
 		logger.WarnContext(ctx, "ffprobe decryption self-check failed",
 			"host", safeHost(src.URL),
 			"stderr", loggableStderr(stderrTail(nil, stderr.Bytes())))
-		return 0, fmt.Errorf("%s: %w", classDecryptFailed, httpx.ErrUpstream)
+		return 0, subprocessError(classDecryptFailed)
 	}
 	var decoded struct {
 		Format struct {
@@ -386,7 +464,7 @@ func remux(ctx context.Context, logger *slog.Logger, src stream.Direct, headers 
 		logger.WarnContext(ctx, "ffmpeg remux failed",
 			"host", safeHost(src.URL), "class", class,
 			"stderr", loggableStderr(tail))
-		return nil, fmt.Errorf("%s: %w", class, httpx.ErrUpstream)
+		return nil, subprocessError(class)
 	}
 	return out, nil
 }

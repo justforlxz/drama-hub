@@ -121,6 +121,8 @@ func seedTree(t *testing.T, strmPrefix string, withSecret bool) fixture {
 	aID, err := st.UpsertDrama(ctx, store.Drama{
 		Provider: "web", ProviderID: "a1", Title: titleA, Year: 2024,
 		Plot: "第一行 & <第二行>", EpisodeTotal: 2, Genre: genreA,
+		// tags 是上游原样 JSON：主类型在前，其余按原序（剧 NFO 的 genre/tag 用它）。
+		Tags: `["爱情","逆袭"]`,
 		// 剧 A 声明了封面地址：poster.jpg 的按需回源要用它（替身只看 url 是否为空）。
 		CoverURL: "https://cdn.example/a1.jpg",
 	})

@@ -644,8 +644,8 @@ App 通道退为兜底（MKACG-626/630）——同一集换通道就是另一条
 
 | 文件 | 根元素 | 字段 | 说明 |
 |---|---|---|---|
-| 集 `.nfo` | `episodedetails` | `title` / `season` / `episode` / `runtime` | 字段全部取自派生出的对外剧集：`episode` 是**对外集号**，`runtime` 单位是**分钟**（`runtime_sec / 60` 向下取整）；写秒会被 Emby 放大 60 倍 |
-| `tvshow.nfo` | `tvshow` | `title` / `year` / `plot` / `thumb` | `plot` 来自 `drama.plot`；`thumb` 见下「poster.jpg」 |
+| 集 `.nfo` | `episodedetails` | `title` / `season` / `episode` / `runtime` / `plot` | 字段全部取自派生出的对外剧集：`episode` 是**对外集号**，`runtime` 单位是**分钟**（`runtime_sec / 60` 向下取整）；写秒会被 Emby 放大 60 倍。`plot` 优先单集简介，上游没有单集简介字段，当前用 `drama.plot` 兜底；为空则不写元素（MKACG-679） |
+| `tvshow.nfo` | `tvshow` | `title` / `year` / `plot` / `genre` / `tag` / `thumb` | `plot` 来自 `drama.plot`（上游 `series_intro` 原文，不截断）；`genre` 多条，`drama.genre` 在前、`drama.tags` 其余项按原序去重追加；`tag` 多条，`drama.tags` 全量原文（保序，空串项丢弃）；`tags` 为空或非法 JSON 时 `genre`/`tag` 都不写；`thumb` 见下「poster.jpg」（MKACG-679） |
 
 `aired` 不写：库里的时间只有采集时间，没有播出日期。
 

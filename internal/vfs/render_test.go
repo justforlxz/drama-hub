@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/xml"
 	"errors"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -109,7 +110,20 @@ func TestRenderEpisodeNFO(t *testing.T) {
 		if got.Runtime != tt.wantRuntime {
 			t.Errorf("runtime = %d, 期望 %d（秒=%d）", got.Runtime, tt.wantRuntime, tt.ep.DurationSec)
 		}
+		// 集简介没有单集来源，用剧简介兜底；不能是空元素。
+		if got.Plot != "第一行 & <第二行>" {
+			t.Errorf("plot = %q, 期望剧简介", got.Plot)
+		}
 	}
+}
+
+// nfoShowView 只声明被测元素，不复用生产结构体：生产结构体若把 `xml:"genre"` 写成
+// `xml:"genres"`，用它反序列化依然是绿的；独立视图解析不到就是空切片。根元素名也由
+// XMLName 标签校验（encoding/xml 在不匹配时报错）。
+type nfoShowView struct {
+	XMLName xml.Name `xml:"tvshow"`
+	Genres  []string `xml:"genre"`
+	Tags    []string `xml:"tag"`
 }
 
 // AC5：剧 NFO 解析后 title/year/plot 正确（含 XML 转义的 & 与 <>）。
@@ -135,6 +149,76 @@ func TestRenderShowNFO(t *testing.T) {
 	}
 	if got.Plot != "第一行 & <第二行>" {
 		t.Errorf("plot = %q, 期望 %q", got.Plot, "第一行 & <第二行>")
+	}
+	// genre = 主类型在前 + tags 其余；tag = tags 全量。
+	// 用独立视图解析，元素名写错时这里会红。
+	var view nfoShowView
+	if err := xml.Unmarshal(body, &view); err != nil {
+		t.Fatalf("按独立视图解析剧 NFO 失败（根元素或元素名不符）: %v\n%s", err, body)
+	}
+	if want := []string{"爱情", "逆袭"}; !slices.Equal(view.Genres, want) {
+		t.Errorf("genre = %q, 期望 %q", view.Genres, want)
+	}
+	if want := []string{"爱情", "逆袭"}; !slices.Equal(view.Tags, want) {
+		t.Errorf("tag = %q, 期望 %q", view.Tags, want)
+	}
+}
+
+// AC5：genre/tag 的四种输入——tags 为空、单标签、多标签含重复、含 XML 特殊字符。
+func TestRenderShowNFOGenresAndTags(t *testing.T) {
+	tests := []struct {
+		name       string
+		genre      string
+		tags       string
+		wantGenres []string
+		wantTags   []string
+	}{
+		{name: "空 tags", genre: "", tags: "", wantGenres: nil, wantTags: nil},
+		{name: "空 JSON 数组", genre: "剧情", tags: "[]", wantGenres: []string{"剧情"}, wantTags: nil},
+		{name: "单标签", genre: "剧情", tags: `["剧情"]`, wantGenres: []string{"剧情"}, wantTags: []string{"剧情"}},
+		{
+			name:       "多标签含重复",
+			genre:      "都市",
+			tags:       `["都市","爱情","都市","逆袭"]`,
+			wantGenres: []string{"都市", "爱情", "逆袭"},
+			wantTags:   []string{"都市", "爱情", "都市", "逆袭"},
+		},
+		{
+			name:       "XML 特殊字符",
+			genre:      "剧情&悬疑",
+			tags:       `["A<B","C&D"]`,
+			wantGenres: []string{"剧情&悬疑", "A<B", "C&D"},
+			wantTags:   []string{"A<B", "C&D"},
+		},
+		{name: "非法 JSON", genre: "剧情", tags: `{"x":1}`, wantGenres: []string{"剧情"}, wantTags: nil},
+		{name: "空串标签", genre: "剧情", tags: `["","爱情",""]`, wantGenres: []string{"剧情", "爱情"}, wantTags: []string{"爱情"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := renderShowNFO(store.Drama{
+				Title: "剧", Year: 2026, Plot: "简介", Genre: tt.genre, Tags: tt.tags,
+			}, false)
+			if err != nil {
+				t.Fatalf("renderShowNFO: %v", err)
+			}
+			// 特殊字符必须被转义，不能产出非法 XML；独立视图保证元素名写错会红。
+			var got nfoShowView
+			if err := xml.Unmarshal(body, &got); err != nil {
+				t.Fatalf("解析剧 NFO 失败（不是合法 XML）: %v\n%s", err, body)
+			}
+			if !slices.Equal(got.Genres, tt.wantGenres) {
+				t.Errorf("genre = %q, 期望 %q\n%s", got.Genres, tt.wantGenres, body)
+			}
+			if !slices.Equal(got.Tags, tt.wantTags) {
+				t.Errorf("tag = %q, 期望 %q\n%s", got.Tags, tt.wantTags, body)
+			}
+			if len(tt.wantGenres) == 0 && bytes.Contains(body, []byte("<genre")) {
+				t.Errorf("空 tags 却写了 <genre>：%s", body)
+			}
+			if len(tt.wantTags) == 0 && bytes.Contains(body, []byte("<tag")) {
+				t.Errorf("空 tags 却写了 <tag>：%s", body)
+			}
+		})
 	}
 }
 

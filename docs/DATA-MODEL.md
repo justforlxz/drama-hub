@@ -253,6 +253,29 @@ CREATE INDEX IF NOT EXISTS idx_drama_genre_title ON drama (genre, title);
 - `episode.source` = 插件名（`"web"`）。
 - `drama.episode_total` = `episode_cnt`；`drama.sync_at` = 本次刷新时间（UTC RFC3339）。
 
+### NFO 未生成字段的上游依据（MKACG-679）
+
+NFO 是请求时现渲染的（硬约束 1），字段全部来自库里的原始列，没有第二份元数据。
+**元素、来源、空值语义的唯一口径在 `docs/DEV-STANDARDS.md`「NFO 形态」**；本节只记录
+上游缺少、因此不生成哪些元素及其实测依据。
+
+**不生成的三类元素**（上游没有可靠数据，编造比缺失更糟）：
+
+- **总集数 `<episode_total>`**：不是 Emby/Kodi 的 NFO 契约元素（客户端按 Season 目录里
+  的实际文件数得出集数），写了也被忽略。`drama.episode_total` 仍在库里，供管理面展示。
+- **连载状态 `<status>`**：上游 `seriesDetail.series_episode_info.series_status` 没有落库，
+  且语义未证实。2026-11-04 抽样 50 部播放页只观测到 `0` / `1` 两个取值，且两个取值下都有
+  `episode_cnt == episode_total_cnt`、`episode_right_text = "全N集"` 的剧
+  （`1`：绝大多数样本含本站剧；`0`：`烟火小馆：大厨的治愈日常第二季`、`雪夜重生`），
+  找不到「连载中」样本可对照。映射不成立就不写，也不为它加采集列。
+- **评分 `<rating>` 与首播 `<premiered>`**：播放页 `seriesDetail` 与详情页都没有
+  `score` / `rating` / 首播日期字段；App 通道只有「匿名设备注册」与
+  `multi_video_model`（取流）两个端点（`internal/plugin/hongguo/device.go` /
+  `app.go`），不提供剧目元数据接口。`first_visible_time` 是**上线时间**，目前只在采集时
+  派生 `year`（库里不存日期），也不是首播日期。因此本项目**不生成** `<rating>` 与
+  `<premiered>`。`series_favorite_count`（收藏数）/ `episode_like_count`（点赞数）不是
+  评分，禁止拿来填充。
+
 ### 合并数据（自动分块，ADR-0010 / ADR-0014）
 
 - 合并集**没有表，也没有派生表**：库里只存原始 `episode`，对外剧集在每次读取时由

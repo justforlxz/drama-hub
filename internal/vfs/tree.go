@@ -566,7 +566,8 @@ func (t *Tree) Render(ctx context.Context, p string) ([]byte, error) {
 		if req.ext == ".strm" {
 			return t.renderStrm(ctx, item)
 		}
-		return renderItemNFO(item)
+		// 集简介用剧简介兜底：上游没有单集简介字段，空着不如给一句可读的简介。
+		return renderItemNFO(item, d.Plot)
 	}
 	return nil, ErrNotFound
 }

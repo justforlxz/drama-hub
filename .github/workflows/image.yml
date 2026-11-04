@@ -6,9 +6,12 @@ name: image
 # lint / test 在这里重新定义，是因为跨 workflow 没有 `needs` 可用（ci.yml 的 job 无法被
 # 引用）。两处跑的是同一个入口 `scripts/ci.sh`，检查内容不会分叉。
 # 口径与 tag 矩阵见 docs/adr/0008-image-publish.md，tag 由 scripts/image-tags.sh 决定。
+#
+# 触发面只有 `main` push 与 `v*` tag push（MKACG-633）：功能分支 / PR 的 push 只跑
+# ci.yml，不构建、不推镜像。
 on:
   push:
-    branches: ['**']
+    branches: ['main']
     tags: ['v*']
 
 permissions:

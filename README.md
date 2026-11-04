@@ -200,8 +200,9 @@ Emby 能逐层往下扫，Jellyfin 不能：它只把**库根的直接子目录*
 
 ## 容器镜像
 
-`main` 与任意分支的每次 push 都会构建镜像，ci 全绿才推到
-`ghcr.io/justforlxz/drama-hub`（口径见 `docs/adr/0008-image-publish.md`）。
+`main` 的每次 push 与 `v*` tag 会构建镜像，ci 全绿才推到
+`ghcr.io/justforlxz/drama-hub`；功能分支 / PR 的 push 只跑 `ci.yml`，不构建镜像
+（口径见 `docs/adr/0008-image-publish.md`）。
 
 ```bash
 podman pull ghcr.io/justforlxz/drama-hub:latest
@@ -219,8 +220,8 @@ podman logs drama-hub | head -1                        # version / commit 与构
 
 | tag | 什么时候更新 |
 |---|---|
-| `sha-<7位>` | 每次 push（`main` 与任意分支）；不可变——同一个 commit 永远同一份字节 |
-| `latest` | **只在 `main`**；分支与 tag 构建不动它 |
+| `sha-<7位>` | `main` 每次 push；不可变——同一个 commit 永远同一份字节 |
+| `latest` | **只在 `main`**；`v*` tag 构建不动它 |
 | `vX.Y.Z` | 推 `v*` tag 时 |
 
 - 两个平台在同一个 manifest list 里：`linux/amd64`、`linux/arm64`（`docker manifest inspect` 除这两个平台外还有 buildx 的 provenance 清单，`unknown/unknown`，属正常）。

@@ -29,13 +29,17 @@ arm64 镜像（实测镜像内 `/usr/local/bin/drama-hub` 是 `ELF 64-bit LSB ex
    是同一个入口 `scripts/ci.sh`，检查内容不会分叉（代价见「后果」）。
 4. **tag 矩阵**（唯一真值 `scripts/image-tags.sh`，自带 `--self-test`，`ci.sh --lint` 会跑）：
 
-    | 事件 | 推的 tag | `VERSION` build-arg |
-    |---|---|---|
-    | 分支 push | `sha-<7位>`；`main` 上另加 `latest` | 7 位 sha |
-    | `v*` tag push | `vX.Y.Z` | tag 名 |
+   | 事件 | 推的 tag | `VERSION` build-arg |
+   |---|---|---|
+   | `main` push | `sha-<7位>` + `latest` | 7 位 sha |
+   | `v*` tag push | `vX.Y.Z` | tag 名 |
 
    `COMMIT` 一律是完整 sha。
-5. **`latest` 只跟 `main`**：分支与 tag 构建都不动它。
+
+   **触发面**（2026-11-04 口径变更，MKACG-633）：`image.yml` 的 `on.push` 只覆盖 `main`
+   与 `v*` tag。功能分支 / PR 的 push 只跑 `ci.yml`（lint + test），不构建、不推镜像。
+   `sha-<7位>` 的不可变承诺不变，变的是「哪些 ref 会产出它」。
+5. **`latest` 只跟 `main`**：只有 `main` 的 push 更新它，`v*` tag 构建不动它。
 6. **`sha-<7位>` 不可变，因此 tag push 不重出 sha tag**：tag 构建的 `VERSION` 是 tag 名，
    与分支构建的 `VERSION` 不同，重出会把同一个 sha tag 改写成另一份字节。
 7. **缓存** `cache-from/to=type=gha`（`Containerfile` 已按 `go.mod` 分层）；`concurrency`
@@ -64,8 +68,10 @@ arm64 镜像（实测镜像内 `/usr/local/bin/drama-hub` 是 `ELF 64-bit LSB ex
 
 ## 后果
 
-- **每个分支的每次 push 都跑 lint+test+image**（`sha-<7>` 要对任意分支出）。本机实测两平台
-  发布约 5–6 分钟（缓存命中），GH runner 上更慢；PR 事件不触发发布。
+- **`main` 的每次 push 都跑 lint+test+image**（`sha-<7>` 与 `latest` 只跟 `main`）；功能分支 /
+  PR 的 push 只跑 `ci.yml`，不构建镜像，因此镜像构建本身的问题（Dockerfile / Containerfile
+  改动）要合进 `main` 才暴露。本机实测两平台发布约 5–6 分钟（缓存命中），GH runner 上更慢；
+  PR 事件不触发发布。
 - **`main` push 时 lint/test 会跑两遍**（`ci.yml` 一遍、`image.yml` 的 `needs` 一遍）。这是
   「发布必须自带门禁、又不许跨 workflow 引用 job」的必然代价；两处跑的是同一个
   `scripts/ci.sh`，不会给出两个不同的结论，只是多花一次 runner 时间。
@@ -92,4 +98,4 @@ arm64 镜像（实测镜像内 `/usr/local/bin/drama-hub` 是 `ELF 64-bit LSB ex
 | `docs/adr/0008-image-publish.md` | 本文件 |
 | `Containerfile` / `env.lock` | `GOIMG`/`GO_IMAGE` 换成多架构 index digest；测试二进制拆到 `testbin` 段 |
 | `scripts/image-tags.sh` | tag 口径的唯一真值 + `--self-test`（`scripts/ci-lint.sh` 调用） |
-| `.github/workflows/image.yml` | 新增：`push`（任意分支 + `v*` tag）触发，lint/test 门禁 + 双架构发布 |
+| `.github/workflows/image.yml` | 新增：`push`（`main` + `v*` tag）触发，lint/test 门禁 + 双架构发布（触发面 2026-11-04 由任意分支收窄到 `main`，MKACG-633） |

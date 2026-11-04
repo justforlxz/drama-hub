@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/plugin"
+	"github.com/justforlxz/drama-hub/internal/plugin/hongguo/sign"
 )
 
 // Name 是插件在库里的稳定标识，直接进 drama.provider / episode.source。
@@ -101,7 +102,7 @@ const (
 // *slog.Logger），不保存游标、上次结果或缓存的直链。
 //
 // 唯一例外是匿名设备身份（MKACG-628）：它是 App 通道取址的前置，单条、失败也
-// 缓存、续期 ≤ 1 次/分钟，只活在进程内存里（MKACG-626 契约第 3 条，
+// 缓存（60 秒静默期），只活在进程内存里（MKACG-626 契约第 3 条，
 // MKACG-632 写进 docs/PLUGIN-CONTRACT.md）。
 type Config struct {
 	BaseURL           string       // 空 → DefaultBaseURL
@@ -112,6 +113,14 @@ type Config struct {
 	// （DeviceRegisterURL）与取流（本字段），两者都是构造期配置、默认值内置、
 	// 测试可注入；settings 不新增键（MKACG-626 D2：上游换域名就发版）。
 	AppVideoURL string // 空 → defaultAppVideoURL
+	// AppVideoAltURL 是主域名被拒后的备用取流端点（参考实现同款备用域名）。
+	// 空 → 生产用 defaultAppVideoAltURL；注入了 AppVideoURL 的测试沿用同一个假上游，
+	// 这样「换域名重试」也能被断言到。
+	AppVideoAltURL string
+	// Cookie 返回站点登录 Cookie 串（空 = 匿名）。它不缓存、不落盘、不进日志：
+	// 每次取流现读一次，settings 改完下一次取流就是新凭据（MKACG-676）。
+	// nil → 恒为匿名（未装配 / 单测）。
+	Cookie func(ctx context.Context) string
 }
 
 // 编译期断言：红果插件实现契约的全部方法（少一个就是构建失败，不是运行时才发现）。
@@ -119,24 +128,40 @@ var _ plugin.Plugin = (*Plugin)(nil)
 
 // Plugin 是红果插件。零值不可用，用 New 构造。
 type Plugin struct {
-	baseURL     string
-	appVideoURL string
-	client      *http.Client
-	logger      *slog.Logger
+	baseURL        string
+	appVideoURL    string
+	appVideoAltURL string
+	client         *http.Client
+	logger         *slog.Logger
+	// cookie 取站点登录态（每次调用现读）。它只被站点播放接口使用；日志只记
+	// 「带没带」，不记内容（MKACG-676）。
+	cookie func(ctx context.Context) string
 	// device 是本插件唯一的进程内可变状态（匿名设备身份），规则见 device.go。
 	device *deviceCache
+	sign   *sign.Signer
 }
 
 // New 构造插件：空 BaseURL 用 DefaultBaseURL，空 client 用 30s 超时客户端，
-// 空 logger 用默认 logger。
+// 空 logger 用默认 logger，空 Cookie 源按恒匿名处理。
 func New(cfg Config) *Plugin {
 	p := &Plugin{baseURL: cfg.BaseURL, appVideoURL: cfg.AppVideoURL,
-		client: cfg.HTTPClient, logger: cfg.Logger}
+		client: cfg.HTTPClient, logger: cfg.Logger, cookie: cfg.Cookie}
+	if p.cookie == nil {
+		p.cookie = func(context.Context) string { return "" }
+	}
 	if p.baseURL == "" {
 		p.baseURL = DefaultBaseURL
 	}
 	if p.appVideoURL == "" {
 		p.appVideoURL = defaultAppVideoURL
+	}
+	p.appVideoAltURL = cfg.AppVideoAltURL
+	if p.appVideoAltURL == "" {
+		if cfg.AppVideoURL != "" {
+			p.appVideoAltURL = cfg.AppVideoURL
+		} else {
+			p.appVideoAltURL = defaultAppVideoAltURL
+		}
 	}
 	if p.client == nil {
 		p.client = &http.Client{Timeout: defaultTimeout}
@@ -145,22 +170,20 @@ func New(cfg Config) *Plugin {
 		p.logger = slog.Default()
 	}
 	// 设备身份的注册点：构造期只装缓存，首次取用才发注册请求。
+	p.sign = sign.NewSigner()
 	p.device = newDeviceCache(cfg.DeviceRegisterURL, p.client, p.logger)
 	return p
 }
 
-// deviceIdentity 取本进程的匿名设备身份（注册一次、失败也缓存、续期 ≤ 1 次/分钟）。
+// deviceIdentity 取进程内的匿名设备身份（注册一次、失败也缓存、静默期内不重试）。
+//
+// 注意：App 取流走的是 device.fresh（每次新注册一条，MKACG-676），本入口只在
+// 注册失败时作为兜底身份返回。
 //
 // 这是 App 通道取址（MKACG-630）的唯一入口；本包之外拿不到它，它也不落库、
 // 不落盘、不进 settings、不进日志。
 func (p *Plugin) deviceIdentity(ctx context.Context) (deviceIdentity, error) {
 	return p.device.get(ctx)
-}
-
-// renewDeviceIdentity 在 App 接口拒了 rejected 这条身份后换一条新的，重试一次
-// （626 契约）。续期 ≤ 1 次/分钟；静默期内再被拒就回 plugin.ErrRejected。
-func (p *Plugin) renewDeviceIdentity(ctx context.Context, rejected deviceIdentity) (deviceIdentity, error) {
-	return p.device.renew(ctx, rejected)
 }
 
 // Name 实现 plugin.Plugin。
@@ -226,12 +249,18 @@ func (p *Plugin) workPage(ctx context.Context, ref plugin.WorkRef) (plugin.WorkD
 
 // Resolve 实现 plugin.Plugin：解析某一集的可播放直链。
 //
-// 取址顺序（MKACG-626 契约）：web(非预览) → app。
-//   - 网页通道能给出真直链就用它（2 个请求：详情页取集表 + 集页取直链）；
-//   - 页面声明 protectedPlayback==true 时，网页只有 10 秒 SEO 预览，一律不请求
-//     集页、不把那个 URL 当片源（626 D1：不回落预览），直接走 App 通道；
-//   - 网页通道回 ErrNoStream（集页 404 / VideoObject 无 contentUrl）同样落到 App；
-//     其余错误照原样上抛——上游故障不该被 App 通道掩盖。
+// 取址顺序（MKACG-676）：web(非预览) → App(带签名) → site(站点播放接口) →
+// site 带登录态。
+//   - 未受保护的剧，网页通道能给出真直链就用它（2 个请求：详情页取集表 +
+//     集页取直链），这是最省的一次取址；
+//   - 网页通道回 ErrNoStream（集页 404 / VideoObject 无 contentUrl）时落到
+//     App 通道，其余错误照原样上抛——上游故障不该被别的通道掩盖；
+//   - 受保护的剧网页只有 10 秒 SEO 预览，一律不请求集页、不把那个 URL 当片源
+//     （626 D1），直接走 App 通道：该接口按请求签名（x-gorgon/x-argus/x-ladon/
+//     x-helios/x-medusa）放行，签名由 internal/plugin/hongguo/sign 生成；
+//   - App 通道不可用时回落站点播放接口（免费集可用）；站点回「需登录」且配了
+//     hongguo_cookie 时再试一次带登录态的请求，这是最后兜底；
+//   - 「需登录」与「仅加密流」是这一集的确定答复，不再往别的通道上掩盖。
 //
 // epNo 超出集数 → ErrNotFound（这一集不存在，与通道无关）。
 func (p *Plugin) Resolve(ctx context.Context, ref plugin.WorkRef, epNo int) (plugin.Stream, error) {
@@ -253,13 +282,36 @@ func (p *Plugin) Resolve(ctx context.Context, ref plugin.WorkRef, epNo int) (plu
 			return plugin.Stream{}, err
 		}
 	}
-	return p.resolveApp(ctx, vid)
+
+	st, appErr := p.resolveApp(ctx, vid)
+	if appErr == nil {
+		return st, nil
+	}
+	p.logger.WarnContext(ctx, "App 通道不可用，回落站点播放通道",
+		"plugin", Name, "vid", vid, "reason", errorClass(appErr))
+
+	st, siteErr := p.resolveSite(ctx, ref.ID, vid, false)
+	if siteErr == nil {
+		return st, nil
+	}
+	if errors.Is(siteErr, plugin.ErrLoginRequired) && p.cookie(ctx) != "" {
+		// 最后兜底：配了登录态就带 Cookie 再要一次（站点对锁定集只认登录态）。
+		st, retryErr := p.resolveSite(ctx, ref.ID, vid, true)
+		if retryErr == nil {
+			return st, nil
+		}
+		siteErr = retryErr
+	}
+	// 站点给出的确定答复优先：这一集就是要登录，或只有加密流，换通道没意义。
+	if errors.Is(siteErr, plugin.ErrLoginRequired) || errors.Is(siteErr, plugin.ErrUnsupported) {
+		return plugin.Stream{}, siteErr
+	}
+	p.logger.WarnContext(ctx, "站点播放通道也不可用",
+		"plugin", Name, "vid", vid, "reason", errorClass(siteErr))
+	// 两条通道都失败且站点没给确定答复：报主路径（App）的原因，它才是「为什么播不了」。
+	return plugin.Stream{}, appErr
 }
 
-// resolveWeb 是网页通道取址：集页 JSON-LD 的明文 MP4 直链。
-//
-// 集页 404 或 VideoObject 无 contentUrl → ErrNoStream（契约错误语义表的两行：
-// 这一集不可播不是作品不存在）。Key 显式留 nil：网页通道给的是明文。
 func (p *Plugin) resolveWeb(ctx context.Context, sid, vid string) (plugin.Stream, error) {
 	body, err := p.get(ctx, "/player/"+sid+"/"+vid)
 	if err != nil {

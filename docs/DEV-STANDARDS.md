@@ -164,6 +164,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 | `jellyfin_library_root` | `""` | 容器内绝对路径（非 `/`） | 即时 | **Jellyfin 容器内**看到的挂载根（本部署 `/data/video/dramahub`）；空 = 关闭。填成宿主路径或本服务的挂载点会建出空库 |
 | `jellyfin_library_prefix` | `短剧 - ` | 非空字符串 | 即时 | 库名前缀：`name = <前缀><分类目录名>`，同时是「哪些库归本服务管」的第一条判据。不接受空串（空前缀会让所有库都算自管） |
 | `jellyfin_timeout_sec` | `10` | 1–60 | 即时 | Jellyfin 单次出站超时；`http.Client` 不设全局 Timeout，超时靠每次请求的 ctx |
+| `hongguo_cookie` | 无行（= 空） | 空或任意非空字符串 | 即时（每次取流现读） | 红果站点登录态 Cookie（**只写不读**：PATCH 回 `null`，状态页不给值；不进日志与错误文本）。**只作最后兜底**：App 通道与匿名站点通道都不通时才带它再要一次，播放不依赖它。空 = 匿名；配了会解锁该账号有权限的集。凭据失效时锁定集回 403 `protected_playback_unavailable`，出流面据此报「需要登录态」而不是 502（MKACG-676） |
 
 `<源>` 是 `Plugin.Name()`（红果是 `web`），键的格式与校验在 `internal/store`
 （`PluginSettingKey` + `specFor` 的前缀模式），调用方不自己拼字符串。
@@ -390,13 +391,18 @@ DISCONTINUITY 表达，不再需要 `-output_ts_offset` 平移 PTS。分片端�
 | 方法 | 上游 | 请求数 |
 |---|---|---|
 | `Work(ctx, ref)` | `GET {BaseURL}/player/{id}` | 1（剧目元数据 + 全部集） |
-| `Resolve(ctx, ref, epNo)` | 网页通道：`GET /player/{id}` → `GET /player/{id}/{vid}`；App 通道：设备注册（进程内一次）→ `POST` 取流 | 2（网页通道）；App 通道 1 次注册 + 1 次取流 |
+| `Resolve(ctx, ref, epNo)` | 详情页 `GET /player/{id}` 必发（集号 → `vid`）→ 网页通道 `GET /player/{id}/{vid}`；没拿到直链就走 App 通道（注册一次性身份 → 签名 → `POST` 取流）；再不行才 `POST /api/video/protected/play-info` 兜底 | 受保护剧 3（详情页 + **每次取流一次设备注册** + 取流；被拒重试时 4–5）；非受保护剧拿到明文直链 2、落到 App 3 |
 | `Enumerate(ctx, cur)` | 目录索引：`index.xml` + 29 份子 sitemap + `seo-important.xml` + `/category` 34 页 | 64（每份子 sitemap 前重取一次 4 KB 索引）= 30s 级 |
 
 `Resolve` 在网页通道是 2 个请求：契约入参只有集号，集号 → 源侧集标识（`vid`）只能从详情页取，
 而插件不许保存状态；要压到 1 个必须改接口（把源侧集标识传进来）。
-受保护剧（`protectedPlayback == true`）不发集页请求，直接走 App 通道：设备注册 1 次
-（进程内缓存，不是每集都注册）+ 每次取流 1 个 `POST`。
+受保护剧（`protectedPlayback == true`）不发集页请求，直接走 App 通道（MKACG-676 路线调整）：
+详情页 1 个 + 每次取流 1 次设备注册 + 1 个 `POST`（带请求签名）。**取流身份是一次性的**——
+上游对同一条身份的第二次取流回 `200` + 空体，所以每集都新注册一条；被拒时再换一条身份 +
+备用域名（`Config.AppVideoAltURL`）+ `Connection: close` 重试一次。App 通道不可用时才落到
+站点播放通道（`POST /api/video/protected/play-info`，匿名只覆盖免费集）；站点回
+`protected_playback_unavailable` 且配了 `hongguo_cookie` 时才带登录态要最后一次。站点只回
+DASH-CENC（`play_info`）时按 `ErrUnsupported` 上报，不回落。
 `Enumerate` 一页 = 一份上游文档（子 sitemap 整份返回，43,556 个 loc 一次读完），
 三段串行：子 sitemap（29）→ `seo-important.xml` → `/category` 第 1..34 页。并集才是全集：
 只用 sitemap 漏最新 53 部，只用 `/category` 只剩 800 部（`docs/L1-CORPUS-SCOPE.md`）。
@@ -404,12 +410,16 @@ DISCONTINUITY 表达，不再需要 `-output_ts_offset` 平移 PTS。分片端�
 `ErrSchema` 打回（静默从头开始会把「游标坏了」伪装成「枚举走完了」）。
 
 - `BaseURL` 默认 `https://hongguoduanju.com`，配置键 `plugin.web.base_url`（空 = 用它）。
-  它与 App 通道的两个 host 是**三个构造期缝**（`--network=none` 下都指向
+  它与 App 通道的三个 host 是**四个构造期缝**（`--network=none` 下都指向
   `httptest.Server`）：`Config.BaseURL`（官网页）、`Config.DeviceRegisterURL`（匿名设备注册，
-  默认 `log5-applog-lf.fqnovel.com`）、`Config.AppVideoURL`（App 取流，默认
-  `api5-normal-sinfonlineb.fqnovel.com`）。三者都是构造期注入、默认值内置、**不进 settings**
-  （MKACG-626 D2：上游换域名就发版）。`*http.Client`
+  默认 `log5-applog-lf.fqnovel.com`）、`Config.AppVideoURL`（App 取流主域名，默认
+  `api5-normal-sinfonlineb.fqnovel.com`）、`Config.AppVideoAltURL`（被拒后的备用域名，默认
+  `api5-normal-hl.fqnovel.com`；注入了 `AppVideoURL` 的测试沿用同一个假上游）。四者都是
+  构造期注入、默认值内置、**不进 settings**（MKACG-626 D2：上游换域名就发版）。`*http.Client`
   由装配根按 `plugin.web.request_timeout_sec` 构造（默认 30s）。
+- 第四个注入缝是 `Config.Cookie func(ctx) string`（MKACG-676）：装配根把「现读
+  `hongguo_cookie`」的闭包传进来，插件不 import `internal/store`；测试注入固定串或 `nil`
+  （= 匿名）。它没有默认地址，所以除 `hongguo_cookie` 这一项外没有别的配置面。
 - 响应体经 `io.LimitReader` 读，两档上限：页面（列表页 / 集页 / `/category`）4 MiB，sitemap 8 MiB
   （实测子 sitemap 每份 5,242,7xx 字节）；超限按 `ErrSchema`（页面异常放大，不是可重试的传输错误）。
 - 解析：`_ROUTER_DATA` 后的 JSON 用标准库 `json.Decoder` 从 `{` 起解（不手写括号扫描）；JSON-LD 用 `regexp` 取出 `<script type="application/ld+json">` 块后按 `@type` 过滤。
@@ -427,7 +437,10 @@ DISCONTINUITY 表达，不再需要 `-output_ts_offset` 平移 PTS。分片端�
   `ErrRejected`（换一次身份，仍失败即 502）、404（带体或不带体）→ `ErrNoStream`、其余非
   200 → `ErrUpstream`、200 + 空体 → `ErrRejected`（换身份可自愈，MKACG-673）、
   200 + 非空但不是 JSON → `ErrSchema`、200 + `code != 0` → `ErrRejected`。
-  网页通道同一顺序，200 + 空体按 `ErrUpstream`。
+  网页通道同一顺序，200 + 空体按 `ErrUpstream`。站点播放通道也同一顺序：403 **先读体**，
+  `{"error":"protected_playback_unavailable"}` → `ErrLoginRequired`，其余 403 → `ErrRejected`；
+  404 → `ErrNotFound`、其余非 200 → `ErrUpstream`、200 + 空体 → `ErrSchema`（这个接口的
+  被拒形态是 403，空体只可能是结构变了，MKACG-676）。
 - 框架校验（`internal/sync`）：集表非空、`Episodes[i].No == i+1`、源侧集标识数量与集数一致，
   违反即 `ErrSchema` 且**不写库**（这是插件实现 bug，不是上游问题）。
 - `episode.vid` 的来源不在契约的 `Episode` 里（只有集号 / 标题 / 时长）：框架用消费方定义的
@@ -441,8 +454,10 @@ DISCONTINUITY 表达，不再需要 `-output_ts_offset` 平移 PTS。分片端�
 
 实测（2026-10-29，9 部剧逐一 ffprobe，**网页通道**）：列表页 `vid_list` 给全全部集，但单集页
 SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **实际时长恒为 10.08 秒**
-（JSON-LD 却声明整集时长）。受保护剧的完整片源只在 App 通道（MKACG-626/630）——同一集
-换通道就是另一条字节流，所以分片身份带通道段（见「分片缓存」）。两条通道都不落库：
+（JSON-LD 却声明整集时长）。受保护剧的完整片源走站点播放通道（MKACG-676，站点登录态），
+App 通道退为兜底（MKACG-626/630）——同一集换通道就是另一条字节流，所以分片身份带通道段
+（见「分片缓存」）。出流面把 `ErrLoginRequired` 映射为 403、`ErrUnsupported` 映射为 501，
+其余解析失败仍是 502（`internal/segment` 的 `resolveFailure`）。三条通道都不落库：
 1.0 从不写这两列，读它们的出流端点（`/s/{token}/e/{uid}`）在真实
 库上恒 502 —— 那条断链在 S8 直接接在 `/video` 上：**每次播放请求现调
 `plugin.Resolve`**（`internal/stream` 的 `Resolver`），失败一律 502、不写库不缓存。

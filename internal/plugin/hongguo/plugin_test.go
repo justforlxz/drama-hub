@@ -19,6 +19,7 @@ type fakeSite struct {
 	mu      sync.Mutex
 	paths   []string
 	headers []http.Header
+	bodies  []string
 	respond func(path string) (int, string)
 }
 
@@ -61,6 +62,14 @@ func (f *fakeSite) headerList() []http.Header {
 	return out
 }
 
+// bodyList 返回收到的全部请求体（按到达顺序）。站点播放接口是 POST，只有请求体
+// 能证明 series_id / item_id 发对了。
+func (f *fakeSite) bodyList() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.bodies...)
+}
+
 // newFakeSite 起一个 httptest 假官网，初始响应固定为 status + body。
 func newFakeSite(t *testing.T, status int, body string) (*fakeSite, *httptest.Server) {
 	t.Helper()
@@ -70,9 +79,11 @@ func newFakeSite(t *testing.T, status int, body string) (*fakeSite, *httptest.Se
 		// 记录 RequestURI 而不是 Path：目录发现要按 ?page=N 区分 /category 的每一页，
 		// 路径相同而页码不同，只记 Path 就断言不出「按页推进」。
 		uri := r.URL.RequestURI()
+		raw, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
 		f.paths = append(f.paths, uri)
 		f.headers = append(f.headers, r.Header.Clone())
+		f.bodies = append(f.bodies, string(raw))
 		respond := f.respond
 		f.mu.Unlock()
 		st, b := respond(uri)

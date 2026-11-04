@@ -12,8 +12,9 @@
 
 - `podman`（或 `docker`）可用的 Linux 主机。
 - PostgreSQL 16（容器即可；本服务**不建库**，只连库并自动迁移）。
-- 出站能到 `hongguoduanju.com`（元数据）与 `*.fqnovel.com` / `*.qznovelvod.com`
-  （App 通道取完整片源）。
+- 出站能到 `hongguoduanju.com`（元数据 + 站点播放接口，MKACG-676）与
+  `*.qznovelvod.com` / `*.fqnovel.com`（明文 CDN 直链；App 兜底通道另有
+  `*.douyinvod.com`）。
 - 宿主机上用于验收的工具：`curl`、`ffmpeg`、`ffprobe`、`python3`。
   服务自己的 `ffmpeg` 在镜像里，不需要宿主机装。
 - 可选：任意 WebDAV 客户端（浏览器即可列目录）。第 5a 节的 rclone 只是示例，
@@ -243,6 +244,28 @@ curl -sS -H "Authorization: MediaBrowser Token=\"<Jellyfin API key>\"" \
   库根的直接子目录是 `00`–`7f`，Jellyfin 会把分片目录认成 Series、真剧目录退化成普通
   目录 —— 本服务建库正确也照样如此（12.1 实测复现）。所以 651 必须先合并。
 
+## 5c. 站点登录态（可选，最后兜底）
+
+锁定集的主路径是带请求签名的 App 通道（内置，不需要配置）。这一节是**最后兜底**：
+App 通道与匿名站点通道都不通时，站点才会回 **403**
+（`code=forbidden`，文案「该集需要登录态或无权限」）；把浏览器登录后的 Cookie 串写进
+settings，能让兜底路径用上该账号的权限：
+
+```bash
+curl -sS -X PATCH -H "X-Admin-Token: $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"settings":{"hongguo_cookie":"<浏览器里 hongguoduanju.com 的 Cookie 串>"}}' \
+  http://127.0.0.1:8080/api/settings
+```
+
+- **热改即生效**：下一次取流就带新 Cookie，不用重启。
+- **只写不读**：PATCH 回 `null`，状态页不给值，日志只记 `login=true/false`；错误文本里也
+  不会出现 Cookie 内容。
+- **不是播放的前置条件**：没配也能播。配了只在兜底路径上多一次带登录态的尝试。
+- 过期或抓错时现象与未配置一样：兜底路径仍 403（上游 `protected_playback_unavailable`），
+  免费集照常可播 —— 重新抓一条即可。
+- 若某集只回 DASH-CENC（`play_info`）则是 **501**（`code=unsupported`）：本服务不实现
+  CENC 解密（拿不到 16 字节 key），配 Cookie 也解决不了。
+
 ## 6. 播放面自检
 
 ```bash
@@ -259,7 +282,8 @@ ffmpeg -v error -i "$STRM" -t 60 -f null - && echo "播了 60 秒"
 ```
 
 **判「完整片源 vs 10 秒预览」看时长，不看状态码**：官网 SSR 对受保护剧只给
-`10.07 秒 / 360p` 的 SEO 预览，完整片源只能从 App 通道来。playlist 里
+`10.07 秒 / 360p` 的 SEO 预览，完整片源走站点播放通道（MKACG-676：需要登录态才解锁锁定集，
+见 5c；App 通道退为兜底）。playlist 里
 `#EXTINF` 加起来 ≈10 秒就是拿到了预览（不应发生）；正常单集是几十秒到几分钟。
 
 ## 7. 跑验收脚本
@@ -315,7 +339,9 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 | `PROPFIND` 401 | `webdav_user/webdav_pass` 还没写（第 3.2 步），或凭据错 |
 | 缓存目录 `permission denied` | 忘了 `--userns=keep-id` |
 | 同步/播放日志里大量 `upstream_status:444` | 上游限流（累计约 1 万次 `/player` 后触发），等十几分钟；不要写重试循环 |
-| `/video/{id}.m3u8` 502 | 该集解析不到片源：受保护剧的网页只有预览，完整片源走 App 通道；App 被拒/不可用时按契约回 502（日志一条 `WarnContext` 说明 `uid`/`ep_no`/`channel`/`reason`） |
+| `/video/{id}.m3u8` 502 | 该集解析不到片源：网页只有预览，站点通道（5c）与 App 通道都不可用；日志一条 `WarnContext` 说明 `uid`/`ep_no`/`channel`/`reason` |
+| `/video/{id}.m3u8` 403 | 该集只在兜底路径上被判「需要登录态」：`hongguo_cookie` 没配或已失效（5c）。先看日志里是不是 `channel=app` 的失败（签名被拒/上游故障），再看 5c |
+| `/video/{id}.m3u8` 501 | 该集只提供 DASH-CENC 加密流（`play_info`），拿不到 ffmpeg 可用的 16 字节 key；本服务不实现 CENC 解密 |
 | `/video/{id}.m3u8` 503 + `Retry-After` | 首次播放要探测时长，30 秒硬上限；稍后重试 |
 | URL 变了 / 换了 `stream_secret` 后全部 401 | 出流 id 是 HMAC 签名（ADR-0003）：换密钥等于所有旧 URL 失效 |
 | 日志出现 `package_manager` 之外的「未知的 DRAMA_HUB_* 环境变量」 | 变量名拼错，值被忽略 |
@@ -332,7 +358,7 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 |---|---|
 | 首启后 PATCH 关调度，库还在涨 | 第一轮在启动后约 0.15 秒已派出，PATCH 只拦下一轮；本轮会跑到 `refresh_timeout_sec`（默认 900 秒）。见 3.1 |
 | 客户端列出的文件数 ≠ `对外集数×2 + 剧数` | 若首轮仍在灌库，清单与库是两个时刻的快照。等 `/api/status` 的 `running=false` 再比 |
-| App 通道连续几分钟全是 `/video` 502，日志 `App 取流 … "bytes":0` + `reason:"ErrRejected"`（可能还有 `renew_reason:"ErrRejected"`） | 上游端点 `200 + 空响应体`，是它拒绝请求的形态，不是契约结构变了（MKACG-673）。插件会换一次身份自愈；换身份有 ≤1 次/分钟闸，连续空体时本分钟内的重试直接失败，等到下一分钟再试。实测曾连续 25 分钟后自行恢复（同期同一 vid 之前是 18 KB 正常体） |
+| App 通道连续几分钟全是 `/video` 502，日志 `App 取流 … "upstream_status":200, "bytes":0` + `reason:"ErrRejected"` | 上游端点 `200 + 空响应体`，是它拒绝请求的形态，不是契约结构变了（MKACG-673）。插件会**新注册一条身份** + 备用域名 + `Connection: close` 再取一次；两次都空体就报 502。取流身份是一次性的，换身份不是限流闸、每次播放都新注册一条。实测曾连续 25 分钟后自行恢复（同期同一 vid 之前是 18 KB 正常体） |
 
 `docs/SCHEDULER-MODEL.md` 把「首启立刻跑一轮」写成既定行为；本文件的 3.1 只讲怎么在验收时
 绕开它，不改调度语义。

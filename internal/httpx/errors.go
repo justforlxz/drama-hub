@@ -21,13 +21,20 @@ var (
 	// WebDAV Basic 认证共用；本 token 不是 HTTP 认证方案，因此不写
 	// WWW-Authenticate。
 	ErrUnauthorized = errors.New("未授权")
+	// ErrForbidden 表示已识别出请求方但该内容无权访问（需要登录态 / 该集无权限），
+	// 映射 403。与 401 的差别：不是「你没带凭据」，而是「凭据不够看这一集」
+	// （MKACG-676：站点对锁定集回 403 protected_playback_unavailable）。
+	ErrForbidden = errors.New("无权访问该内容")
 	// ErrUpstream 表示上游（数据源 / CDN）失败，映射 502。
 	ErrUpstream = errors.New("上游失败")
+	// ErrUnsupported 表示该内容只提供本服务不支持的形态（拿不到 key 的加密流），
+	// 映射 501。上游没坏、重试无用，但要明确报出而不是静默 502（MKACG-676）。
+	ErrUnsupported = errors.New("该内容仅提供不支持的形态")
 	// ErrUnavailable 表示依赖暂不可用（索引未完成等），映射 503。
 	ErrUnavailable = errors.New("暂不可用")
 )
 
-// StatusCode 把错误映射为 HTTP 状态码：六个哨兵分别 404 / 400 / 401 / 409 / 502 / 503，
+// StatusCode 把错误映射为 HTTP 状态码：八个哨兵分别 404 / 400 / 401 / 409 / 403 / 502 / 501 / 503，
 // 未命中任何哨兵返回 500。用 errors.Is 判定，因此支持 %w 包装；各哨兵互不
 // 包含，判定顺序不影响结果。
 func StatusCode(err error) int {
@@ -40,8 +47,12 @@ func StatusCode(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, ErrUnauthorized):
 		return http.StatusUnauthorized
+	case errors.Is(err, ErrForbidden):
+		return http.StatusForbidden
 	case errors.Is(err, ErrUpstream):
 		return http.StatusBadGateway
+	case errors.Is(err, ErrUnsupported):
+		return http.StatusNotImplemented
 	case errors.Is(err, ErrUnavailable):
 		return http.StatusServiceUnavailable
 	default:
@@ -64,10 +75,14 @@ func errorCode(status int) string {
 		return "invalid"
 	case http.StatusUnauthorized:
 		return "unauthorized"
+	case http.StatusForbidden:
+		return "forbidden"
 	case http.StatusConflict:
 		return "conflict"
 	case http.StatusBadGateway:
 		return "upstream"
+	case http.StatusNotImplemented:
+		return "unsupported"
 	case http.StatusServiceUnavailable:
 		return "unavailable"
 	default:

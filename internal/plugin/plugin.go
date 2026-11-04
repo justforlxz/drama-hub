@@ -21,6 +21,13 @@ var (
 	ErrNotFound = errors.New("上游不存在该对象")
 	// ErrNoStream：作品/集存在，但没有可播放直链。这是正常状态，不是故障。
 	ErrNoStream = errors.New("该集没有可播放直链")
+	// ErrLoginRequired：该集需要登录态（未配置或已失效）或当前身份没有该集权限。
+	// 这是上游给出的确定答复，不是上游故障：出流面 MUST 明确报出，不得折成
+	// ErrUpstream 的 502（否则「配个 Cookie 就好」会被显示成「源坏了」）。
+	ErrLoginRequired = errors.New("该集需要登录态或无权限")
+	// ErrUnsupported：该集只提供本实现不支持的流形态（如拿不到 key 的加密流）。
+	// 上游没坏、重试无用；出流面同样 MUST 明确报出，不得静默成 502。
+	ErrUnsupported = errors.New("该集仅提供不支持的流形态")
 )
 
 // WorkRef 是插件作用域内的作品标识。

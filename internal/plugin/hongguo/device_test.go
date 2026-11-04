@@ -214,64 +214,6 @@ func TestDeviceIdentityFailureCached(t *testing.T) {
 	assertIdentityNotLogged(t, logs.text(), id)
 }
 
-// TestDeviceIdentityRenewalBounded：身份被上游拒后可以换一条，但续期 ≤ 1 次/分钟；
-// 已被换掉的旧身份再报拒，直接回当前身份，不重复注册。
-func TestDeviceIdentityRenewalBounded(t *testing.T) {
-	fake, srv := newFakeSite(t, http.StatusOK, `{"code":0,"device_id":1001,"install_id":2002}`)
-	clock := newFakeClock()
-	p, _ := newDevicePlugin(t, srv.URL, clock)
-	ctx := context.Background()
-
-	first, err := p.deviceIdentity(ctx)
-	if err != nil {
-		t.Fatalf("首次取身份: %v", err)
-	}
-
-	// 上游拒了 first：换一条新的（一次续期 = 一次注册）。
-	fake.setReply(http.StatusOK, `{"code":0,"device_id":3003,"install_id":2002}`)
-	second, err := p.renewDeviceIdentity(ctx, first)
-	if err != nil {
-		t.Fatalf("续期: %v", err)
-	}
-	if second.DeviceID != "3003" || second == first {
-		t.Fatalf("续期后的身份 = %+v, 期望新的一条（不是 %+v）", second, first)
-	}
-	if reqs := fake.requests(); len(reqs) != 2 {
-		t.Fatalf("注册请求 = %d 次, 期望 2 次（首次 + 一次续期）", len(reqs))
-	}
-
-	// 同一分钟内又被拒：不注册，回可判定的错误。
-	if _, err := p.renewDeviceIdentity(ctx, second); !errors.Is(err, plugin.ErrRejected) {
-		t.Fatalf("静默期内续期的 err = %v, 期望 plugin.ErrRejected", err)
-	}
-	if reqs := fake.requests(); len(reqs) != 2 {
-		t.Fatalf("静默期内又发了注册请求（共 %d 次），期望仍是 2 次", len(reqs))
-	}
-
-	// 过了静默期才允许再换一条。
-	fake.setReply(http.StatusOK, `{"code":0,"device_id":4004,"install_id":2002}`)
-	clock.Advance(61 * time.Second)
-	third, err := p.renewDeviceIdentity(ctx, second)
-	if err != nil {
-		t.Fatalf("静默期后续期: %v", err)
-	}
-	if third.DeviceID != "4004" {
-		t.Fatalf("静默期后续期的身份 = %+v, 期望 4004", third)
-	}
-
-	// 被拒的是已经换掉的旧身份：直接回当前身份，不注册。
-	stale, err := p.renewDeviceIdentity(ctx, first)
-	if err != nil {
-		t.Fatalf("旧身份续期: %v", err)
-	}
-	if stale != third {
-		t.Fatalf("旧身份续期拿到 %+v, 期望当前身份 %+v", stale, third)
-	}
-	if reqs := fake.requests(); len(reqs) != 3 {
-		t.Fatalf("注册请求 = %d 次, 期望 3 次", len(reqs))
-	}
-}
-
 // TestDeviceIdentityRejectsBadResponse：结构不符、业务拒绝、标识缺失都回
 // plugin.ErrRejected，不返回空身份让上层误判为成功。
 func TestDeviceIdentityRejectsBadResponse(t *testing.T) {

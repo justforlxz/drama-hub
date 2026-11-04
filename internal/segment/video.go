@@ -13,6 +13,7 @@ import (
 
 	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/httpx"
+	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
 )
@@ -127,7 +128,7 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 			if !resolved {
 				var rerr error
 				if src, rerr = c.resolve(ctx, ep); rerr != nil {
-					return nil, fmt.Errorf("解析剧集 %d 直链（%v）: %w", ep.ID, rerr, httpx.ErrUpstream)
+					return nil, resolveFailure(ep.ID, rerr)
 				}
 			}
 			out, err := remux(ctx, c.logger, src, c.fetchHeaders(src))
@@ -142,12 +143,17 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		c.logger.WarnContext(ctx, "segment remux failed",
 			"uid", uid, "seq", seq, "episode_id", ep.ID, "channel", channel, "err", err)
-		// 生成失败（ffmpeg）是 502 且不写缓存；缓存自身故障按 500 报，不冒充上游问题。
-		if errors.Is(err, httpx.ErrUpstream) {
+		// 生成失败（ffmpeg）是 502 且不写缓存；解析直链被拒（要登录）与「只有加密流」
+		// 按插件哨兵的语义原样报出（403 / 501），不冒充上游失败；缓存自身故障按 500
+		// 报，不冒充上游问题（MKACG-676）。
+		switch {
+		case errors.Is(err, httpx.ErrUpstream):
 			writeVideoError(w, fmt.Errorf("转封装 %s 分片 %d（%v）: %w", uid, seq, err, httpx.ErrUpstream))
-			return
+		case errors.Is(err, httpx.ErrForbidden), errors.Is(err, httpx.ErrUnsupported):
+			writeVideoError(w, err)
+		default:
+			httpx.WriteError(w, fmt.Errorf("写分片 %s %d: %w", uid, seq, err))
 		}
-		httpx.WriteError(w, fmt.Errorf("写分片 %s %d: %w", uid, seq, err))
 		return
 	}
 
@@ -196,7 +202,7 @@ func (c *Cutter) timelineStart(ctx context.Context, uid string, eps []store.Epis
 		}
 		d, err := c.resolve(ctx, eps[i])
 		if err != nil {
-			return 0, fmt.Errorf("解析剧集 %d 直链（%v）: %w", eps[i].ID, err, httpx.ErrUpstream)
+			return 0, resolveFailure(eps[i].ID, err)
 		}
 		seconds, err := c.ensureDuration(ensureCtx, eps[i], d)
 		if err != nil {
@@ -251,7 +257,7 @@ func (c *Cutter) episodeChannel(ctx context.Context, ep store.Episode) (channel 
 
 	direct, err = c.resolve(ctx, ep)
 	if err != nil {
-		return "", stream.Direct{}, false, fmt.Errorf("解析剧集 %d 直链（%v）: %w", ep.ID, err, httpx.ErrUpstream)
+		return "", stream.Direct{}, false, resolveFailure(ep.ID, err)
 	}
 	channel = channelOf(direct)
 	if err := c.st.UpsertSegment(ctx, store.Segment{EpisodeID: ep.ID, Channel: channel}); err != nil {
@@ -298,7 +304,7 @@ func (c *Cutter) timelineFor(ctx context.Context, u playbackUnit) (*Timeline, er
 	for _, ep := range u.eps {
 		d, err := c.resolve(ctx, ep)
 		if err != nil {
-			return nil, fmt.Errorf("解析剧集 %d 直链（%v）: %w", ep.ID, err, httpx.ErrUpstream)
+			return nil, resolveFailure(ep.ID, err)
 		}
 		dur, err := c.ensureDuration(ensureCtx, ep, d)
 		if err != nil {
@@ -338,8 +344,27 @@ func parseSeqFile(name string) (int, bool) {
 	return seq, true
 }
 
+// resolveFailure 把「解析直链失败」折成出流面的错误。
+//
+// 三类原因必须分开报（MKACG-676）：
+//   - 需要登录态 / 该集无权限 → 403：用户该做的是配一次登录 Cookie，不是换源；
+//   - 只提供拿不到 key 的加密流 → 501：这一集本服务就是播不了，重试无用；
+//   - 其余（上游故障、被拒、格式看不懂）→ 502：源侧的问题。
+//
+// 折成同一个 502 时，前两种会被显示成「源坏了」，配置项也就失去意义。
+func resolveFailure(epID int64, err error) error {
+	target := httpx.ErrUpstream
+	switch {
+	case errors.Is(err, plugin.ErrLoginRequired):
+		target = httpx.ErrForbidden
+	case errors.Is(err, plugin.ErrUnsupported):
+		target = httpx.ErrUnsupported
+	}
+	return fmt.Errorf("解析剧集 %d 直链（%v）: %w", epID, err, target)
+}
+
 // writeVideoError 按播放面的错误矩阵写出响应：时长探测超时 → 503 + Retry-After
-// （不出半截流），其余走 httpx 统一映射（404 / 502 / 500）。
+// （不出半截流），其余走 httpx 统一映射（404 / 403 / 501 / 502 / 500）。
 func writeVideoError(w http.ResponseWriter, err error) {
 	if errors.Is(err, httpx.ErrUnavailable) {
 		w.Header().Set("Retry-After", "5")

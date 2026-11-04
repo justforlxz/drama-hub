@@ -63,8 +63,8 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
 | `/webdav/` 及全部子路径 | 任意 | 207/200/308/401/403/404/405/415/500 | 只读 WebDAV：PROPFIND 207（带 getcontentlength；**排障请带 `Depth: 1`**——数值深度 ≥2 由 `x/net/webdav` 直接 400，而**省略 `Depth` 等价于 `infinity`，会递归整棵树**，21.6 万剧的分类目录实测 369 MB / 116 s / RSS +501 MB，见 `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」）、**集合的 GET/HEAD → 200 `text/html` 目录页**（浏览器/文件管理器列目录用；单页 ≤ settings `webdav_page_size`（默认 1000），超出显示「共 M 项，已显示前 N」，`.strm` 的链接指向 `/video/…` 而不是 DAV 自身路径，见 `docs/DIRECTORY-CONTRACT.md`「集合 GET」）、GET strm/nfo 200；树是 `/{分类}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401；认证后 `/webdav`（无尾斜杠）308 到 `/webdav/`（跳转在认证之后，凭据不会丢）；405 一律带 `Allow`；写意图被拒的状态码由协议层决定（`PUT` 404、`MOVE`/`COPY` 403、`DELETE`/无 body 的 `MKCOL` 405、带 body 的 `MKCOL` 415、`PROPPATCH` 500，逐格前置条件见 `docs/DEV-STANDARDS.md`「只读」） |
-| `/video/{id}.m3u8` | GET / HEAD | 200/401/404/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
-| `/video/{id}/{seq}.m4s` | GET / HEAD | 200/206/401/404/502/503 | 整集 fMP4 分片：本地缓存命中即回，未命中整集转封装并落缓存 |
+| `/video/{id}.m3u8` | GET / HEAD | 200/401/403/404/501/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
+| `/video/{id}/{seq}.m4s` | GET / HEAD | 200/206/401/403/404/501/502/503 | 整集 fMP4 分片：本地缓存命中即回，未命中整集转封装并落缓存 |
 | `/s/{token}/…`、`/dav/…` | 任意 | 404 | 已退役（不留兼容层） |
 | `/` | GET | 200 | 管理界面：概览（同步计数、播放源调度、Jellyfin 媒体库现状与问题、补录入口） |
 | `/settings` | GET | 200 | 管理界面：设置（访问 / 同步与刷新 / 合并 / 缓存 / Jellyfin 共 12 个可改项，一个保存按钮） |
@@ -79,7 +79,10 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 对外 id 是 HMAC 常量签名（ADR-0003）：`id = uid + "-" + hex(HMAC-SHA256(secret,
 uid))[:12]`，`uid` 是 `e<episode.id>`（单集）或 `m<dramaID>_<epFrom>_<epTo>`（合并集），secret 取
 `settings.stream_secret`。一个 id 同时给 playlist 与分片用，无过期、无 token 表、不落库；
-签名错 → 401，`uid` 不是当前派生规则下的播放单元 → 404，解析不到直链或上游失败 → 502。
+签名错 → 401，`uid` 不是当前派生规则下的播放单元 → 404，解析不到直链或上游失败 → 502；
+该集需要登录态（App 通道与匿名站点通道都不通、`hongguo_cookie` 未配或已失效）→ 403，
+只提供拿不到 key 的加密流 → 501。三种都不是「源坏了」的同一种说法：403 补 Cookie 即可，
+501 是能力边界。
 
 **直链只在请求时解析**：`episode.play_url` / `play_url_at` 已由 `0004` 迁移删除（直链是
 短时凭据，落库就是过期链接），每次播放请求现调插件 `Resolve`，换链后下一次请求自然拿到
@@ -146,7 +149,7 @@ curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8
 
 每个请求输出一条结构化访问日志（`method` / `path` / `status` / `duration_ms`，见
 `internal/httpx`）；只记路径、不记 query，也不记带签名的上游直链。
-错误响应统一为 `{"code":"<kind>","message":"..."}`（404/400/401/502/503，其余 500）。
+错误响应统一为 `{"code":"<kind>","message":"..."}`（404/400/401/403/501/502/503，其余 500）。
 
 需要的运行环境：`ffmpeg`、`ffprobe` 在 `PATH` 里。
 

@@ -58,7 +58,7 @@ type fakeApp struct {
 }
 
 // newFakeApp 起一个假 App 上游：注册端点每次回一条新的身份（真实上游也是
-// 每次注册发一条新身份，续期测试靠它区分「换过没换过」）。
+// 每次注册发一条新身份，换身份测试靠它区分「换过没换过」）。
 func newFakeApp(t *testing.T) (*fakeApp, *httptest.Server) {
 	t.Helper()
 	f := &fakeApp{registerStatus: http.StatusOK,
@@ -110,7 +110,7 @@ func deviceResponseBody(call int) string {
 		`,"device_id_str":"` + deviceID + `","install_id_str":"` + iid + `"}`
 }
 
-// setRegisterStatus 设置注册端点的应答状态（续期失败场景用）。
+// setRegisterStatus 设置注册端点的应答状态（换身份重试失败场景用）。
 func (f *fakeApp) setRegisterStatus(status int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -292,9 +292,11 @@ func TestAppResolve(t *testing.T) {
 		t.Fatalf("ExpiresAt = %v, 上游没给过期时间就该是零值", st.ExpiresAt)
 	}
 
-	// 受保护剧：网页只取一次详情页（不请求集页 → 不可能拿到 10 秒预览），App 注册与取流各一次。
+	// 受保护剧：网页只取一次详情页（不请求集页 → 不可能拿到 10 秒预览），之后直接
+	// 走带签名的 App 通道（MKACG-676：App 是主路径，站点播放接口退为兜底，
+	// 主路径成功时不该再打站点）。
 	if reqs := web.requests(); len(reqs) != 1 || reqs[0] != "/player/"+fixtureSID {
-		t.Fatalf("网页请求 = %v, 期望只有详情页一次", reqs)
+		t.Fatalf("网页请求 = %v, 期望 只有详情页一次", reqs)
 	}
 	if registers, videos := app.count(); registers != 1 || videos != 1 {
 		t.Fatalf("App 请求 = 注册 %d / 取流 %d, 期望各一次", registers, videos)
@@ -308,6 +310,19 @@ func TestAppResolve(t *testing.T) {
 	}
 	if got := query.Get("aid"); got != "8662" {
 		t.Errorf("取流 query 的 aid = %q, 期望红果的产品号", got)
+	}
+	if query.Get("ts") == "" {
+		t.Error("取流 query 缺 ts（ts 与 x-khronos 必须是同一个秒值）")
+	}
+	// MKACG-676：签名头缺任何一个，网关都会回 200 + 空体（静默拒绝）。
+	for _, name := range []string{
+		"x-gorgon", "x-ladon", "x-argus", "x-helios", "x-medusa",
+		"x-khronos", "x-ss-req-ticket", "sdk-version", "x-xs-from-web",
+		"x-tt-store-region", "x-tt-dt",
+	} {
+		if _, ok := headers[http.CanonicalHeaderKey(name)]; !ok {
+			t.Errorf("取流请求缺签名头 %s", name)
+		}
 	}
 	// 请求体逐个键对照：biz_param 的 8 个键都是协议必需（含 5 个必须是零值的开关），
 	// 少一个或改成别的值上游就可能不回片源，所以整块钉住而不是只挑一个键断言。
@@ -468,15 +483,15 @@ func TestAppResolvePicksH264(t *testing.T) {
 	}
 }
 
-// TestAppResolveRenewFailureLogged 覆盖续期也失败时的日志：两个错误类别都要记下来
-// （只看 ErrRejected 分不清是「取流被拒」还是「换身份被拒」）。
+// TestAppResolveRenewFailureLogged 覆盖「换身份重试时注册也被拒」：沿用上一条身份
+// 打备用域名，最终按第二次取流的错误类别上抛（不是把注册失败当成取流结论）。
 func TestAppResolveRenewFailureLogged(t *testing.T) {
 	logs := &logSink{}
 	_, webSrv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series-protected.html"))
 	app, appSrv := newFakeApp(t)
 	app.replyVideo(func(call int) (int, string) {
 		if call == 1 {
-			// 取流被拒后把注册也打成被拒：续期拿不到新身份。
+			// 取流被拒后把注册也打成被拒：换身份重试拿不到新身份。
 			app.setRegisterStatus(http.StatusForbidden)
 			return http.StatusForbidden, ""
 		}
@@ -484,14 +499,18 @@ func TestAppResolveRenewFailureLogged(t *testing.T) {
 	})
 	p := newAppTestPlugin(t, webSrv, appSrv, slog.New(slog.NewTextHandler(logs, nil)))
 
-	if _, err := p.Resolve(context.Background(), testRef(), 1); !errors.Is(err, plugin.ErrRejected) {
-		t.Fatalf("err = %v, 期望 ErrRejected", err)
+	if _, err := p.Resolve(context.Background(), testRef(), 1); !errors.Is(err, plugin.ErrUpstream) {
+		t.Fatalf("err = %v, 期望 ErrUpstream（第二次取流是 500）", err)
 	}
-	if registers, videos := app.count(); registers != 2 || videos != 1 {
-		t.Fatalf("App 请求 = 注册 %d / 取流 %d, 期望注册两次（首次 + 续期）且取流只因首次被拒", registers, videos)
+	if registers, videos := app.count(); registers != 2 || videos != 2 {
+		t.Fatalf("App 请求 = 注册 %d / 取流 %d, 期望各两次（首次被拒 + 换身份重试）", registers, videos)
 	}
 	text := logs.text()
-	for _, want := range []string{"reason=ErrRejected", "renew_reason=ErrRejected"} {
+	for _, want := range []string{
+		"App 通道取址被拒，换身份重试",
+		"取流身份注册失败，改用缓存身份",
+		"reason=ErrUpstream",
+	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("日志缺 %q：%s", want, text)
 		}
@@ -526,7 +545,7 @@ func TestAppResolveRenewsDeviceOnce(t *testing.T) {
 		t.Fatalf("App 请求 = 注册 %d / 取流 %d, 期望各两次（首次被拒 → 换身份重试一次）", registers, videos)
 	}
 	if got := app.lastQueryDeviceID(); got != "1002" {
-		t.Fatalf("重试用的 device_id = %q, 期望续期后的新身份 1002（不能拿旧身份重试）", got)
+		t.Fatalf("重试用的 device_id = %q, 期望换身份后的新身份 1002（不能拿旧身份重试）", got)
 	}
 }
 
@@ -621,13 +640,13 @@ func TestAppResolveEmptyBodyRenewsDevice(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if st.URL != appTestMediaURL || !bytes.Equal(st.Key, appTestKey) {
-		t.Fatalf("Stream = %+v, 期望续期后出流", st)
+		t.Fatalf("Stream = %+v, 期望换身份后出流", st)
 	}
 	if reg, videos := app.count(); reg != 2 || videos != 2 {
 		t.Fatalf("App 请求 = 注册 %d / 取流 %d, 期望 2 / 2", reg, videos)
 	}
 	if got := app.lastQueryDeviceID(); got != "1002" {
-		t.Fatalf("重试用的 device_id = %q, 期望续期后的 1002", got)
+		t.Fatalf("重试用的 device_id = %q, 期望换身份后的 1002", got)
 	}
 	// 日志必须能看出「这次是空体」，否则排障还是只能猜。
 	if text := logs.text(); !strings.Contains(text, "content_type=application/json") ||
@@ -875,8 +894,8 @@ func TestResolvePrecedence(t *testing.T) {
 		if st.URL != appMedia || len(st.Key) != appKeyLen {
 			t.Fatalf("直链 = %q / key 长度 %d, 期望 App 片源 + 16 字节 key", st.URL, len(st.Key))
 		}
-		if reqs := web.requests(); len(reqs) != 1 {
-			t.Fatalf("网页请求 = %v, 受保护剧不该请求集页", reqs)
+		if reqs := web.requests(); len(reqs) != 1 || reqs[0] != "/player/"+fixtureSID {
+			t.Fatalf("网页请求 = %v, 受保护剧不该请求集页（只有详情页一次，App 是主路径）", reqs)
 		}
 		if _, videos := app.count(); videos != 1 {
 			t.Fatalf("App 取流 = %d 次, 期望 1 次", videos)

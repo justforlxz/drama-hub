@@ -11,11 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/plugin"
+	"github.com/justforlxz/drama-hub/internal/plugin/hongguo/sign"
 )
 
 // App 通道取址（MKACG-630，设计见 MKACG-626）。
@@ -38,9 +38,19 @@ const (
 	// 这样测试能把假上游整条装进来。
 	defaultAppVideoURL = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/"
 
+	// defaultAppVideoAltURL 是主域名被拒后的备用取流端点（参考实现同款备用域名）。
+	defaultAppVideoAltURL = "https://api5-normal-hl.fqnovel.com/novel/player/multi_video_model/v1/"
+
+	// appRetryDelay 是换身份重试前的等待（参考实现的 300ms；只用于一次重试）。
+	appRetryDelay = 300 * time.Millisecond
+
 	// appUA 是取流请求的 User-Agent：App 的 Android 形态，与官网页的浏览器身份
 	// （outboundUA）不是一套，两者别互相顶掉（626 §6 交叠提示）。
 	appUA = "com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)"
+
+	// appVersionName 是取流请求声明的 App 版本：查询串与签名（medusa 的设备指纹）
+	// 都读它，两处必须是同一个值。
+	appVersionName = "7.1.3.32"
 
 	// appVideoIDKind 是 mixed_video_id_map 的键：这次请求的是「剧集 vid」这一类
 	// 标识（App 侧协议事实，换一个上游就认不出这批 id）。
@@ -71,37 +81,51 @@ var appMediaDomains = []string{"qznovelvod.com", "fqnovelvod.com", "douyinvod.co
 
 // resolveApp 走 App 通道取某集完整片源。
 //
-// 设备身份被上游拒（ErrRejected）时按 626 换一条新身份重试一次；换不到就回原错误。
-// 其余错误直接上抛：结构不符重试也不会变，传输失败归下一轮。
+// 上游把取流身份当一次性的：同一条身份第二次请求会被网关 200 + 空体拒绝
+// （MKACG-676 实测）。所以每次取流先注册一条新身份；被拒时按参考实现再换一条
+// 身份、改走备用域名、Connection: close 重试一次，仍失败就回原错误。
 func (p *Plugin) resolveApp(ctx context.Context, vid string) (plugin.Stream, error) {
-	id, err := p.deviceIdentity(ctx)
-	if err != nil {
-		p.logAppFailure(ctx, vid, err)
-		return plugin.Stream{}, err
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		id, err := p.playbackIdentity(ctx)
+		if err != nil {
+			p.logAppFailure(ctx, vid, err)
+			return plugin.Stream{}, err
+		}
+		st, err := p.appPlayback(ctx, id, vid, attempt)
+		if err == nil {
+			return st, nil
+		}
+		lastErr = err
+		if attempt == 1 || !errors.Is(err, plugin.ErrRejected) {
+			break
+		}
+		// 空体只说明「这条身份不被接受」：换身份 + 备用域名再试一次。
+		p.logger.WarnContext(ctx, "App 通道取址被拒，换身份重试",
+			"plugin", Name, "channel", "app", "vid", vid, "reason", errorClass(err))
+		select {
+		case <-ctx.Done():
+			return plugin.Stream{}, ctx.Err()
+		case <-time.After(appRetryDelay):
+		}
 	}
-	st, err := p.appPlayback(ctx, id, vid)
+	p.logAppFailure(ctx, vid, lastErr)
+	return plugin.Stream{}, lastErr
+}
+
+// playbackIdentity 取一条本次取流专用身份。注册失败时退回缓存身份
+// （缓存同时承担「注册不可用时的 60 秒闸」，避免每集都打一次注册）。
+func (p *Plugin) playbackIdentity(ctx context.Context) (deviceIdentity, error) {
+	id, err := p.device.fresh(ctx)
 	if err == nil {
-		return st, nil
+		return id, nil
 	}
-	if !errors.Is(err, plugin.ErrRejected) {
-		p.logAppFailure(ctx, vid, err)
-		return plugin.Stream{}, err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return deviceIdentity{}, ctxErr
 	}
-	renewed, renewErr := p.renewDeviceIdentity(ctx, id)
-	if renewErr != nil {
-		// 续期也失败时把两者的类别都记下来：只记 ErrRejected 分不清是「取流被拒」
-		// 还是「换身份被拒」（续期自己有 ≤1 次/分钟的闸）。
-		p.logger.WarnContext(ctx, "App 通道取址失败",
-			"plugin", Name, "channel", "app", "vid", vid,
-			"reason", errorClass(err), "renew_reason", errorClass(renewErr))
-		return plugin.Stream{}, err
-	}
-	st, err = p.appPlayback(ctx, renewed, vid)
-	if err != nil {
-		p.logAppFailure(ctx, vid, err)
-		return plugin.Stream{}, err
-	}
-	return st, nil
+	p.logger.WarnContext(ctx, "取流身份注册失败，改用缓存身份",
+		"plugin", Name, "reason", errorClass(err))
+	return p.deviceIdentity(ctx)
 }
 
 // logAppFailure 记一条失败日志：只有通道、集标识与错误类别，没有密钥/地址/查询串。
@@ -120,6 +144,8 @@ func errorClass(err error) string {
 		{plugin.ErrNoStream, "ErrNoStream"},
 		{plugin.ErrSchema, "ErrSchema"},
 		{plugin.ErrNotFound, "ErrNotFound"},
+		{plugin.ErrLoginRequired, "ErrLoginRequired"},
+		{plugin.ErrUnsupported, "ErrUnsupported"},
 		{plugin.ErrUpstream, "ErrUpstream"},
 	} {
 		if errors.Is(err, c.sentinel) {
@@ -130,7 +156,7 @@ func errorClass(err error) string {
 }
 
 // appPlayback 发一次取流请求并把它翻成 plugin.Stream。
-func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string) (plugin.Stream, error) {
+func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string, attempt int) (plugin.Stream, error) {
 	body, err := json.Marshal(appRequestBody{
 		BizParam: appBizParam{
 			DeviceLevel:            3,
@@ -142,17 +168,43 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string)
 	if err != nil {
 		return plugin.Stream{}, fmt.Errorf("%w: 构造取流请求体: %v", plugin.ErrSchema, err)
 	}
-	rawURL := strings.TrimRight(p.appVideoURL, "/") + "?" + appQuery(id, time.Now().UnixMilli())
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
+	// 签名与发送共用同一份 body 字节：签名覆盖 query + body，签名后重新 marshal
+	// 会让上游验签失败（MKACG-676 的硬约束），所以这里只 marshal 这一次。
+	baseURL := p.appVideoURL
+	if attempt > 0 {
+		baseURL = p.appVideoAltURL
+	}
+	signed, err := p.sign.Playback(
+		strings.TrimRight(baseURL, "/"),
+		appSignParams(),
+		sign.Identity{
+			DeviceID:    id.DeviceID,
+			IID:         id.IID,
+			CDID:        id.CDID,
+			VersionName: appVersionName,
+		},
+		body, appUA,
+	)
+	if err != nil {
+		// 签名生成本身失败（128 次 ticket 都没落进分支 0）：显式报结构错误，
+		// 不得静默回退到无签名请求（那只会拿回 200+空体，把根因藏起来）。
+		return plugin.Stream{}, fmt.Errorf("%w: %v", plugin.ErrSchema, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, signed.URL, bytes.NewReader(body))
 	if err != nil {
 		// 不带上游错误的原文：*url.Error 会把带设备身份的完整 URL 打进错误文本，
 		// 而错误文本会进日志与 502 响应体（626：签名参数 MUST NOT 出现）。
 		return plugin.Stream{}, fmt.Errorf("%w: 构造取流请求", plugin.ErrUpstream)
 	}
-	req.Header.Set("User-Agent", appUA)
-	req.Header.Set("Accept", "application/json; charset=utf-8,application/x-protobuf")
-	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
-	// 日志只记路径：查询串里是设备身份，不是排障需要的。
+	for name, value := range signed.Headers {
+		req.Header.Set(name, value)
+	}
+	if attempt > 0 {
+		// 备用路由按参考实现的写法强制换连接，避免复用被判重的那条。
+		req.Close = true
+		req.Header.Set("Connection", "close")
+	}
+	// 日志只记路径：查询串里是设备身份与签名参数，不是排障需要的。
 	logPath := req.URL.Path
 
 	resp, err := p.client.Do(req)
@@ -181,10 +233,15 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string)
 	}
 	// content_type 是区分「真没返回」与「返回了别的东西」的唯一线索，不含内容本身。
 	contentType := resp.Header.Get("Content-Type")
+	// logid 是上游给的排障句柄（不含请求内容），失败时最需要它。
+	logID := resp.Header.Get("X-Tt-Logid")
+	if logID == "" {
+		logID = resp.Header.Get("X-Tt-LogID")
+	}
 	p.logger.Log(ctx, level, "App 取流",
 		"plugin", Name, "channel", "app", "path", logPath,
 		"upstream_status", resp.StatusCode, "bytes", len(payload),
-		"content_type", contentType)
+		"content_type", contentType, "logid", logID)
 
 	if readErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -231,14 +288,20 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string)
 	return st, nil
 }
 
-// appQuery 拼取流请求的查询串：设备参数 + 匿名身份 + 请求票据（毫秒）。
-func appQuery(id deviceIdentity, ticket int64) string {
-	q := appDeviceParams()
-	q.Set("device_id", id.DeviceID)
-	q.Set("iid", id.IID)
-	q.Set("cdid", id.CDID)
-	q.Set("_rticket", strconv.FormatInt(ticket, 10))
-	return q.Encode()
+// appSignParams 把设备参数摊成有序切片（签名对 query 字节敏感，顺序必须稳定，
+// 所以按 key 排序一次而不是用会被并发改写的 map）。
+func appSignParams() []sign.KV {
+	params := appDeviceParams()
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]sign.KV, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, sign.KV{Key: k, Value: params.Get(k)})
+	}
+	return out
 }
 
 // appDeviceParams 是取流请求要声明的设备形态（App 7.1.3.32 / Android 手机那套）。
@@ -272,7 +335,7 @@ func appDeviceParams() url.Values {
 		"ssmix":                   {"a"},
 		"update_version_code":     {"71332"},
 		"version_code":            {"71332"},
-		"version_name":            {"7.1.3.32"},
+		"version_name":            {appVersionName},
 	}
 }
 

@@ -162,11 +162,14 @@ type Plugin interface {
    - 只在进程内存里：**不落库、不落盘、不进 settings** —— 重启即重新注册，
      与「插件无持久状态」不冲突；
    - 闸：并发首次取用只发一次注册（single-flight，不是两个开关）；失败同样落缓存，
-     **60 秒内不再重试**；换身份（续期）共用同一条 60 秒闸，即「续期 ≤ 1 次/分钟」；
+     **60 秒内不再重试**；
    - 不进日志：日志只记 `channel` / `vid` / 错误类别，身份字段本身是凭据形态，不记。
 
-   为什么必须开这个口子：App 通道每次取流都要带设备参数，注册端点一次只发一条身份，
-   重复注册会被上游当异常。没有这条缓存就得每次播放都注册一遍 —— 那是主动触发风控。
+   这条口子的用途在 MKACG-676 之后变了：App 取流身份是**一次性**的（见下文「取流身份是
+   一次性的」），每次取流都新注册一条（`device.fresh`），缓存里这**一条**身份只在「本次
+   注册失败」时作为兜底身份发出去，不再是「每集复用」的身份——复用缓存恰好是上游明确
+   拒绝的形态（`200` + 空体）。缓存仍负责失败态的 60 秒静默期，避免注册端点故障时
+   每集都打一次。
 3. **错误必须 `%w` 包装哨兵**，且错误文本 **MUST NOT** 含直链、解密 key、
    签名参数、Cookie、请求头。可以含作品标识与集号（排障要）。
 4. **超时归插件。** 每次出站请求 MUST 带 `ctx`，且 `*http.Client` 有 `Timeout`
@@ -223,21 +226,43 @@ type Plugin interface {
         │
         └─ 受保护（protectedPlayback == true），或网页通道给 ErrNoStream
                 ↓
-        App 通道：设备身份 → 取流 → 选流 → 派生 key → 解 URL → 白名单校验
-                ↓
-        失败 → 原样返回哨兵（/video 侧 502），不回落
+        App 通道（主路径）：注册一次性身份 → 生成请求签名（x-gorgon / x-argus /
+                x-ladon / x-helios / x-medusa + _rticket 命中分支 0）→ 取流
+                → 选流 → 派生 key → 解 URL → 白名单校验
+                ├─ 成功 → 返回
+                └─ ErrRejected（含 200 + 空体）→ 换新身份 + 备用域名重试一次
+                        ↓
+        站点播放通道（兜底）：POST {base}/api/video/protected/play-info
+                ├─ legacy_play_info.main_url（明文 mp4 直链）→ 返回
+                ├─ play_info（DASH-CENC，kid + player_access_key）→ ErrUnsupported
+                ├─ 403 protected_playback_unavailable → ErrLoginRequired
+                │      └─ 配了 hongguo_cookie 才带登录态再要一次（最后兜底）
+                └─ 其余失败 → 报 App 通道的错误
+                        ↓
+        失败 → 原样返回哨兵（/video 侧按哨兵映射状态码），不回落
 ```
 
+- **App 通道是主路径，站点播放通道是兜底**（MKACG-676 路线调整）：App 取流端点按请求
+  签名放行（`x-gorgon` / `x-argus` / `x-ladon` / `x-helios` / `x-medusa`，见「App 请求签名」），
+  签名齐了之后锁定集能取到完整片源；站点 play-info 只覆盖匿名可见的免费集，所以退为
+  兜底而不是主路径。
+- **取流身份是一次性的**：上游对同一条身份第二次请求取流端点回 `200` + 空体（实测
+  MKACG-676）。因此每次取流先注册一条新身份，被拒时再换一条 + 备用域名
+  （`Config.AppVideoAltURL`）+ `Connection: close` 重试一次。进程内缓存的单条身份只在
+  注册失败时兜底，不再当作「每集复用」的身份。
 - **网页页 `protectedPlayback == true` 时，那条 10 秒 SEO 预览一律 `ErrNoStream`。**
   插件 MUST NOT 把预览 URL 当直链交付：播放器无法「如实告知这是预览」，静默交付等于把
   10.07 秒的片子冒充整集（实测见 `docs/L1-CORPUS-SCOPE.md` 取证 D）。
-- **App 通道不可用时就是 502，不降级。** `/video` 返回 502 + 一条 `WarnContext`
-  （`channel=app`、`vid`、错误类别），不回落成「200 + 10 秒 playlist」。
+- **两条通道都不可用时就是 502，不降级。** `/video` 返回 502 + 一条 `WarnContext`
+  （`channel`、`vid`、错误类别），不回落成「200 + 10 秒 playlist」。
+  例外只有两格：站点通道回 `ErrLoginRequired` / `ErrUnsupported` 时直接把该哨兵交给
+  出流面（403 / 501）——这两种情况重试与换通道都无用，回落只会把「配个 Cookie 就好」
+  显示成「源坏了」。
 - 「可播」判据仍是 `URL` 非空：通道选择不改变状态码矩阵（`docs/PLAYBACK-CONTRACT.md`）。
 - **未受保护的剧先试网页通道**：拿到明文直链就返回，不再发 App 请求（`protectedPlayback`
   只决定「要不要先试网页通道」，不决定「发不发 App 请求」）。网页回 `ErrNoStream`
   （第 2..N 集没有 `contentUrl`、集页 404 就是这种形态）时照样按上面的顺序落到 App 通道；
-  其余错误原样上抛——上游故障不该被 App 通道掩盖。
+  其余错误原样上抛——上游故障不该被别的通道掩盖。
 - 同一集的网页源与 App 源字节流不同，因此分片身份必须带通道段（见「加密切片与 Key」
   与 `docs/CACHE-MODEL.md`「失效」）。
 
@@ -252,6 +277,8 @@ type Plugin interface {
 | `ErrSchema` | 缺 `_ROUTER_DATA`、身份校验失败、`vid_list` 为空/非数字/重复、响应体超限；**App 通道**：200 + 非空但不是 JSON、密文缺 `spade_a` 或 key 派生失败、media URL 不在白名单 | 跳过该对象，记错误与计数；同一轮内连续 N 次（N=20）则中止本轮（当作源级结构变更） | 不变 | 否（人等） |
 | `ErrNotFound` | 上游 404 / 明确表示已下架 | 跳过该对象，**不删库**（刷新只增改不删，见 `docs/DATA-MODEL.md`「增删改语义」） | 不变 | 否 |
 | `ErrNoStream` | `VideoObject` 在但无 `contentUrl`；集页 404；受保护剧的 10 秒预览（不当作直链）；**App 通道取流 404（带体或不带体）** | 该集可播性 = 否。出流端点返回 502，同步流程视为成功 | 不变 | 否 |
+| `ErrLoginRequired` | 站点通道 `403` + `{"error":"protected_playback_unavailable"}`（未配 Cookie、Cookie 已失效、或该集本就需要登录）；集页 `302` 到 `?pc_locked_episode=`（MKACG-676） | 该集可播性 = 否，但原因是**缺凭据**不是上游故障：出流端点返回 **403**（`code=forbidden`），文案说明「需要登录态或该集无权限」；MUST NOT 折成 `ErrUpstream` 的 502 | 不变 | 否（先配 Cookie） |
+| `ErrUnsupported` | 站点通道只回 `play_info`（DASH-CENC）：有 `kid` / `player_access_key` / `init_range` / `index_range`，但拿不到 ffmpeg 可用的 16 字节 key（MKACG-676） | 该集可播性 = 否：出流端点返回 **501**（`code=unsupported`），文案说明「该集仅提供加密流」；MUST NOT 静默 502 | 不变 | 否（等人） |
 
 三条补充规则：
 
@@ -269,10 +296,10 @@ type Plugin interface {
 
 | 上游响应 | 哨兵 | 后果 |
 |---|---|---|
-| 403 / 429 / 444 | `ErrRejected` | 换一条身份重试一次（受续期 ≤1 次/分钟闸约束），仍失败即 502 |
+| 403 / 429 / 444 | `ErrRejected` | 换一条新身份 + 备用域名重试一次，仍失败即 502 |
 | 404（带体或不带体） | `ErrNoStream` | 该集无片源：不换身份、不重试 |
 | 其余非 200（5xx 等） | `ErrUpstream` | 不换身份；退避到下一周期 |
-| 200 + 空体 | `ErrRejected` | 上游拒绝请求的形态：换一次身份（受同一闸约束），仍为空体即 502（MKACG-673） |
+| 200 + 空体 | `ErrRejected` | 上游拒绝请求的形态（缺签名、身份已用过、被风控都是这一格）：换一条新身份 + 备用域名重试一次，仍为空体即 502（MKACG-673 / 676） |
 | 200 + 非空但不是 JSON | `ErrSchema` | 结构不符，重试无用；错误文本带该次响应的 status / content_type / bytes |
 | 200 + `code != 0` | `ErrRejected` | 与风控同一动作（换一次身份） |
 
@@ -281,13 +308,20 @@ type Plugin interface {
 按 `ErrUpstream`（重试有意义）。**不许**在状态码之前判空体：空体只在 200 这一格才是判据，
 404 / 403 等格的空体照状态码归类。
 
-**200 + 空体的代价与边界（MKACG-673）**：这个 agw 拒绝请求时回 200、
+站点播放通道（`POST .../play-info`，MKACG-676）沿用同一顺序：`429/444` → `ErrRejected`；
+`403` **先读体**再看 `{"error":"protected_playback_unavailable"}` —— 对得上就是
+`ErrLoginRequired`，否则（风控等）仍按 `ErrRejected`；`404` → `ErrNotFound`；其余非 200 →
+`ErrUpstream`；只有 200 才解析 JSON，200 + 空体按 `ErrSchema`（这个接口的成功答复必带
+`legacy_play_info` 或 `play_info`，空体只会是结构变了，不是「被拒」——被拒的形态是 403）。
+
+**200 + 空体的代价与边界（MKACG-673 / MKACG-676）**：这个 agw 拒绝请求时回 200、
 `content-type: application/json`、`content-length: 0`，所以空体只能是「请求没被接受」，
-不是「契约结构变了」。归 `ErrRejected` 之后每次播放最多换一次身份、最多两次取流；换身份
-本身有 ≤1 次/分钟闸（`deviceRetryInterval`）：闸期内的播放不再注册新身份，直接返回取流
-侧那条 `ErrRejected`（错误文本形如「POST … 返回 200 但响应体为空」），日志多一条
-`renew_reason=ErrRejected`；距上次续期满 60 秒后的下一次播放才会再换一次。连续空体即
-「这一分钟内换身份也拿不到」，重试要等到下一分钟。
+不是「契约结构变了」。归 `ErrRejected` 之后最多再取一次流：**新注册**一条身份 + 备用
+域名（`Config.AppVideoAltURL`）+ `Connection: close`，两次都空体就把 `ErrRejected` 交给
+出流面（502）。因为身份是一次性的，受保护剧每次 `Resolve` 都固定多一次设备注册
+（上游成本见 `docs/DEV-STANDARDS.md`「红果插件的上游成本」）。连续空体即「签名或身份
+已被上游改判」，重试要等上游恢复；排障看 `App 取流` 那条日志的 `upstream_status=200`
+`bytes=0` 与随后的 `App 通道取址被拒，换身份重试`（字段 `reason`）。
 
 非 JSON 那格仍归 `ErrSchema`，但错误文本必须带上这次响应的 `status` / `content_type` /
 `bytes`（只记这些元信息，不含查询串、响应体内容和任何密钥）；`App 取流` 日志同一条行
@@ -350,6 +384,12 @@ if err := reg.Register(hongguo.New(hongguo.Config{
 `refresh_batch`、`refresh_timeout_sec`）归 `docs/SCHEDULER-MODEL.md`「配置」，
 本表不重复列：同一张表出现两处就会漂。
 
+- **`hongguo_cookie` 不是 `plugin.<源>.*` 前缀**（MKACG-676）：站点登录态的 Cookie 串，
+  敏感项（`PATCH /api/settings` 回 `null`，不进日志与错误文本），空 = 匿名（只播免费集）。
+  它**热读**：每次取流现读 `settings`，改完下一集立即生效（与 `base_url` 需重启不同）——
+  凭据会过期要换，不该让人重启服务才能换。**它只作最后兜底**：App 通道与匿名站点通道
+  都不通时才用，不得成为播放的前置条件（MKACG-676 路线调整）。插件侧通过构造期注入的
+  `hongguo.Config.Cookie func(ctx) string` 拿值，插件不 import `internal/store`。
 - 空值（`""`）表示「继承 / 用插件默认」，与「未设置」等价；两者行为相同。
 - `plugin.<源>.enabled` 缺失时按 `true` 处理（内置源默认启用），因此升级到 2.0 后
   红果不需要先手工开一下。
@@ -371,7 +411,7 @@ if err := reg.Register(hongguo.New(hongguo.Config{
 |---|---|---|
 | `Enumerate` | `GET /sitemap/hongguoduanju/index.xml` → `index{N}.xml` → 并集 `GET /seo-important.xml`，再 `GET /category?page=2..34` | 只取 `/player/{id}` 与 `/detail?series_id={id}` 的 id。游标 `v1:<段>:<位置>`（段 = `s`/`e`/`c`）：sitemap 段是「第几份子 sitemap」，seo 段只一份，category 段是「第几页」。走完 30 份 sitemap 后，用 `/category` 全 34 页补齐 sitemap 滞后漏掉的最新剧目。一页 = 一份上游文档（子 sitemap 整份 43,556 个 loc 一次返回），**不在文件中间切页**：切在中间要把「第几份 + 已读位置」都塞进游标，而一次 5 MiB GET 的成本本来就大于一次游标往返 |
 | `Work` | `GET /player/{id}` | 解析 `_ROUTER_DATA → loaderData["player_(series_id)/page"] → seriesDetail`：`series_name` / `series_cover` / `series_intro` / `tags` / `episode_cnt` / `vid_list` |
-| `Resolve` | `GET /player/{id}/{ep_vid}` | JSON-LD `VideoObject.contentUrl` + 绑定校验（`url` 的 pathname 含 `/player/{id}`、`contentUrl` 含 `/ep_vid`） |
+| `Resolve` | `GET /player/{id}/{ep_vid}`（JSON-LD `VideoObject.contentUrl`）→ 没有就走 App 通道（带请求签名）→ 再不行 `POST /api/video/protected/play-info`（兜底） | 见「通道与取流顺序」；签名见「App 请求签名」，站点通道答复形态见下节 |
 
 - 红果的集标识（`vid`）进 `episode.vid` 列；`ep_no = vid_list 下标 + 1`。
 - 校验沿用现有实现（`internal/provider/parse.go` 已验证的部分）：`isSuccess` 不为
@@ -385,19 +425,49 @@ if err := reg.Register(hongguo.New(hongguo.Config{
 - **网页通道的上限**（不是插件缺陷、不许在插件里「修」）：网页页只给第 1 集一条直链，
   且是 **10.07 秒 / 651 KB 的 360p 预览**；第 2..N 集 `contentUrl` 缺失；第 4 集起集页 404。
   `docs/L1-CORPUS-SCOPE.md` 取证 D 有完整数据。因此网页通道交付不了完整集，受保护剧
-  （`protectedPlayback == true`）按「通道与取流顺序」直接换 App 通道，预览不当直链交付。
+  （`protectedPlayback == true`）按「通道与取流顺序」直接走 App 通道（再不行才用站点
+  播放通道兜底），预览不当直链交付。
+
+### 站点播放通道（红果实现，MKACG-676）
+
+| 项 | 口径 |
+|---|---|
+| 归属 | 同一个插件内部的取流分支（**兜底路径**，MKACG-676 之后不再是首选），`Name()` 仍是 `web`；不新增 provider |
+| 端点 | `POST {base}/api/video/protected/play-info`。`{base}` 取 `plugin.web.base_url`（默认 `https://hongguoduanju.com`）；**必须直接用裸域**，`www.` 前缀对 POST 回 301 且不跟随 |
+| 请求 | 体 `{"series_id":"<sid>","item_id":"<vid>","definition":"720p"}`，`Content-Type: application/json`；UA / Referer 沿用网页通道的出站身份。先匿名要一次；只有回 `protected_playback_unavailable` 且配了 `hongguo_cookie` 时才带 `Cookie` 再要一次 |
+| 答复 | `legacy_play_info.main_url` = 明文 mp4 直链（https、支持 `Range` → 206 `video/mp4`，ffmpeg 可直接吃）；`play_info` = DASH-CENC（`kid` / `player_access_key` / `init_range` / `index_range`，音视频各一路） |
+| 登录门槛 | 匿名可播免费集（实测本剧前 5 集全是 `legacy_play_info`）；锁定集匿名 403 `protected_playback_unavailable`，集页 302 到 `?pc_locked_episode=`。站点文案「登录后观看」，没有匿名解锁接口 |
+| 错误归类 | 见「错误语义」与「判定顺序：状态码先于响应体」 |
+| 敏感面 | Cookie、`main_url` 的查询串、`kid` / `player_access_key` **一律不进日志与错误文本**；日志只有 `channel=site` / `path` / `upstream_status` / `bytes` / `login`（布尔，不含值） |
+| 不做什么 | 不实现 DASH-CENC 解密（拿不到 16 字节 key 就报 `ErrUnsupported`）、不用 `fallback-play-info`（实测对本剧全量不可用：403 `public_fallback_unavailable` / 502） |
+
+### App 请求签名（红果实现，MKACG-676）
+
+App 取流端点按请求签名放行：签名不齐时网关回 `200` + `content-length: 0`（不是 4xx，
+也不是 401），看起来像「上游没返回」。签名实现在独立子包 `internal/plugin/hongguo/sign`，
+只依赖标准库，是本仓唯一一处逆向产物，集中在一个包里便于上游变更时整体替换。
+
+| 项 | 口径 |
+|---|---|
+| 头 | `x-gorgon`（query+body 摘要 + RC4 变体）、`x-ladon`（`BE32(khronos)` base64）、`x-argus`（`LE32(khronos)` base64）、`x-helios`（64 位字轮函数）、`x-medusa`（proto 打包 + SM3 + AES 变体）、`x-khronos`、`x-ss-req-ticket`、`sdk-version: 2`、`x-xs-from-web: 0`、`x-tt-store-region: cn`、`x-tt-store-region-src: did`、`x-tt-dt: ""` |
+| 覆盖范围 | **query 字节 + body 字节**。body 只 marshal 一次，签名与发送共用同一份；签名后重新 marshal 会让上游验签失败 |
+| `_rticket` 分支 | 取流必须落在散列分支 0：ticket 从 `now.UnixMilli()` 起递增，最多 128 次；128 次仍未命中即显式报错（`ErrBranchTimeout` → 插件侧 `ErrSchema`），**不静默回退无签名请求** |
+| 身份 | 取流身份一次性（见「通道与取流顺序」）；`device_id` / `iid` / `cdid` 参与签名与 query |
+| 随机量 | 全部经 `sign.Signer.Rand` 注入，测试用固定序列跑出逐字节向量（对比参考实现） |
+| 日志 | 只记 `channel=app` / `path` / `upstream_status` / `bytes` / `content_type` / `logid`；签名材料、查询串、身份一律不进日志与错误文本 |
+| 出处 | 算法改编自 `woshishiq1/drpys`（经 `N3urda/hongguoTV`），移植自 `jackotom/hongguo-drama` 的 `src/native/app-source.js` / `sm3.js`；本仓同为 GPL-3.0，文件头保留原作者署名与 commit（`tables.go` 的常量表由参考实现逐字节生成） |
 
 ### App 通道（红果实现）
 
 | 项 | 口径 |
 |---|---|
 | 归属 | 同一个插件内部的取流分支，`Name()` 仍是 `web`；不新增 provider、不新增 settings 键 |
-| 端点 | 两个，**都是 `hongguo.Config` 的构造期字段**：`DeviceRegisterURL`（匿名设备注册）、`AppVideoURL`（取流）。默认值内置，测试注入假上游；上游换域名发版 |
-| 设备身份 | 匿名注册拿 `device_id` / `install_id`（+ 本进程生成的 `cdid`）。规则见硬性要求 2 的例外：单条、失败也缓存、续期 ≤1 次/分钟、不落库不落盘不进 settings |
+| 端点 | 三个，**都是 `hongguo.Config` 的构造期字段**：`DeviceRegisterURL`（匿名设备注册）、`AppVideoURL`（取流主域名）、`AppVideoAltURL`（被拒后的备用域名，默认 `api5-normal-hl.fqnovel.com`）。默认值内置，测试注入假上游；上游换域名发版 |
+| 设备身份 | 匿名注册拿 `device_id` / `install_id`（+ 本进程生成的 `cdid`）。**取流身份一次性**：每次取流新注册一条；进程内缓存的单条身份只在注册失败时兜底。不落库、不落盘、不进 settings、不进日志 |
 | 取址 | `POST` 取流端点（`mixed_video_id_map` 以集 `vid` 为键）→ 优先 h264 流 → `spade_a` 派生 16 字节 AES-128 内容密钥 → 有 `key_seed` 时再解出真实媒体地址 |
 | 白名单 | media URL 必须在 `*.fqnovelvod.com` / `*.qznovelvod.com` / `*.douyinvod.com` 之下，https、无 userinfo、443。之外一律 `ErrSchema`，**不出站** |
-| 错误归类 | 见「错误语义」的判定顺序表；风控被拒 → 换一次身份后 502，**不回落预览** |
-| 敏感面 | `spade_a`、`key_seed`、内容密钥、解出的 URL 查询串**一律不进日志与错误文本**；日志只记 `channel` / `vid` / 错误类别，域名只在校验通过后出现 |
+| 错误归类 | 见「错误语义」的判定顺序表；被拒（含 `200` + 空体）→ 换新身份 + 备用域名重试一次，仍失败即 502，**不回落预览** |
+| 敏感面 | `spade_a`、`key_seed`、内容密钥、解出的 URL 查询串、签名头**一律不进日志与错误文本**；日志只记 `channel` / `vid` / 状态 / 字节数 / `logid` / 错误类别，域名只在校验通过后出现 |
 | 不做什么 | 不整集解密落盘、不自研 MP4-CENC 解析器、不新增第三方依赖、不搬参考实现的源码与常量表（只取协议与算法事实，Go 侧独立实现，夹具自建） |
 
 - 现有 `internal/provider` 的解析逻辑整体搬进 `internal/plugin/hongguo`，

@@ -72,9 +72,12 @@ func mapSettingErr(err error) error {
 }
 
 // isSecretSetting 判断一个键的值是否不该回显。
+//
+// 红果登录 Cookie 属于同一类（MKACG-676）：它是账号凭据，回显等于把它多抄一份到
+// 浏览器与会话记录里；页面只需要知道「配了没配」，不需要看到内容。
 func isSecretSetting(key store.SettingKey) bool {
 	switch key {
-	case store.KeyWebDAVPass, store.KeyStreamSecret, store.KeyJellyfinAPIKey:
+	case store.KeyWebDAVPass, store.KeyStreamSecret, store.KeyJellyfinAPIKey, store.KeyHongguoCookie:
 		return true
 	}
 	return false

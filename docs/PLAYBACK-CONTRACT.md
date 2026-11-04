@@ -105,12 +105,22 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 | id 签名不对 / 缺 `-` | 401 |
 | `uid` 在库里不存在 | 404 |
 | 该集解析不到直链（`ErrNoStream`，含受保护剧只给 10 秒预览） | 502 |
+| 该集需要登录态或无权限（`ErrLoginRequired`：站点回 403 `protected_playback_unavailable`，含 Cookie 未配/已失效） | 403（`code=forbidden`） |
+| 该集仅提供不支持的形态（`ErrUnsupported`：只给 DASH-CENC 且拿不到 key） | 501（`code=unsupported`） |
 | 时长探测超时（30 s 硬上限） | 503 + `Retry-After: 5` |
 
 **502 的语义（MKACG-626 契约 2）**：可播性只在请求时判定，失败一律 502，不降级。
-「受保护剧只给 10 秒预览」不产出「200 + 10 秒 playlist」：预览不当直链交付，App 通道也不
-可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `channel` / 错误类别）。不回落、不静默
-给一个「看起来能播」的短片 —— 判据与顺序见 `docs/PLUGIN-CONTRACT.md`「通道与取流顺序」。
+「受保护剧只给 10 秒预览」不产出「200 + 10 秒 playlist」：预览不当直链交付，站点通道与
+App 通道也不可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `channel` / 错误类别）。
+不回落、不静默给一个「看起来能播」的短片 —— 判据与顺序见 `docs/PLUGIN-CONTRACT.md`
+「通道与取流顺序」。
+
+**403 / 501 的语义（MKACG-676）**：这两种不是上游故障，不该显示成「源坏了」。
+它们只可能来自兜底路径：App 通道（主路径，带请求签名）不成时站点播放通道给出的确定答复。
+403 = 这一集需要登录态（`hongguo_cookie` 没配、已失效，或该账号本就无权限）；补一条
+`PATCH /api/settings` 就能播，重试无用。501 = 这一集只提供加密流（`play_info` 里只有
+`kid` / `player_access_key`，拿不到 ffmpeg 能用的 16 字节 key），本服务不实现 DASH-CENC
+解密。两格都不进 `WarnContext` 的「上游失败」口径，文案直接告诉人该干什么。
 
 **时长按需探测**：`m3u8` 需要每集时长，而 `episode.duration_sec` 是唯一真值。
 第一次播放某 `uid` 时，`duration_sec` 为 0 的成员**同步** ffprobe 一次

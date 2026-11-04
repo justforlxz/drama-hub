@@ -17,6 +17,7 @@ internal/vfs 30
 internal/httpx 30
 internal/jellyfin 30
 internal/plugin/hongguo 20
+internal/plugin/hongguo/sign 15
 internal/cache 20
 internal/stream 20
 internal/plugin 10

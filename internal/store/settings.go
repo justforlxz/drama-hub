@@ -64,6 +64,10 @@ const (
 	KeyJellyfinLibraryRoot   SettingKey = "jellyfin_library_root"
 	KeyJellyfinLibraryPrefix SettingKey = "jellyfin_library_prefix"
 	KeyJellyfinTimeoutSec    SettingKey = "jellyfin_timeout_sec"
+	// KeyHongguoCookie 是红果站点的登录 Cookie（MKACG-676）。不是 plugin.web.* 前缀：
+	// 它不属于「插件构造期配置」，而是每次取流现读的凭据（热改即生效），前缀模式
+	// 表达不了这个语义。空 = 匿名（只播免费集）；非空即按原样作为 Cookie 头发出。
+	KeyHongguoCookie SettingKey = "hongguo_cookie"
 )
 
 // 插件配置的项名（docs/PLUGIN-CONTRACT.md「配置」）。
@@ -455,6 +459,10 @@ func specFor(key SettingKey) (settingSpec, bool) {
 	case KeyJellyfinTimeoutSec:
 		// 单次出站超时。http.Client 不设全局 Timeout，超时靠每次请求的 ctx（internal/jellyfin）。
 		return settingSpec{kind: kindInt, def: "10", min: 1, max: 60}, true
+	case KeyHongguoCookie:
+		// 站点登录态（Cookie 串）：空 = 匿名，只播免费集；非空即原样发往站点。
+		// 属密钥：PATCH /api/settings 回 null，不进日志与错误文本（MKACG-676）。
+		return settingSpec{kind: kindToken}, true
 	}
 	return pluginSpecFor(string(key))
 }

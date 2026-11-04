@@ -320,11 +320,22 @@ func newPlugins(ctx context.Context, settings *store.Settings, logger *slog.Logg
 		logger.Warn("读插件 request_timeout_sec 失败，用默认值", "plugin", hongguo.Name, "err", err)
 		timeoutSec = defaultPluginTimeoutSec
 	}
+	// 站点登录态（MKACG-676）：每次取流现读 settings，插件只拿到一个取值闭包，
+	// 不缓存内容、不写日志。库读失败按匿名继续（值本身是密钥，不记进日志）。
+	cookieSource := func(ctx context.Context) string {
+		v, err := settings.String(ctx, store.KeyHongguoCookie)
+		if err != nil {
+			logger.Warn("读站点登录 Cookie 失败，按匿名取流", "err", err)
+			return ""
+		}
+		return v
+	}
 	reg := plugin.NewRegistry()
 	if err := reg.Register(hongguo.New(hongguo.Config{
 		BaseURL:    baseURL,
 		HTTPClient: &http.Client{Timeout: time.Duration(timeoutSec) * time.Second},
 		Logger:     logger,
+		Cookie:     cookieSource,
 	})); err != nil {
 		return nil, nil, err
 	}

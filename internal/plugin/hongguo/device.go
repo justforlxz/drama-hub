@@ -21,7 +21,7 @@ import (
 // App 通道取址要一整套设备参数，其中 device_id / install_id 由匿名注册端点发。
 // 注册不需要账号、不需要 cookie：POST 一个加密信封，回两个数字标识。
 //
-// 本文件只管「拿到身份」：注册信封、单条缓存、失败也缓存、续期 ≤ 1 次/分钟。
+// 本文件只管「拿到身份」：注册信封、单条缓存、失败也缓存（60 秒静默期）。
 // 身份是本插件唯一允许的进程内可变状态，**不落库、不落盘、不进 settings、不进
 // 日志**（626 契约第 3 条）。取址、派生与白名单归 MKACG-630。
 
@@ -36,7 +36,7 @@ const (
 	// （outboundUA）不是一套，两者别互相顶掉（626 §6 交叠提示）。
 	deviceUA = "com.phoenix.read/72232 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3)"
 	// deviceRetryInterval 是注册失败后的静默期：期间一律回放同一条失败，不再发
-	// 请求（626 契约的「续期 ≤ 1 次/分钟」）。
+	// 请求（626 契约的「失败也缓存」）。
 	deviceRetryInterval = time.Minute
 	// maxDeviceResponseBytes 是注册响应的读取上限：正常响应只有几百字节，64 KiB
 	// 足够且挡住上游异常放大。
@@ -53,8 +53,10 @@ type deviceIdentity struct {
 // deviceCache 是插件唯一的进程内可变状态：一条身份，成功与失败都只存这一条。
 //
 // 语义（MKACG-628 验收）：同一进程内反复取用只注册一次；并发首次取用也只注册
-// 一次（single-flight，不是两个开关）；失败同样落缓存，且 60 秒内不再重试；
-// 换身份（续期）同样受这条 60 秒闸约束，即「续期 ≤ 1 次/分钟」。
+// 一次（single-flight，不是两个开关）；失败同样落缓存，且 60 秒内不再重试。
+//
+// 注意取流不走 get：取流身份是一次性的（MKACG-676），每次取流用 fresh 新注册
+// 一条；这里的一条只在注册失败时兜底。
 type deviceCache struct {
 	registerURL string
 	client      *http.Client
@@ -62,10 +64,9 @@ type deviceCache struct {
 	now         func() time.Time // 测试注入；生产是 time.Now
 	rand        io.Reader        // 测试注入确定性随机源；生产是 crypto/rand
 
-	mu         sync.Mutex
-	cached     *deviceAttempt // 单条：成功或失败都在这
-	inflight   chan struct{}  // 非 nil = 有一次注册在途；关闭即落定
-	renewAfter time.Time      // 下一次允许换身份的时刻（续期 ≤ 1 次/分钟）
+	mu       sync.Mutex
+	cached   *deviceAttempt // 单条：成功或失败都在这
+	inflight chan struct{}  // 非 nil = 有一次注册在途；关闭即落定
 }
 
 // deviceAttempt 是一次注册的结果。成功时 retryAt 为零值（永不重试）。
@@ -118,38 +119,21 @@ func (d *deviceCache) get(ctx context.Context) (deviceIdentity, error) {
 	}
 }
 
-// renew 在「上游刚刚拒了 rejected 这条身份」时换一条新的（626 契约：更新一次
-// 匿名设备并重试）。三条约束：
+// fresh 注册一条本次专用身份，不进缓存。
 //
-//   - 别人已经换过（当前身份不是被拒的那条）→ 直接回当前身份，不重复注册；
-//   - 距上次续期不足 60 秒 → 不注册，回 plugin.ErrRejected（续期 ≤ 1 次/分钟）；
-//   - 在途注册优先等它落定，与 get 共用同一个 single-flight。
-func (d *deviceCache) renew(ctx context.Context, rejected deviceIdentity) (deviceIdentity, error) {
-	for {
-		d.mu.Lock()
-		cur := d.cached
-		wait := d.inflight
-		if cur != nil && cur.err == nil && cur.id != rejected {
-			d.mu.Unlock()
-			return cur.id, nil
-		}
-		if d.now().Before(d.renewAfter) {
-			d.mu.Unlock()
-			return deviceIdentity{}, fmt.Errorf("%w: 设备续期已达每分钟一次上限", plugin.ErrRejected)
-		}
-		if wait == nil {
-			d.inflight = make(chan struct{})
-			d.renewAfter = d.now().Add(deviceRetryInterval)
-			d.mu.Unlock()
-			return d.attempt(ctx)
-		}
-		d.mu.Unlock()
-		select {
-		case <-wait:
-		case <-ctx.Done():
-			return deviceIdentity{}, ctx.Err()
-		}
+// 上游把取流身份当一次性的：同一条身份第二次请求 multi_video_model 会被
+// 200 + 空体静默拒绝（MKACG-676 实测，参考实现也按「每次取流新注册」处理）。
+func (d *deviceCache) fresh(ctx context.Context) (deviceIdentity, error) {
+	id, err := d.register(ctx)
+	if err != nil {
+		return deviceIdentity{}, err
 	}
+	// 记成「上一条身份」：换身份重试时若再注册失败，备用域名还能拿它打一次
+	// （参考实现的做法：注册失败就沿用之前那条身份走备用路由）。
+	d.mu.Lock()
+	d.cached = &deviceAttempt{id: id}
+	d.mu.Unlock()
+	return id, nil
 }
 
 // attempt 是「本次调用负责发起注册」的那条路径：结果写回缓存再唤醒等待者。

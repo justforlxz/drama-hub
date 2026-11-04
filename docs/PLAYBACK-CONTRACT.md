@@ -223,6 +223,7 @@ App 通道也不可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `
 | `/api/dramas` | — | 管理 API |
 | `/api/refresh` | POST | 手动触发一轮刷新（`docs/SCHEDULER-MODEL.md`） |
 | `/api/status` | GET | 含各源调度状态（同上） |
+| `/api/playback` | GET | 正在播放的内存会话与汇总（只读；重启清空，TTL 由 `play_session_ttl_sec` 控制） |
 | `/healthz` | GET | 存活探测（不变） |
 
 ## 2.0 明确不做

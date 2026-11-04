@@ -169,6 +169,21 @@ h1 { margin: 0; font-size: var(--f-xl); font-weight: 600; line-height: 1.25; let
 .kv dt { color: var(--ink-3); font-size: var(--f-sm); }
 .kv dd { margin: 0; font-size: var(--f-sm); overflow-wrap: anywhere; }
 
+/* 「正在播放」的行（MKACG-683）：每条流一张小卡，头行是剧名与块，下面是键值对。 */
+.playback-list { display: grid; gap: var(--s2); }
+.playback-list:empty { display: none; }
+.playback-row {
+  padding: var(--s3) var(--s4);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+.playback-head {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s2);
+  margin-bottom: var(--s2);
+}
+.playback-head .card-sub { margin: 0; }
+
 /* ---- 徽标 ---- */
 
 .badge {

@@ -144,13 +144,16 @@ func TestOverviewPage(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	doc := parseDoc(t, do(t, srv, http.MethodGet, "/", "").Body.Bytes())
 
-	for _, id := range []string{"summary", "notice", "sources", "jellyfin-progress", "jellyfin-sync", "drama-form", "series-id", "drama-submit", "admin-token", "write-hint"} {
+	for _, id := range []string{"summary", "notice", "sources", "jellyfin-progress", "jellyfin-sync", "drama-form", "series-id", "drama-submit", "admin-token", "write-hint", "playback", "playback-empty"} {
 		if byID(doc, id) == nil {
 			t.Errorf("概览页缺少 #%s", id)
 		}
 	}
 	if progress := byID(doc, "jellyfin-progress"); progress != nil && !isElement(progress, "p") {
 		t.Errorf("#jellyfin-progress 是 %s, 期望 p（664 的进度行）", progress.Data)
+	}
+	if empty := byID(doc, "playback-empty"); empty != nil && !isElement(empty, "p") {
+		t.Errorf("#playback-empty 是 %s, 期望 p（空态文案）", empty.Data)
 	}
 	if form := byID(doc, "drama-form"); form != nil && !isElement(form, "form") {
 		t.Errorf("#drama-form 是 %s, 期望 form", form.Data)

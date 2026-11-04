@@ -14,6 +14,7 @@ import (
 
 	"github.com/justforlxz/drama-hub/internal/jellyfin"
 	"github.com/justforlxz/drama-hub/internal/pgtest"
+	"github.com/justforlxz/drama-hub/internal/playback"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/store"
@@ -99,7 +100,7 @@ func newTestServerWith(t *testing.T, jellyfinMgr Jellyfin) (*Server, *store.Stor
 	// 状态页的播放源清单由装配根给（生产里来自注册表），测试固定一个源。
 	sources := []Source{{Name: "web", Label: "红果官网 SSR"}}
 	return NewServer(st, store.NewSettings(db.DB), syncer, &fakeSchedule{}, jellyfinMgr, sources,
-		testAdminToken, slog.New(slog.DiscardHandler)), st, syncer
+		playback.NewTracker(time.Now), testAdminToken, slog.New(slog.DiscardHandler)), st, syncer
 }
 
 // fakeJellyfin 是媒体库维护依赖的替身：记下触发次数，现状与分类开关由用例给定。
@@ -659,7 +660,7 @@ func TestAPI_Refresh_RealScheduler(t *testing.T) {
 		map[string]scheduler.Syncer{"web": syncer},
 		slog.New(slog.DiscardHandler), nil)
 	srv := NewServer(st, settings, syncer, sched, &fakeJellyfin{}, []Source{{Name: "web", Label: "红果官网 SSR"}},
-		testAdminToken, slog.New(slog.DiscardHandler))
+		nil, testAdminToken, slog.New(slog.DiscardHandler))
 
 	if rec := do(t, srv, http.MethodPost, "/api/refresh", `{"source":"web"}`); rec.Code != http.StatusAccepted {
 		t.Fatalf("第一次手动触发状态码 = %d, 期望 202（body=%s）", rec.Code, rec.Body.String())

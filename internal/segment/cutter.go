@@ -17,6 +17,7 @@ import (
 
 	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/httpx"
+	"github.com/justforlxz/drama-hub/internal/playback"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
 )
@@ -60,6 +61,9 @@ type Cutter struct {
 	// 用哪一份由本次解析出的直链决定（见 fetchHeaders）。本包不认识任何源，
 	// 两份都由装配根注入（见 NewCutter 的 headers）。
 	headers Headers
+	// playback 是「正在播放」的内存会话表（MKACG-683）。只写不读、失败不影响出流：
+	// 记录的时机在响应写完之后，nil 时整段跳过。
+	playback *playback.Tracker
 	// ensureTimeout 是「补齐播放列表所需信息」（每个成员的直链 + 时长）的硬上限，
 	// 生产固定 ensureDeadline；测试把它调短，才能在 5 分钟测试预算里验证 503 那条路径。
 	ensureTimeout time.Duration
@@ -81,7 +85,9 @@ type Headers struct {
 //
 // headers 是 ffmpeg / ffprobe 取直链时要带的出站请求头，按通道两份：这两个子进程
 // 不走 http.Client，只能靠 `-headers`。空切片 = 该通道不带（见 Headers）。
-func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc, resolveMany ResolveManyFunc, invalidate InvalidateFunc, headers Headers) *Cutter {
+//
+// playback 是「正在播放」的会话表（MKACG-683）：播放列表与分片成功写出后各记一笔。
+func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, caches *cache.Cache, resolve ResolveFunc, resolveMany ResolveManyFunc, invalidate InvalidateFunc, headers Headers, pb *playback.Tracker) *Cutter {
 	return &Cutter{
 		st:          st,
 		settings:    settings,
@@ -92,6 +98,7 @@ func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, c
 		invalidate:  invalidate,
 		gate:        make(chan struct{}, ffmpegSlots()),
 		headers:     headers,
+		playback:    pb,
 
 		ensureTimeout: ensureDeadline,
 	}

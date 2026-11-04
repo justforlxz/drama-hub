@@ -80,6 +80,8 @@ func (s *Syncer) Name() string { return s.source.Name() }
 // —— 离线或封面域名不可达时同步不因此失败、也不写进 last_error（MKACG-620）。
 // 已有本地海报时不再回源（源图失效不影响已入库海报）。
 func (s *Syncer) SyncSeries(ctx context.Context, st *store.Store, id string) error {
+	// 同步面取数：插件出站日志据此打上 caller=sync（MKACG-683）。
+	ctx = plugin.WithCaller(ctx, plugin.CallerSync)
 	ref := plugin.WorkRef{Plugin: s.source.Name(), ID: id}
 	detail, keys, err := s.work(ctx, ref)
 	if err != nil {

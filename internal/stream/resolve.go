@@ -165,6 +165,9 @@ func waitFlight(ctx context.Context, f *flight) (Direct, error) {
 
 // fetch 向插件解析一次，不做任何缓存。
 func (r *Resolver) fetch(ctx context.Context, ep store.Episode) (plugin.Stream, error) {
+	// 播放面解析：插件出站日志据此打上 caller=play（MKACG-683）。
+	ctx = plugin.WithCaller(ctx, plugin.CallerPlay)
+
 	d, err := r.st.DramaByID(ctx, ep.DramaID)
 	if err != nil {
 		return plugin.Stream{}, fmt.Errorf("查剧集 %d 所属剧目: %w", ep.ID, err)
@@ -228,6 +231,8 @@ type SeriesResolver interface {
 // 与 Direct 共用同一份库内缓存：已过期的集不重复解析，缺的那部分才批量申请；
 // 单集能力的插件逐集解析。返回结果同时落库，后续播放直接命中。
 func (r *Resolver) DirectMany(ctx context.Context, eps []store.Episode) ([]Direct, error) {
+	// 与 Direct 同一来源标记：批量解析也是播放（MKACG-683）。
+	ctx = plugin.WithCaller(ctx, plugin.CallerPlay)
 	if len(eps) == 0 {
 		return nil, nil
 	}

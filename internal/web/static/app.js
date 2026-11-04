@@ -135,9 +135,14 @@ function initOverview() {
   const dramaForm = document.getElementById('drama-form');
   const dramaInput = document.getElementById('series-id');
   const dramaBtn = document.getElementById('drama-submit');
+  const pbSummary = document.getElementById('playback-summary');
+  const pbBadge = document.getElementById('playback-badge');
+  const pbList = document.getElementById('playback-list');
+  const pbEmpty = document.getElementById('playback-empty');
 
   let status = null; // 最近一次 /api/status：令牌改动后据此重画按钮，不必再打服务端
   let jellyfinPolling = false;
+  let playbackPolling = false;
 
   const canWrite = () => Boolean(status && status.admin_token_set && adminToken() !== '');
 
@@ -370,6 +375,87 @@ function initOverview() {
     }
   }
 
+  // ---- 正在播放（MKACG-683）----
+
+  const PLAYBACK_POLL_MS = 4000; // 页面刷新 ≤5 s，且只在可见时发请求
+
+  /** 把字节写成 B / KB / MB / GB。 */
+  function fmtBytes(n) {
+    if (typeof n !== 'number' || n < 0) return '—';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+    return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  }
+
+  /** 把秒写成「分:秒」。 */
+  function fmtClock(sec) {
+    const s = Math.max(0, Math.floor(sec || 0));
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  function playbackRow(s) {
+    const title = s.title === '' ? '未知剧目' : s.title;
+    const unit = s.unit === '' ? '未知块' : s.unit;
+    const seq = s.slices > 0 ? '第 ' + (s.seq + 1) + '/' + s.slices + ' 片' : '第 ' + (s.seq + 1) + ' 片';
+    const pos = s.total_sec > 0
+      ? fmtClock(s.position_sec) + '/' + fmtClock(s.total_sec)
+      : fmtClock(s.position_sec);
+    return el('article', { class: 'playback-row' },
+      el('div', { class: 'playback-head' },
+        el('strong', { text: title }),
+        el('span', { class: 'card-sub', text: unit + ' · ' + seq })),
+      el('dl', { class: 'kv' },
+        el('dt', { text: '进度' }), el('dd', { text: pos }),
+        el('dt', { text: '已出' }), el('dd', { text: fmtBytes(s.bytes_served) }),
+        el('dt', { text: '客户端' }), el('dd', { text: s.client_ip === '' ? '—' : s.client_ip }),
+        el('dt', { text: 'UA' }), el('dd', { title: s.user_agent, text: s.user_agent === '' ? '—' : s.user_agent }),
+        el('dt', { text: '最后活跃' }), el('dd', { title: s.last_seen, text: fmtTime(s.last_seen) })));
+  }
+
+  function renderPlayback(pb) {
+    const n = pb.streams;
+    pbSummary.textContent = n === 0
+      ? '没有客户端在拉流'
+      : n + ' 条流 · ' + pb.clients + ' 个客户端 · 已出 ' + fmtBytes(pb.bytes);
+    pbBadge.textContent = n === 0 ? '空闲' : n + ' 条流';
+    pbBadge.dataset.tone = n === 0 ? 'muted' : 'ok';
+    pbEmpty.hidden = n !== 0;
+    pbList.replaceChildren(...pb.sessions.map(playbackRow));
+  }
+
+  async function loadPlayback() {
+    try {
+      renderPlayback(await api('GET', '/api/playback'));
+    } catch (err) {
+      // 快照读失败只影响这一块：页面其余部分照常。
+      pbSummary.textContent = '读取失败';
+      pbBadge.textContent = '失败';
+      pbBadge.dataset.tone = 'danger';
+      pbEmpty.hidden = true;
+      pbList.replaceChildren(el('p', { class: 'state', 'data-state': 'error', text: err.message }));
+    }
+  }
+
+  // 轮询链只有一个：每 4 s 读一次快照；页面不可见时不发请求，切回来立刻续上。
+  async function followPlayback() {
+    if (playbackPolling) return;
+    playbackPolling = true;
+    try {
+      for (;;) {
+        if (document.hidden) break;
+        await loadPlayback();
+        await sleep(PLAYBACK_POLL_MS);
+      }
+    } finally {
+      playbackPolling = false;
+    }
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) followPlayback();
+  });
+
   function updateWritable() {
     if (!status) return;
     const ready = canWrite();
@@ -452,6 +538,7 @@ function initOverview() {
   if (tokenInput) tokenInput.addEventListener('input', updateWritable);
 
   load();
+  followPlayback();
 }
 
 // ---- 设置 ----

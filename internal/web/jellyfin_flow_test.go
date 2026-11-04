@@ -56,7 +56,7 @@ func TestAPI_JellyfinSyncFlow(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	srv := NewServer(store.NewStore(db.DB), store.NewSettings(db.DB), &fakeSyncer{}, &fakeSchedule{}, mgr,
-		[]Source{{Name: "web", Label: "红果官网 SSR"}}, testAdminToken, slog.New(slog.DiscardHandler))
+		[]Source{{Name: "web", Label: "红果官网 SSR"}}, nil, testAdminToken, slog.New(slog.DiscardHandler))
 
 	// 页面上的「正在跑」= 轮询 GET 读到的 running。AC-1 要求点下之后 2 秒内可见。
 	start := time.Now()

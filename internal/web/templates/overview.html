@@ -34,6 +34,21 @@
   </section>
 </div>
 
+<section class="card" id="playback" aria-labelledby="playback-title">
+  <header class="card-head">
+    <div>
+      <h2 id="playback-title">正在播放</h2>
+      <p class="card-sub" id="playback-summary">读取中…</p>
+    </div>
+    <span class="badge" data-tone="muted" id="playback-badge">读取中</span>
+  </header>
+  <div class="card-body">
+    <p class="state" data-state="empty" id="playback-empty">当前没有播放</p>
+    <div class="playback-list" id="playback-list"></div>
+    <p class="hint">会话只存在内存里，服务重启即清空；超过「播放会话保留时长」没有请求就自动消失。同步轮次取数不算播放。</p>
+  </div>
+</section>
+
 <details class="card" id="lookup">
   <summary>补录 / 查一部剧</summary>
   <div class="card-body">

@@ -948,7 +948,7 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 			return out, nil
 		},
 		func(context.Context, int64) error { return nil },
-		playbackHeaders(nil))
+		playbackHeaders(nil), nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
 	tree := vfs.NewTree(st, settings, stream.ID, nil, logger)

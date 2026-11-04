@@ -16,6 +16,7 @@ import (
 	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/httpx"
 	"github.com/justforlxz/drama-hub/internal/jellyfin"
+	"github.com/justforlxz/drama-hub/internal/playback"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
@@ -205,7 +206,9 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // （`名称: 值` 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624 / MKACG-638）：
 // 本函数不认识具体源。
 func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, jellyfinMgr web.Jellyfin, sources []web.Source, caches *cache.Cache, covers *cache.CoverCache, resolver *stream.Resolver, tree *vfs.Tree, playbackHeaders segment.Headers, adminToken string) http.Handler {
-	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, resolver.DirectMany, resolver.Invalidate, playbackHeaders)
+	// 播放会话表（MKACG-683）：播放面写、管理面读，同一实例在装配根创建。
+	playbackTracker := playback.NewTracker(time.Now)
+	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, resolver.DirectMany, resolver.Invalidate, playbackHeaders, playbackTracker)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
@@ -217,7 +220,7 @@ func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, 
 	// 播放面两条路由由 internal/segment 自己提供（领域包只提供 handler，挂载点在此）。
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
 	mux.HandleFunc(segment.SegmentRoute, cutter.ServeSegment)
-	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, jellyfinMgr, sources, adminToken, logger))
+	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, jellyfinMgr, sources, playbackTracker, adminToken, logger))
 	return httpx.RequestLogger(logger, mux)
 }
 

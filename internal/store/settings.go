@@ -72,6 +72,9 @@ const (
 	// 它不属于「插件构造期配置」，而是每次取流现读的凭据（热改即生效），前缀模式
 	// 表达不了这个语义。空 = 匿名（只播免费集）；非空即按原样作为 Cookie 头发出。
 	KeyHongguoCookie SettingKey = "hongguo_cookie"
+	// KeyPlaySessionTTL 是「正在播放」会话的保留时长（秒，默认 120，范围 30–3600）。
+	// 每次播放请求现读：改完下一片即按新值回收（MKACG-683）。
+	KeyPlaySessionTTL SettingKey = "play_session_ttl_sec"
 )
 
 // 插件配置的项名（docs/PLUGIN-CONTRACT.md「配置」）。
@@ -471,6 +474,10 @@ func specFor(key SettingKey) (settingSpec, bool) {
 		// 站点登录态（Cookie 串）：空 = 匿名，只播免费集；非空即原样发往站点。
 		// 属密钥：PATCH /api/settings 回 null，不进日志与错误文本（MKACG-676）。
 		return settingSpec{kind: kindToken}, true
+	case KeyPlaySessionTTL:
+		// 「正在播放」会话的保留时长：短于 30 s 会把正常缓冲误判成停止，
+		// 长于 1 h 则过期会话长期占着页面（MKACG-683）。
+		return settingSpec{kind: kindInt, def: "120", min: 30, max: 3600}, true
 	}
 	return pluginSpecFor(string(key))
 }

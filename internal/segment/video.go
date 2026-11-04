@@ -74,6 +74,8 @@ func (c *Cutter) ServePlaylist(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+	// 响应已写完再记会话：采集在任何情况下都不能影响出流。
+	c.recordOpen(ctx, r, uid, u.eps)
 }
 
 // ServeSegment 实现 `GET /video/{id}/{seq}.m4s`：鉴权 → 定位第 seq 集 → 缓存命中即回 /
@@ -184,6 +186,8 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(served))
+	// 分片已经出流，再记进度（位置取本片在单元时间轴上的起点）。
+	c.recordProgress(ctx, r, uid, seq, int(start.Seconds()), int64(len(served)))
 }
 
 // timelineStart 返回第 seq 片在播放单元时间轴上的起点（前面各集的 duration_sec 之和），

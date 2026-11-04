@@ -12,6 +12,7 @@ import (
 
 	"github.com/justforlxz/drama-hub/internal/httpx"
 	"github.com/justforlxz/drama-hub/internal/jellyfin"
+	"github.com/justforlxz/drama-hub/internal/playback"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
@@ -53,6 +54,9 @@ type Server struct {
 	schedule Schedule
 	jellyfin Jellyfin
 	sources  []Source
+	// playback 是「正在播放」的内存会话表（MKACG-683），只读快照给 /api/playback。
+	// 采集在 internal/segment，本包不写它。
+	playback *playback.Tracker
 	// adminToken 是写操作的令牌（DRAMA_HUB_ADMIN_TOKEN）。空 = 没配 = 写操作一律 401。
 	adminToken string
 	logger     *slog.Logger
@@ -90,7 +94,7 @@ type Schedule interface {
 //
 // 写操作（非 GET/HEAD/OPTIONS）在 ServeHTTP 里先过令牌，路由表本身不重复这件事：
 // 新增写端点不需要记得加鉴权，忘不了。
-func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, schedule Schedule, jellyfinMgr Jellyfin, sources []Source, adminToken string, logger *slog.Logger) *Server {
+func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, schedule Schedule, jellyfinMgr Jellyfin, sources []Source, pb *playback.Tracker, adminToken string, logger *slog.Logger) *Server {
 	s := &Server{
 		st:         st,
 		settings:   settings,
@@ -98,6 +102,7 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 		schedule:   schedule,
 		jellyfin:   jellyfinMgr,
 		sources:    sources,
+		playback:   pb,
 		adminToken: adminToken,
 		logger:     logger,
 		mux:        http.NewServeMux(),
@@ -114,6 +119,8 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 	s.mux.HandleFunc("POST /api/dramas", s.handleCreateDrama)
 	s.mux.HandleFunc("POST /api/refresh", s.handleRefresh)
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
+	// 「正在播放」快照：纯内存只读，GET 不过令牌闸门（MKACG-683）。
+	s.mux.HandleFunc("GET /api/playback", s.handlePlayback)
 	s.mux.HandleFunc("PATCH /api/settings", s.handlePatchSettings)
 	// 建库是写操作：令牌闸门在 ServeHTTP 里统一过，这里不重复。
 	s.mux.HandleFunc("POST /api/jellyfin/libraries", s.handleJellyfinLibraries)

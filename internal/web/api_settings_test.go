@@ -68,7 +68,7 @@ func TestAPI_WriteEndpointsRequireToken(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = db.Close() })
 		srv := NewServer(store.NewStore(db.DB), store.NewSettings(db.DB), &fakeSyncer{}, &fakeSchedule{},
-			&fakeJellyfin{}, nil, "", slog.New(slog.DiscardHandler))
+			&fakeJellyfin{}, nil, nil, "", slog.New(slog.DiscardHandler))
 		req := httptest.NewRequest(http.MethodPatch, "/api/settings",
 			strings.NewReader(`{"settings":{"webdav_user":"alice"}}`))
 		rec := httptest.NewRecorder()

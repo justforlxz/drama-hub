@@ -481,6 +481,11 @@ func (p *Plugin) fetch(ctx context.Context, logPath, rawURL string, limit int64)
 		out = o
 		fields := []any{"plugin", Name, "path", logPath, "upstream_status", o.status,
 			"bytes", o.bytes, "duration_ms", o.elapsed.Milliseconds(), "attempt", attempt}
+		// 调用来源（sync / play）由框架入口打在 ctx 上（MKACG-683）：没有标记的
+		// 路径（启动期探测等）不追加空字段。
+		if caller := plugin.CallerOf(ctx); caller != "" {
+			fields = append(fields, "caller", caller)
+		}
 		if err == nil {
 			if attempt == 1 {
 				p.logger.InfoContext(ctx, "上游请求", fields...)
@@ -508,9 +513,12 @@ func (p *Plugin) fetch(ctx context.Context, logPath, rawURL string, limit int64)
 			return nil, werr
 		}
 	}
-	p.logger.WarnContext(ctx, "上游请求重试次数用尽",
-		"plugin", Name, "path", logPath, "upstream_status", out.status, "bytes", out.bytes,
-		"duration_ms", out.elapsed.Milliseconds(), "attempts", fetchAttempts, "reason", out.reason)
+	exhausted := []any{"plugin", Name, "path", logPath, "upstream_status", out.status, "bytes", out.bytes,
+		"duration_ms", out.elapsed.Milliseconds(), "attempts", fetchAttempts, "reason", out.reason}
+	if caller := plugin.CallerOf(ctx); caller != "" {
+		exhausted = append(exhausted, "caller", caller)
+	}
+	p.logger.WarnContext(ctx, "上游请求重试次数用尽", exhausted...)
 	return nil, fmt.Errorf("%w（已尝试 %d 次，最后一次耗时 %dms）",
 		last, fetchAttempts, out.elapsed.Milliseconds())
 }

@@ -392,7 +392,7 @@ func newRig(t *testing.T) *rig {
 				out[i] = d
 			}
 			return out, nil
-		}, r.invalidate, Headers{Web: testWebHeaders, App: testAppHeaders})
+		}, r.invalidate, Headers{Web: testWebHeaders, App: testAppHeaders}, nil)
 	return r
 }
 

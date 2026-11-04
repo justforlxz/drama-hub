@@ -25,6 +25,9 @@ type fakeSource struct {
 
 	mu    sync.Mutex
 	calls []string
+	// callers 与 calls 一一对应：记录每次 Resolve 看到的 caller 标记
+	// （MKACG-683：播放面必须打 caller=play）。
+	callers []string
 }
 
 // callsCount 返回 Resolve 的调用次数（调用方可能并发，读也要加锁）。
@@ -44,9 +47,10 @@ func (f *fakeSource) Work(context.Context, plugin.WorkRef) (plugin.WorkDetail, e
 	return plugin.WorkDetail{}, nil
 }
 
-func (f *fakeSource) Resolve(_ context.Context, ref plugin.WorkRef, epNo int) (plugin.Stream, error) {
+func (f *fakeSource) Resolve(ctx context.Context, ref plugin.WorkRef, epNo int) (plugin.Stream, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, ref.ID)
+	f.callers = append(f.callers, plugin.CallerOf(ctx))
 	f.mu.Unlock()
 	if f.err != nil {
 		return plugin.Stream{}, f.err
@@ -592,5 +596,35 @@ func TestDirectManyCrossDrama(t *testing.T) {
 	}
 	if len(src.batches) != 0 {
 		t.Fatalf("批量调用 = %v, 期望校验失败时不外呼", src.batches)
+	}
+}
+
+// TestDirectMarksCallerPlay 覆盖 MKACG-683 的 caller 标记：播放面无论是单集
+// Direct 还是批量 DirectMany，进到插件时 ctx 里都必须带 caller=play。
+// 缓存命中不解析、也就不打日志，因此这里用两集都未落库的首次解析。
+func TestDirectMarksCallerPlay(t *testing.T) {
+	src := &fakeSource{name: "web", byEp: map[int]plugin.Stream{
+		1: {URL: "https://cdn.example/1.mp4"},
+		2: {URL: "https://cdn.example/2.mp4"},
+	}}
+	r, _, eps := newResolveRig(t, src)
+
+	if _, err := r.Direct(context.Background(), eps[0]); err != nil {
+		t.Fatalf("Direct: %v", err)
+	}
+	if _, err := r.DirectMany(context.Background(), []store.Episode{eps[1]}); err != nil {
+		t.Fatalf("DirectMany: %v", err)
+	}
+
+	src.mu.Lock()
+	got := append([]string(nil), src.callers...)
+	src.mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("插件被调用 %d 次, 期望 2（Direct 与 DirectMany 各一次）", len(got))
+	}
+	for i, caller := range got {
+		if caller != plugin.CallerPlay {
+			t.Errorf("第 %d 次调用的 caller = %q, 期望 %q", i+1, caller, plugin.CallerPlay)
+		}
 	}
 }

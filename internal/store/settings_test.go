@@ -866,3 +866,28 @@ func TestJellyfinSettings(t *testing.T) {
 		}
 	})
 }
+
+// 播放会话 TTL（MKACG-683）：默认 120 秒；低于 30 或高于 3600 不落库。
+//
+// 真值在 docs/DEV-STANDARDS.md「配置」表；采集侧每请求现读，所以改完立刻生效。
+func TestPlaySessionTTLSettings(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	if got, err := s.Int(ctx, KeyPlaySessionTTL); err != nil || got != 120 {
+		t.Fatalf("play_session_ttl_sec 默认 = %d, %v, 期望 120", got, err)
+	}
+	if err := s.Set(ctx, KeyPlaySessionTTL, "10"); !errors.Is(err, ErrInvalidSetting) {
+		t.Errorf("Set(10) = %v, 期望 ErrInvalidSetting（下限 30）", err)
+	}
+	if err := s.Set(ctx, KeyPlaySessionTTL, "4000"); !errors.Is(err, ErrInvalidSetting) {
+		t.Errorf("Set(4000) = %v, 期望 ErrInvalidSetting（上限 3600）", err)
+	}
+	if err := s.Set(ctx, KeyPlaySessionTTL, "600"); err != nil {
+		t.Fatalf("Set(600) = %v, 期望通过", err)
+	}
+	if got, err := s.Int(ctx, KeyPlaySessionTTL); err != nil || got != 600 {
+		t.Errorf("Set(600) 后读回 = %d, %v, 期望 600", got, err)
+	}
+}

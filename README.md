@@ -71,6 +71,7 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | `/static/app.css`、`/static/app.js` | GET | 200 | 内嵌样式与脚本（随二进制，无构建步骤） |
 | `/api/dramas` | GET / POST | 200 / 200·201 | 剧目列表（含计数）/ 按上游剧 id 同步入库：**新建 201、已存在（只更新）200** |
 | `/api/status` | GET | 200 | 同步计数、运行配置现状（含各键的现读值；密钥只报「是否已设置」）、各源调度状态、`jellyfin` 块（媒体库同步现状：配置、上次结果、运行中进度、孤儿库；API key 只报 `api_key_set`）、`admin_token_set`（写操作能不能用） |
+| `/api/playback` | GET | 200 | 正在播放（只读、纯内存会话）：`sessions` 为当前几条流，每条带 uid、剧名、集号或合并块范围、已请求到第几片、播放位置/总时长、已出字节、客户端 IP 与 UA、首末活跃时间；`streams`/`clients`/`bytes` 是汇总，没有播放时 `sessions` 为 `[]`。会话超过 settings `play_session_ttl_sec` 无活动即回收，重启清空；同步轮次不计入 |
 | `/api/jellyfin/libraries` | GET / POST | 200 / 202 / 400 / 401 / 409 | GET = 一轮媒体库同步的现状与进度（`running` / `phase_label` / `processed` / `total` / `started_at`；收尾后 `created` / `unchanged` / `removed` / `duration_ms` / `delete_failed`），页面每秒轮询它、不碰 drama 表；POST = 手动跑一轮（无 body 参数，删不删库由分类开关决定）；400 = 三项配置没配齐（点名缺哪个键），409 = 上一轮还在跑（接着 GET 看那一轮进度） |
 | `/api/jellyfin/categories` | GET / PATCH | 200 / 400 / 401 | GET = 全部分类 + 开关状态（`{"categories":[{"name","enabled"}]}`）；PATCH = 开关一个分类（`{"name":"都市","enabled":false}`），只写库、不碰 Jellyfin |
 | `/api/settings` | PATCH | 200 / 400 / 401 | 按 key 批量写配置：`{"settings":{"<key>":"<值>"}}` → 归一化后的值；未知键 / 非法值 400 且整批不落库；写操作要 `X-Admin-Token` |
@@ -116,7 +117,7 @@ PTS（ADR-0011）。
 
 | 页面 | 能干的事 |
 |---|---|
-| `/` 概览 | 摘要条（剧/集/对外集计数与最近同步时间）、每个播放源一张卡片（状态徽标、上次运行/成功/下次计划、上次错误、立即刷新）、Jellyfin 卡片（状态徽标、同步进度与上次结果、分类开关列表、孤儿/冲突/被拒分类、同步媒体库）、默认收起的「补录 / 查一部剧」 |
+| `/` 概览 | 摘要条（剧/集/对外集计数与最近同步时间）、「正在播放」（当前几条流、剧名与集/块、进度、已出字节、客户端，没有播放时明确写「当前没有播放」，每 4 秒且仅在页面可见时刷新）、每个播放源一张卡片（状态徽标、上次运行/成功/下次计划、上次错误、立即刷新）、Jellyfin 卡片（状态徽标、同步进度与上次结果、分类开关列表、孤儿/冲突/被拒分类、同步媒体库）、默认收起的「补录 / 查一部剧」 |
 | `/settings` 设置 | 一个表单、一个「保存」：访问（WebDAV 账号密码 / strm 前缀）、同步与刷新、合并与对外集号、缓存、Jellyfin，每项带生效时机徽标；底部可折叠「只读运行参数」（缓存目录 / 每轮存量 / 单轮预算 / 密钥与凭据是否已设置） |
 
 页面里的每个操作都直接落到上面的 `/api/` 端点，渲染结果与 API 返回一致；补录走

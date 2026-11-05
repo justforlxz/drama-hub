@@ -1,52 +1,87 @@
 {{define "content"}}
-<section class="page-head">
-  <h1>概览</h1>
-  <p class="summary" id="summary">读取中…</p>
-</section>
-<p class="notice" id="notice" role="status" aria-live="polite"></p>
-<p class="hint" id="write-hint"></p>
-
-<div class="columns">
-  <div class="stack" id="sources" aria-label="播放源">
-    <p class="state" data-state="loading">读取中…</p>
+<div class="page-head">
+  <div>
+    <h1 class="page-title">概览</h1>
+    <p class="page-desc">系统状态、内容同步的时间线与正在播放的流。</p>
   </div>
+</div>
+<p class="notice" id="notice" role="status" aria-live="polite"></p>
+<p class="write-hint" id="write-hint"></p>
 
-  <section class="card" aria-labelledby="jellyfin-title">
-    <header class="card-head">
+<section class="card health-card" id="system-status" aria-label="系统状态">
+  <div class="health-top">
+    <div class="health-lead">
+      <span class="health-icon" id="system-badge" aria-hidden="true">·</span>
       <div>
-        <h2 id="jellyfin-title">Jellyfin 媒体库</h2>
-        <p class="card-sub" id="jellyfin-when">读取中…</p>
+        <div class="health-title" id="system-title">正在读取系统状态…</div>
+        <div class="health-sub" id="system-copy">稍候</div>
       </div>
-      <span class="badge" data-tone="muted" id="jellyfin-badge">读取中</span>
-    </header>
-    <div class="card-body">
-      <p class="notice" id="jellyfin-progress"></p>
-      <div class="switch-list" id="jellyfin-categories" aria-label="按分类启用的媒体库">
-        <p class="state" data-state="loading">读取中…</p>
-      </div>
-      <div class="issues" id="jellyfin-issues"></div>
-      <p class="hint">一分类一库；关掉的分类会在下一轮同步时删掉对应的库（点「同步媒体库」则当场删）。分类消失只列成「孤儿库」，不会删。</p>
     </div>
-    <footer class="card-foot">
-      <button type="button" class="btn primary" id="jellyfin-sync">同步媒体库</button>
-      <p class="hint" id="jellyfin-hint"></p>
-    </footer>
+    <span class="updated" id="system-note"></span>
+  </div>
+  <div class="health-services">
+    <div class="health-service">
+      <span class="dot" data-tone="muted"></span>
+      <div>
+        <div class="service-name">内容同步</div>
+        <div class="service-value" id="sync-state">读取中…</div>
+      </div>
+    </div>
+    <div class="health-service">
+      <span class="dot" data-tone="muted"></span>
+      <div>
+        <div class="service-name">播放源</div>
+        <div class="service-value" id="source-state">读取中…</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="overview-grid">
+  <section class="card summary-card" id="sync-card" aria-labelledby="sync-card-title">
+    <div class="card-heading">
+      <div>
+        <h2 class="card-title" id="sync-card-title">内容同步</h2>
+        <p class="card-description">播放源扫描与剧库写入。</p>
+      </div>
+      <span class="badge" data-tone="muted" id="sync-badge">读取中</span>
+    </div>
+    <div class="metric-grid">
+      <div>
+        <div class="metric-label">剧</div>
+        <div class="metric-value" id="summary-dramas">—</div>
+        <div class="metric-hint">部</div>
+      </div>
+      <div>
+        <div class="metric-label">集</div>
+        <div class="metric-value" id="summary-episodes">—</div>
+        <div class="metric-hint">集</div>
+      </div>
+      <div>
+        <div class="metric-label">对外集</div>
+        <div class="metric-value" id="summary-emby">—</div>
+        <div class="metric-hint">个</div>
+      </div>
+    </div>
+    <p class="metrics-line" id="summary">最近同步 —</p>
+    <dl class="kv kv-inline">
+      <div><dt>最近运行</dt><dd id="sync-last-run">—</dd></div>
+      <div><dt>最近成功</dt><dd id="sync-last-ok">—</dd></div>
+      <div><dt>下次计划</dt><dd id="sync-next">—</dd></div>
+    </dl>
+  </section>
+
+  <section class="card summary-card" id="playback" aria-labelledby="playback-title">
+    <div class="card-heading">
+      <div>
+        <h2 class="card-title" id="playback-title">正在播放</h2>
+        <p class="card-description" id="playback-summary">读取中…</p>
+      </div>
+      <span class="badge" data-tone="muted" id="playback-badge">读取中</span>
+    </div>
+    <div class="play-count"><strong id="playback-streams">0</strong><span>条活跃流</span></div>
+    <p class="empty" id="playback-empty" data-state="empty">当前没有播放</p>
+    <div class="playback-list" id="playback-list"></div>
   </section>
 </div>
-
-<section class="card" id="playback" aria-labelledby="playback-title">
-  <header class="card-head">
-    <div>
-      <h2 id="playback-title">正在播放</h2>
-      <p class="card-sub" id="playback-summary">读取中…</p>
-    </div>
-    <span class="badge" data-tone="muted" id="playback-badge">读取中</span>
-  </header>
-  <div class="card-body">
-    <p class="state" data-state="empty" id="playback-empty">当前没有播放</p>
-    <div class="playback-list" id="playback-list"></div>
-    <p class="hint">会话只存在内存里，服务重启即清空；超过「播放会话保留时长」没有请求就自动消失。同步轮次取数不算播放。</p>
-  </div>
-</section>
-
 {{end}}

@@ -126,10 +126,6 @@ FROM runtime AS e2e
 
 USER root
 
-# node 只用于跑 static/paging.js 的表驱动单测（web 包 TestPagingContract），
-# 不进 runtime 镜像：浏览器端没有构建步骤，这段 JS 是直接嵌进二进制的源码。
-RUN apk add --no-cache nodejs
-
 COPY --from=testbin /out/tests /usr/local/bin/tests
 COPY --from=build /src/scripts/run-tests.sh /usr/local/bin/run-tests
 RUN chmod 0755 /usr/local/bin/run-tests \

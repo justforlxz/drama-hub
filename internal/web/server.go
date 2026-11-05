@@ -138,11 +138,10 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 
 	// 页面与静态资源：模板与 CSS/JS 随二进制嵌入（ADR-0002，无构建步骤）。
 	// 页面集合见 pages.go 的 pageMetaOf；未登记路径（含旧的 /status）由 ServeMux 兜底 404。
+	// 三个页面（MKACG-688）：概览、同步、设置。旧剧库 / 剧详情 / 分类页已移除，
+	// 不注册路由即 404（显式路由，不做 catch-all，也不做重定向）。
 	s.mux.HandleFunc("GET /{$}", s.handlePage("overview"))
-	// 剧库、剧详情、分类：剧详情带路径参数，因此单独注册（显式路由，不做 catch-all）。
-	s.mux.HandleFunc("GET /library", s.handlePage("library"))
-	s.mux.HandleFunc("GET /library/{id}", s.handleDramaPage)
-	s.mux.HandleFunc("GET /categories", s.handlePage("categories"))
+	s.mux.HandleFunc("GET /sync", s.handlePage("sync"))
 	s.mux.HandleFunc("GET /settings", s.handlePage("settings"))
 	s.mux.HandleFunc("GET /static/{file}", s.handleStatic)
 

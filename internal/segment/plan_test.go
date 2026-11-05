@@ -66,7 +66,7 @@ func TestFFmpegSlots(t *testing.T) {
 // TestCutter_Gate 覆盖并发闸语义：占满后在 acquire 处排队，释放后放行，
 // ctx 取消时放弃排队（不泄漏、不丢弃）。
 func TestCutter_Gate(t *testing.T) {
-	c := &Cutter{gate: make(chan struct{}, 1)}
+	c := &Cutter{gate: newFFmpegGate(1)}
 	c.acquire(t.Context())
 	// 闸已占满：第二次 acquire 应排队并因子 ctx 取消而放弃（不阻塞、不丢弃）。
 	ctx, cancel := context.WithCancel(context.Background())

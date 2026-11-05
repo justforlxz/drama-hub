@@ -277,6 +277,13 @@ func (f *fakeCDN) setHang() {
 	f.mu.Unlock()
 }
 
+// releaseHang 让之后的新请求恢复正常；已经挂起的请求仍等自己的 ctx 结束。
+func (f *fakeCDN) releaseHang() {
+	f.mu.Lock()
+	f.hanging = false
+	f.mu.Unlock()
+}
+
 // heal 模拟「上游换了一条能用的直链」：不再拒绝，并给 url() 换一个查询串。
 // rig 的 invalidate 钩子用它，让「作废 + 重解析一次」拿到与旧链不同的新链。
 func (f *fakeCDN) heal() {

@@ -100,6 +100,9 @@ func (c *Cache) evictExpired(ctx context.Context, before time.Time) error {
 // evictOverLimit 按 last_used_at 升序删分片，直到 SUM(bytes) 落回 maxBytes 内
 // （docs/CACHE-MODEL.md「淘汰」第 2 步）。
 //
+// 两轮优先级（MKACG-682）：先只清「预热但没播过」（prefetched=true）的分片 ——
+// 那是最该丢的字节；清完还不够才动用户真正播放过的缓存。轮内仍按 last_used_at 升序。
+//
 // 每批重新问一次总量（不用本地累加）：行里的 bytes 与实际文件大小可能已经被外部
 // 改动过，累加会漂移；重问一次是同一张表的一次聚合，代价可忽略。
 func (c *Cache) evictOverLimit(ctx context.Context, maxBytes int64) error {
@@ -111,9 +114,15 @@ func (c *Cache) evictOverLimit(ctx context.Context, maxBytes int64) error {
 		if total <= maxBytes {
 			return nil
 		}
-		rows, err := c.st.ListArtifactsOldest(ctx, store.ArtifactKindSegment, evictBatch)
+		rows, err := c.st.ListArtifactsOldestPrefetched(ctx, store.ArtifactKindSegment, evictBatch)
 		if err != nil {
 			return err
+		}
+		if len(rows) == 0 {
+			rows, err = c.st.ListArtifactsOldest(ctx, store.ArtifactKindSegment, evictBatch)
+			if err != nil {
+				return err
+			}
 		}
 		if len(rows) == 0 {
 			return nil // 没有行可删了：总量只来自这张表，走到这里说明并发写入刚把它清空

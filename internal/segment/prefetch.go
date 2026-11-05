@@ -90,6 +90,8 @@ func (c *Cutter) StartPrefetch(ctx context.Context) {
 // 不再等它跑完）。换剧不走这里 —— 换剧只关 stop，在途批用旧任务自己的 ctx 跑完，
 // 解析所有权不会被取消，前台等同一集的请求不会读到 context.Canceled。
 func (c *Cutter) StopPrefetch() {
+	c.stopSegmentPrefetch()
+
 	c.pfMu.Lock()
 	run := c.pfRun
 	c.pfRun = nil
@@ -305,7 +307,7 @@ func (c *Cutter) prefetchBatch(ctx context.Context, b prefetchBatch, retrySec in
 // 只在这时候做：ffmpeg 闸空闲（有前台转封装在跑就让路，预取不抢前台的进程槽位）、
 // 该集时长仍为 0。失败只记 debug：下一次播放列表仍会按原路径现探测，功能不受影响。
 func (c *Cutter) backfillPrefetchDurations(ctx context.Context, eps []store.Episode, directs []stream.Direct) {
-	if len(c.gate) != 0 {
+	if c.gate.busy() {
 		return
 	}
 	for i, ep := range eps {

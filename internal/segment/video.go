@@ -71,8 +71,23 @@ func (c *Cutter) ServePlaylist(w http.ResponseWriter, r *http.Request) {
 	// 时间轴已就绪：为整部剧起一次后台预取（非阻塞、失败不影响本次响应，ADR-0017）。
 	// 分片端点不触发：拖动会让它反复重启任务，而播放列表本来就是一次播放的起点。
 	c.kickPrefetch(u.eps[0].DramaID, u.eps)
+	// 记录播放入口时间：分片预热的「前台是否已静默」以它为准。先于 kick：
+	// 进程首次播放时 lastPlay 还是 0，预热会在空闲判定处直接退出。
+	c.markPlayed()
+	// 同一个起点再起分片预热（MKACG-682）：当前块剩余成员 + 后面 N 个块。
+	c.kickSegmentPrefetch(uid, u.eps)
 
 	body := BuildPlaylist(id, tl.slices)
+	etag := playlistETag(body)
+	// m3u8 文本不落服务端缓存（纯函数、<1ms，见 docs/CACHE-MODEL.md），但可以让客户端
+	// 复用并做条件请求：内容只由播放单元与时长决定，ETag 用正文哈希，内容一变就变。
+	// no-cache = 每次使用前必须回源校验，命中 304 时仍拿得到最新播放列表。
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "no-cache")
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
@@ -190,6 +205,7 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(served))
 	// 分片已经出流，再记进度（位置取本片在单元时间轴上的起点）。
+	c.markPlayed()
 	c.recordProgress(ctx, r, uid, seq, int(start.Seconds()), int64(len(served)))
 }
 

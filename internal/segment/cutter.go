@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/cache"
@@ -57,7 +58,7 @@ type Cutter struct {
 	resolveMany ResolveManyFunc
 	// invalidate 作废某集的直链（CDN 拒绝时用一次，只作废这一集）。
 	invalidate InvalidateFunc
-	gate       chan struct{}
+	gate       *ffmpegGate
 	// headers 是取直链时传给 ffmpeg / ffprobe 的出站身份，两个通道各一份；
 	// 用哪一份由本次解析出的直链决定（见 fetchHeaders）。本包不认识任何源，
 	// 两份都由装配根注入（见 NewCutter 的 headers）。
@@ -73,6 +74,13 @@ type Cutter struct {
 	pfCtx context.Context
 	pfMu  sync.Mutex
 	pfRun *prefetchRun
+	// 分片预热（MKACG-682）：按播放单元（uid）单飞，只预热当前块的剩余成员与后面
+	// segment_prefetch_blocks 个块。生命周期同样挂在 pfCtx 上，由 spMu 保护。
+	spMu  sync.Mutex
+	spRun *segmentPrefetchRun
+	// lastPlay 是最近一次播放入口请求的时间（unix nano）：播放列表与分片成功都会刷新。
+	// 分片预热用它判断「前台是否已经静默」（播放结束 / 客户端断开），静默就不再生新分片。
+	lastPlay atomic.Int64
 }
 
 // Headers 是 `ffmpeg` / `ffprobe` 取直链时的出站身份（`名称: 值` 每项一行），
@@ -102,7 +110,7 @@ func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, c
 		resolve:     resolve,
 		resolveMany: resolveMany,
 		invalidate:  invalidate,
-		gate:        make(chan struct{}, ffmpegSlots()),
+		gate:        newFFmpegGate(ffmpegSlots()),
 		headers:     headers,
 		playback:    pb,
 
@@ -136,17 +144,10 @@ func ffmpegSlots() int {
 	}
 }
 
-// acquire 在并发闸上排队；ctx 取消时放弃排队。
-func (c *Cutter) acquire(ctx context.Context) error {
-	select {
-	case c.gate <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
+// acquire 在前台并发闸上排队；ctx 取消时放弃排队。前台优先于后台预热（见 ffmpegGate）。
+func (c *Cutter) acquire(ctx context.Context) error { return c.gate.acquire(ctx) }
 
-func (c *Cutter) release() { <-c.gate }
+func (c *Cutter) release() { c.gate.release() }
 
 // ensureDeadline 是「补齐播放列表所需信息」的硬上限（docs/PLAYBACK-CONTRACT.md：
 // 30 s，超时 503 + Retry-After）。只有第一次播放某个 uid 时会走到 ffprobe。

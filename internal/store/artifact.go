@@ -19,6 +19,10 @@ const (
 // Path 是相对或绝对的本地文件路径，Bytes 是文件大小（供淘汰算总量），SHA256 是
 // 内容哈希（分片用），LastUsedAt 是不透明 TEXT（UTC RFC3339），语义同 Drama.SyncAt。
 // 表里不存上游 URL：key 是内容/身份哈希、path 是本地路径，换链不会留下痕迹。
+//
+// Prefetched 是「后台预热生成、还没有被任何一次播放请求用过」的标记：容量吃紧时
+// 这类分片**先被淘汰**，不挤掉用户真正看过的缓存（docs/CACHE-MODEL.md「淘汰」）。
+// 前台命中或前台生成成功会把它清回 false（MarkArtifactPlayed）。
 type Artifact struct {
 	Kind       string
 	Key        string
@@ -26,15 +30,16 @@ type Artifact struct {
 	Bytes      int64
 	SHA256     string
 	LastUsedAt string
+	Prefetched bool
 }
 
 // artifactColumns 是 artifact 的显式列清单，顺序必须与 scanArtifact 一致。
-const artifactColumns = `SELECT kind, key, path, bytes, sha256, last_used_at FROM artifact`
+const artifactColumns = `SELECT kind, key, path, bytes, sha256, last_used_at, prefetched FROM artifact`
 
 // scanArtifact 按 artifactColumns 的顺序读出一行。
 func scanArtifact(scan func(dest ...any) error) (Artifact, error) {
 	var a Artifact
-	if err := scan(&a.Kind, &a.Key, &a.Path, &a.Bytes, &a.SHA256, &a.LastUsedAt); err != nil {
+	if err := scan(&a.Kind, &a.Key, &a.Path, &a.Bytes, &a.SHA256, &a.LastUsedAt, &a.Prefetched); err != nil {
 		return Artifact{}, err
 	}
 	return a, nil
@@ -97,16 +102,21 @@ func (s *Store) CoverRefs(ctx context.Context) (map[CoverRef]struct{}, error) {
 //
 // 冲突时覆盖 path / bytes / sha256 / last_used_at（同键的内容只会是同一个内容，
 // 覆盖等价于刷新使用时间）。kind 不在合法取值内时由 schema 的 CHECK 拒绝。
+//
+// prefetched 只升不降：`artifact.prefetched AND excluded.prefetched` —— 一条被前台
+// 播放过的分片（prefetched=false）再被预热写入时仍是 false，预热不会把「用户看过」
+// 降级成「可优先淘汰」（docs/CACHE-MODEL.md「淘汰」）。
 func (s *Store) PutArtifact(ctx context.Context, a Artifact) error {
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO artifact(kind, key, path, bytes, sha256, last_used_at)
-		 VALUES($1, $2, $3, $4, $5, $6)
+		`INSERT INTO artifact(kind, key, path, bytes, sha256, last_used_at, prefetched)
+		 VALUES($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT(kind, key) DO UPDATE
 		 SET path = excluded.path,
 		     bytes = excluded.bytes,
 		     sha256 = excluded.sha256,
-		     last_used_at = excluded.last_used_at`,
-		a.Kind, a.Key, a.Path, a.Bytes, a.SHA256, a.LastUsedAt,
+		     last_used_at = excluded.last_used_at,
+		     prefetched = artifact.prefetched AND excluded.prefetched`,
+		a.Kind, a.Key, a.Path, a.Bytes, a.SHA256, a.LastUsedAt, a.Prefetched,
 	); err != nil {
 		return wrapWriteErr("写入缓存资产 "+a.Kind+"/"+a.Key, err)
 	}
@@ -135,6 +145,29 @@ func (s *Store) TouchArtifact(ctx context.Context, kind, key, at string) error {
 	}
 	if n == 0 {
 		return fmt.Errorf("更新缓存资产 %s/%s: %w", kind, key, ErrNotFound)
+	}
+	return nil
+}
+
+// MarkArtifactPlayed 把一份缓存资产标记为「前台真正用过」：last_used_at 推到 at，
+// 并清掉 prefetched 标记（MKACG-682）。
+//
+// 前台命中与前台生成成功都走这里 —— 一旦用户真的播到这一片，它就不再是
+// 「预热但没播过」的候选，容量吃紧时不会被优先淘汰。无该行返回 ErrNotFound，
+// 调用方与 TouchArtifact 一样可以忽略（丢一次只影响淘汰顺序）。
+func (s *Store) MarkArtifactPlayed(ctx context.Context, kind, key, at string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE artifact SET last_used_at = $1, prefetched = FALSE WHERE kind = $2 AND key = $3`,
+		at, kind, key)
+	if err != nil {
+		return fmt.Errorf("标记缓存资产 %s/%s: %w", kind, key, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("标记缓存资产 %s/%s: %w", kind, key, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("标记缓存资产 %s/%s: %w", kind, key, ErrNotFound)
 	}
 	return nil
 }
@@ -217,6 +250,19 @@ func (s *Store) ListArtifactsOldest(ctx context.Context, kind string, limit int)
 		return nil, fmt.Errorf("列出最久未用的缓存资产 %s: %w", kind, err)
 	}
 	return collectArtifacts(rows, "最久未用的缓存资产 "+kind)
+}
+
+// ListArtifactsOldestPrefetched 按 last_used_at 升序返回「预热但没播过」的分片行，
+// 最多 limit 行（MKACG-682）。
+//
+// 供「超上限」淘汰的第一优先级：先清预热出来的分片，再动用户真正看过的缓存。
+func (s *Store) ListArtifactsOldestPrefetched(ctx context.Context, kind string, limit int) ([]Artifact, error) {
+	rows, err := s.db.QueryContext(ctx,
+		artifactColumns+` WHERE kind = $1 AND prefetched ORDER BY last_used_at LIMIT $2`, kind, limit)
+	if err != nil {
+		return nil, fmt.Errorf("列出预热的缓存资产 %s: %w", kind, err)
+	}
+	return collectArtifacts(rows, "预热的缓存资产 "+kind)
 }
 
 // ListExpiredArtifacts 按 last_used_at 升序返回 last_used_at 早于 before 的最多

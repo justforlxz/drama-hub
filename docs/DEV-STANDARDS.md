@@ -85,11 +85,12 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 > `plugin.<源>.refresh_interval_sec` 随 S4（MKACG-606，范围见
 > `docs/SCHEDULER-MODEL.md`「配置」）。
 >
-> 2.0 明确不做缓存预热（MKACG-603 的「不在范围」表），1.0 预留的 `seg_prefetch` /
+> 2.0 明确不做**整库**缓存预热（MKACG-603 的「不在范围」表），1.0 预留的 `seg_prefetch` /
 > `pin_days` 两个死键已删除（MKACG-616）：它们从没有消费者，留着只会让人以为改了有用。
 > 库里若还有这两行，`Settings` 会按 `ErrUnknownSetting` 忽略它们，不需要数据迁移。
 > 播放触发的**直链**预取（MKACG-681 / ADR-0017）不是分片预热：它只申请直链、落
-> `episode_stream`，不生成任何分片字节；分片预热是 MKACG-682。
+> `episode_stream`，不生成任何分片字节；**分片**预热由 MKACG-682 / ADR-0018 引入，
+> 参数是 `segment_prefetch_blocks`（默认 1，0 = 关闭）。
 
 **生效时机逐键标注在配置表里**，只有四种取值（MKACG-617 的生效性矩阵是实测真值来源）：
 
@@ -152,6 +153,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 | `play_session_ttl_sec` | `120` | 30–3600 | 即时（每请求现读） | 「正在播放」会话的闲置回收阈值（秒）：某个 (客户端, 播放单元) 超过该秒数没有新的分片请求，就从 `/api/playback` 消失。会话只存内存、不落库，重启清空；同步轮次不计入（MKACG-683） |
 | `prefetch_concurrency` | `1` | 0–4 | 下一个预取任务开始时 | 整剧直链预取的并发上限：同时在途的批数（一批 = 一个合并块），默认 1 = 串行；`0` = 关闭预取。一次任务开始时读一次，改值由下一次播放触发的任务生效（ADR-0017） |
 | `prefetch_retry_sec` | `900` | 60–86400 | 下一个预取任务开始时 | 某集预取失败后的固定退避（秒）：`retry_after = 失败时刻 + 本值`，退避期内的集不再被预取；不做指数退避。前台播放该集不受影响、仍现解析（ADR-0017） |
+| `segment_prefetch_blocks` | `1` | 0–10 | 下一次播放列表触发时（每个任务开始时读一次） | 分片预热提前量：除当前块剩余成员外，再预热后面几个合并块；`0` = 关闭。预热与前台共用 ffmpeg 闸且前台优先，生成的分片在容量吃紧时先淘汰（MKACG-682 / ADR-0018） |
 | `webdav_user` / `webdav_pass` | 必填 | 非空字符串 | 即时（每请求） | WebDAV Basic 认证 |
 | `webdav_page_size` | `1000` | 1–100000 | 即时（每次目录页请求） | WebDAV 集合 GET 目录页的单页条数：超出部分不渲染，页面上写「共 M 项，已显示前 N」。分类层有 21.8 万项目录，整页铺开会生成百 MB 级 HTML（MKACG-671；语义见 `docs/DIRECTORY-CONTRACT.md`「集合 GET」） |
 | `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 非空路径 | 即时（每次读写） | 本地缓存根目录：海报 `cover/`、分片 `seg/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`）；三个目录在启动时预先建出 |
@@ -336,8 +338,12 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
 - ffmpeg/ffprobe 一律带硬超时（`timeoutProbe=30s` / `timeoutRemux=300s`，整集要读完
   CDN 全程）；stderr 尾部只进日志，不落响应体；日志只记源 host，不落完整直链。并发闸
   `min(4, max(1, NumCPU/2))`，超出的请求排队不丢弃。
-- **没有预取**：2.0 不做缓存预热（MKACG-603「不在范围」），1.0 的两个占位键
-  `seg_prefetch` / `pin_days` 已删除（MKACG-616），代码里没有预取循环、没有整集预热。
+- **预热**：播放列表成功后按合并块预热分片（当前块剩余成员 + 后面
+  `segment_prefetch_blocks` 个块，默认 1、0 = 关闭；ADR-0018）。与前台共用
+  single-flight 与 ffmpeg 闸，前台优先（预热在跑时前台到达会取消它）；预热拿不到
+  空槽位就跳过该集，从不排队。换单元 / 换剧 / 停机 / 前台静默 30 s 即取消。
+  预热生成的分片带 `prefetched` 标记，容量吃紧时先淘汰。1.0 的两个占位键
+  `seg_prefetch` / `pin_days` 仍是删除状态（MKACG-616）。
 
 ### 合并集
 

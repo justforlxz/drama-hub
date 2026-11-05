@@ -171,6 +171,7 @@ type prefetchRig struct {
 	st       *store.Store
 	settings *store.Settings
 	src      *prefetchSource
+	cdn      *fakeCDN
 	logs     *syncBuffer
 	dramaID  int64
 }
@@ -232,7 +233,7 @@ func newPrefetchRig(t *testing.T, chunkSize int) *prefetchRig {
 	c.StartPrefetch(ctx)
 	t.Cleanup(c.StopPrefetch)
 
-	return &prefetchRig{c: c, st: st, settings: settings, src: src, logs: logs, dramaID: dramaID}
+	return &prefetchRig{c: c, st: st, settings: settings, src: src, cdn: cdn, logs: logs, dramaID: dramaID}
 }
 
 // addDrama 建一部剧与若干集，时长写成 10 秒（预取不触发 ffprobe，测试只关心直链）。

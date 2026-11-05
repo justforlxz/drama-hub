@@ -34,6 +34,10 @@ playlist 是派生数据的**纯函数**（`segment.BuildPlaylist`）：一次�
 「时长回填了但 playlist 文件没失效」这类不一致。你要的「缓存 m3u8」的实际收益，
 全在它引用的分片上——缓存分片就够了。
 
+不落盘不等于不让客户端复用：播放列表响应带 `ETag`（正文 sha256）与
+`Cache-Control: no-cache`，客户端用 `If-None-Match` 做条件请求，内容没变就是
+`304`（MKACG-682，ADR-0018）。校验仍然每次回源，只是不回传正文。
+
 ### 为什么不缓存源 mp4 整文件
 
 源是 360p / 3–10 分钟 / 十几 MB 的整片。缓存整片意味着「这一集全部字节」与我们的
@@ -95,12 +99,15 @@ playlist 是派生数据的**纯函数**（`segment.BuildPlaylist`）：一次�
 | `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 绝对或相对路径 | 缓存根目录；`{cover,seg,tmp}` 三个目录在启动时建出（`Cache.EnsureLayout`），写盘时按需再 `MkdirAll` |
 | `cache_max_mb` | `8192` | 0–1048576 | 分片缓存上限；`0` = 不按大小淘汰 |
 | `cache_lru_days` | `30` | 1–365 | 超过 N 天未命中的条目删除 |
+| `segment_prefetch_blocks` | `1` | 0–10 | 分片预热提前量：当前块剩余成员之外，再预热后面几个合并块；`0` = 关闭（ADR-0018） |
 
 淘汰循环（单 goroutine，启动后每 5 分钟一次，与请求路径无关）：
 
 1. `DELETE` 过期：`artifact WHERE last_used_at < now - cache_lru_days`
-2. 若 `SUM(bytes) WHERE kind='segment' > cache_max_mb`：
-   按 `last_used_at` 升序删到上限以下（一次删一批，避免长事务）
+2. 若 `SUM(bytes) WHERE kind='segment' > cache_max_mb`，分两轮：
+   先按 `last_used_at` 升序删 `prefetched = TRUE` 的分片（预热生成、还没有被任何一次
+   播放请求用过），删到上限内就停；仍然超限才按 `last_used_at` 升序动播过的分片
+   （一次删一批，避免长事务）
 3. 每删一条：先删文件、再处理行；文件已不存在也算成功（自愈）。行的处理**按 kind 分两种**：
    - **分片与索引**：行与文件一起删。行只是「文件在哪」的登记，没有字节就没有意义。
    - **海报**：**行留着**，只把 `path` / `bytes` / `sha256` 清空、`last_used_at` 推到当轮时间
@@ -109,6 +116,12 @@ playlist 是派生数据的**纯函数**（`segment.BuildPlaylist`）：一次�
      要等该剧被下一轮同步重新本地化才回来，「淘汰后按需重新下载」永远不发生
      （MKACG-650 功能检测抓到的失败项）。清空 path 表达「本地没有字节」，下一次请求按未命中
      回源并写回行；`last_used_at` 推到当下，下一轮过期查询不会再选中同一行。
+
+**预热标记（`artifact.prefetched`，MKACG-682）**：分片预热生成的行走这个标记
+（`true`），前台命中或前台生成成功会把它清回 `false`（`MarkArtifactPlayed`）。
+`PutArtifact` 冲突更新用 `artifact.prefetched AND excluded.prefetched`，只升不降——
+预热重写不会把「用户看过」降级。它只影响超限淘汰的先后，不影响过期淘汰：
+后者问的是「多久没用」，与怎么生成无关。
 
 不做的事：不做跨进程锁（单实例）、不做热/冷分区、不做按剧 pin 的例外。
 
@@ -241,13 +254,19 @@ WebDAV 只承载元数据（`.strm` / `.nfo` / 目录），**不经手分片**�
 7. **旧后缀不再接受**：`Spec{Kind: segment, Ext: ".ts"}` 被拒绝（防止旧 TS 冒充新片）。
 8. **整条合并 playlist 不丢帧**：`ffprobe -count_frames -count_packets` 的
    `frames == packets`（缓存的片段是 0 基，出流才平移 tfdt；`TestMergedPlaylist_DecodesEveryFrame`）。
+9. **预热标记与优先淘汰**：预热生成的行走 `prefetched=true`，前台命中后为 `false`；
+   容量超限时先删预热行（哪怕它的 `last_used_at` 最新）—— `TestPrefetchMarksUntilPlayed`
+   与 `TestEvictPrefersPrefetchedOverPlayed`。
+10. **playlist 条件请求**：同一播放单元 ETag 稳定、`If-None-Match` 命中回 304、
+    不同播放单元 ETag 不同（`TestPlaylistETagAndConditionalRequest`）。
 
 不测：文件系统异常（磁盘满、权限拒绝）的具体错误文案；跨进程并发。
 
 ## 2.0 明确不做
 
-- 缓存预热与预取（把整库提前切好 / 播第 N 集时喂 N+1…）：2847 万集不可能预切。
-  1.0 预留的 `seg_prefetch` / `pin_days` 占位键已删除（MKACG-616），代码里没有预取循环。
+- 整库预切（把 2847 万集提前切好）——预热只做「当前块 + 后面
+  `segment_prefetch_blocks` 个块」，有界、只在播放时按需触发（ADR-0018）。
+  1.0 预留的 `seg_prefetch` / `pin_days` 占位键仍是删除状态（MKACG-616）。
 - 按剧/按用户配额、多级缓存、CDN 回源策略。
 - 内容指纹校验 / ETag 回源。
 - 缓存统计看板以外的可观测性（`/api/status` 报 `bytes` 与条目数即可）。

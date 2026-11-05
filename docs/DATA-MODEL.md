@@ -146,7 +146,7 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
 
 | 对象 | 用途 |
 |---|---|
-| `artifact(kind='segment')` | 分片缓存索引：`key = sha256("e<episode.id>"\x1fchannel)`，`path` 是本地文件（`.m4s`），`bytes` 供淘汰算总量，`last_used_at` 供 LRU 与过期（0006 起无 `index`） |
+| `artifact(kind='segment')` | 分片缓存索引：`key = sha256("e<episode.id>"\x1fchannel)`，`path` 是本地文件（`.m4s`），`bytes` 供淘汰算总量，`last_used_at` 供 LRU 与过期，`prefetched` 标记「预热但没播过」（0012） |
 | `artifact(kind='cover')` | 海报（刷新时下载并本地化） |
 | `idx_artifact_kind_last_used` | `WHERE kind=? ORDER BY last_used_at` 的淘汰查询；也覆盖按 `kind` 的计数/求和 |
 
@@ -261,6 +261,23 @@ CREATE TABLE IF NOT EXISTS episode_stream_fail (
 | 对象 | 用途 |
 |---|---|
 | `episode_stream_fail` | 某集预取失败的原因与下次可重试时刻：预取计划的退避依据（`internal/segment` 写、`internal/segment` 读） |
+
+### 0012：分片预热标记（ADR-0018）
+
+```sql
+-- 0012_artifact_prefetched.sql
+ALTER TABLE artifact ADD COLUMN IF NOT EXISTS prefetched BOOLEAN NOT NULL DEFAULT FALSE;
+```
+
+`prefetched = TRUE` 表示这一行是分片预热生成、还没有被任何一次播放请求用过。
+超限淘汰先删这类行，避免预热把用户真正看过的缓存挤掉（`docs/CACHE-MODEL.md`「淘汰」）。
+前台命中 / 前台生成成功会把它清回 `FALSE`（`MarkArtifactPlayed`）；`PutArtifact` 冲突
+更新只允许 `TRUE → FALSE`（`AND`），预热重写不会把播过的行降级。历史行全部是前台生成的，
+默认值就是真实语义，不需要回填。
+
+| 对象 | 用途 |
+|---|---|
+| `artifact.prefetched` | 「预热但没播过」标记：容量吃紧时优先淘汰（`internal/cache` 写） |
 
 ## 字段来源逐个定稿
 

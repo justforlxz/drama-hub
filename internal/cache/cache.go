@@ -124,32 +124,38 @@ func (c *Cache) GetOrGenerate(ctx context.Context, spec Spec, gen GenerateFunc) 
 	if h := c.hooks.beforeEnter; h != nil {
 		h()
 	}
-	return c.flights.do(ctx, spec.Kind+keySeparator+spec.Key, func() ([]byte, error) {
+	body, err := c.flights.do(ctx, spec.Kind+keySeparator+spec.Key, func() ([]byte, error) {
 		// 当上 leader 后再查一次：从上面的 hit() 到这里之间，可能有另一个 leader
 		// 已经生成完并摘掉了 flight（发布先于摘除，所以那时 hit() 必然命中）。
 		// 不复查就会成为第二个 leader，同一片被切两遍 —— MKACG-640。
 		if body, ok, err := c.hit(ctx, spec); err != nil || ok {
 			return body, err
 		}
-		return c.generate(ctx, spec, gen)
+		return c.generate(ctx, spec, gen, false)
 	}, c.hooks.published)
+	if err != nil {
+		return nil, err
+	}
+	// 这次结果可能来自别人领跑的 flight（前台正好等到预热）：那条行写的是
+	// prefetched=true，可前台已经把字节交给播放端了。补一次标记，否则「用户播过」
+	// 会在容量吃紧时被当成「没播过」优先淘汰（MKACG-682 代码审查 nit）。
+	_ = c.st.MarkArtifactPlayed(ctx, spec.Kind, spec.Key, stamp(c.now()))
+	return body, nil
 }
 
-// hit 查索引行并读文件：都成功才算命中，并把 last_used_at 推到现在。
+// hit 查索引行并读文件：都成功才算命中，并把 last_used_at 推到现在、清掉预热标记。
 //
 // 行在、文件没了（被手删，或上一轮淘汰删了文件没删成行）按未命中处理，并顺手删掉
 // 这条脏行：淘汰用 SUM(bytes) 算总量，留着指向不存在文件的字节会虚高。
 func (c *Cache) hit(ctx context.Context, spec Spec) (body []byte, ok bool, err error) {
-	row, err := c.st.ArtifactByKey(ctx, spec.Kind, spec.Key)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil, false, nil
-	}
-	if err != nil {
+	row, ok, err := c.cached(ctx, spec)
+	if err != nil || !ok {
 		return nil, false, err
 	}
 	body, err = os.ReadFile(row.Path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
+			// 与 cached 的判断之间刚被淘汰：删掉脏行，按未命中处理。
 			if derr := c.st.DeleteArtifact(ctx, spec.Kind, spec.Key); derr != nil &&
 				!errors.Is(derr, store.ErrNotFound) {
 				return nil, false, derr
@@ -159,14 +165,78 @@ func (c *Cache) hit(ctx context.Context, spec Spec) (body []byte, ok bool, err e
 		return nil, false, fmt.Errorf("读缓存文件 %s: %w", row.Path, err)
 	}
 	// 命中即 touch（契约 MUST）：不 touch 的条目会被 cache_lru_days 当成过期删掉，
-	// 而它天天在用。touch 失败只让这条更早被淘汰，不影响这次正确性，因此忽略。
-	_ = c.st.TouchArtifact(ctx, spec.Kind, spec.Key, stamp(c.now()))
+	// 而它天天在用。同时清掉 prefetched —— 用户真的播到了这一片，容量吃紧时它不再
+	// 是「预热优先淘汰」的候选。失败只影响淘汰顺序，不影响这次正确性，因此忽略。
+	_ = c.st.MarkArtifactPlayed(ctx, spec.Kind, spec.Key, stamp(c.now()))
 	return body, true, nil
+}
+
+// cached 确认一份缓存是否已经有本地字节：行在、文件在才算有。不读文件内容，也不
+// 更新 last_used_at（预热的检查用它，不该把没播过的条目「用」一次）。
+func (c *Cache) cached(ctx context.Context, spec Spec) (store.Artifact, bool, error) {
+	row, err := c.st.ArtifactByKey(ctx, spec.Kind, spec.Key)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Artifact{}, false, nil
+	}
+	if err != nil {
+		return store.Artifact{}, false, err
+	}
+	if _, err := os.Stat(row.Path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			if derr := c.st.DeleteArtifact(ctx, spec.Kind, spec.Key); derr != nil &&
+				!errors.Is(derr, store.ErrNotFound) {
+				return store.Artifact{}, false, derr
+			}
+			return store.Artifact{}, false, nil
+		}
+		return store.Artifact{}, false, fmt.Errorf("读缓存文件 %s: %w", row.Path, err)
+	}
+	return row, true, nil
+}
+
+// Prefetch 在后台把一份内容生成并落进缓存，标记成 prefetched（MKACG-682）。
+//
+// 与 GetOrGenerate 的区别只有两点：已经有本地字节就直接返回（不重复生成、不读回
+// 整片、不改标记）；生成时写 prefetched=true，容量吃紧时这类分片先被淘汰。
+// 共用同一组 single-flight：前台正在生成同一个键时，预热等它的结果，不会重复跑
+// ffmpeg；反过来预热当 leader 时，前台等待者拿到同一份字节。
+//
+// 不返回字节：预热的结果不进当前请求。失败原样返回错误，调用方只记日志。
+func (c *Cache) Prefetch(ctx context.Context, spec Spec, gen GenerateFunc) error {
+	if err := spec.validate(); err != nil {
+		return err
+	}
+	if ok, err := c.Has(ctx, spec); err != nil || ok {
+		return err
+	}
+	_, err := c.flights.do(ctx, spec.Kind+keySeparator+spec.Key, func() ([]byte, error) {
+		// 与 GetOrGenerate 同样的领跑复查：前台可能刚生成完并摘掉 flight，
+		// 不复查就会把同一片再切一遍（预热白跑一次 ffmpeg）。
+		if ok, err := c.Has(ctx, spec); err != nil || ok {
+			return nil, err
+		}
+		return c.generate(ctx, spec, gen, true)
+	}, c.hooks.published)
+	return err
+}
+
+// Has 报告一份缓存是否已有本地字节（不读内容、不动 last_used_at）。
+//
+// 预热的「已缓存就不重复生成」用它：GetOrGenerate 的命中路径会把条目标记成「播过」，
+// 预热不该借一次检查把没播过的分片洗白。
+func (c *Cache) Has(ctx context.Context, spec Spec) (bool, error) {
+	if err := spec.validate(); err != nil {
+		return false, err
+	}
+	_, ok, err := c.cached(ctx, spec)
+	return ok, err
 }
 
 // generate 生成 → 落盘 → 写行。任一步失败都不留缓存：没 rename 到位就不写行；
 // 写行失败就把刚落的文件删掉——否则它既不会被命中，也不会被淘汰扫到（淘汰按行驱动）。
-func (c *Cache) generate(ctx context.Context, spec Spec, gen GenerateFunc) ([]byte, error) {
+//
+// prefetched 写进 artifact.prefetched：前台生成是 false，后台预热是 true。
+func (c *Cache) generate(ctx context.Context, spec Spec, gen GenerateFunc, prefetched bool) ([]byte, error) {
 	body, err := gen(ctx)
 	if err != nil {
 		return nil, err
@@ -194,6 +264,7 @@ func (c *Cache) generate(ctx context.Context, spec Spec, gen GenerateFunc) ([]by
 		Bytes:      int64(len(body)),
 		SHA256:     hex.EncodeToString(digest[:]),
 		LastUsedAt: stamp(c.now()),
+		Prefetched: prefetched,
 	}); err != nil {
 		_ = os.Remove(target)
 		return nil, err

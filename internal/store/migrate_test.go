@@ -708,7 +708,12 @@ func TestArtifactRebuildKeepsRows(t *testing.T) {
 		LastUsedAt: "2026-10-29T11:00:00Z"}
 	s := NewStore(db)
 	for _, a := range []Artifact{cover, legacyIndex} {
-		if err := s.PutArtifact(ctx, a); err != nil {
+		// 用当时的列写（还没有 prefetched）：这里验证的是迁移保行，
+		// 不该拿未来版本的 store API 往旧 schema 里写。
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO artifact(kind, key, path, bytes, sha256, last_used_at)
+			 VALUES($1, $2, $3, $4, $5, $6)`,
+			a.Kind, a.Key, a.Path, a.Bytes, a.SHA256, a.LastUsedAt); err != nil {
 			t.Fatalf("预置 artifact %s/%s: %v", a.Kind, a.Key, err)
 		}
 	}

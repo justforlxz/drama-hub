@@ -80,6 +80,10 @@ const (
 	//   - prefetch_retry_sec：某集预取失败后的固定退避秒数（不做指数退避）。
 	KeyPrefetchConcurrency SettingKey = "prefetch_concurrency"
 	KeyPrefetchRetrySec    SettingKey = "prefetch_retry_sec"
+	// KeySegmentPrefetchBlocks 是分片预热的提前量：除当前块剩余成员外，再预热后面
+	// 几个合并块（默认 1，0 = 关闭；范围 0–10）。每个预热任务开始时读一次，
+	// 热改在下次播放列表请求生效（MKACG-682）。
+	KeySegmentPrefetchBlocks SettingKey = "segment_prefetch_blocks"
 )
 
 // 插件配置的项名（docs/PLUGIN-CONTRACT.md「配置」）。
@@ -493,6 +497,11 @@ func specFor(key SettingKey) (settingSpec, bool) {
 		// 「200 + 空体」是偶发抖动，退避拉长到小时级反而不如让前台同步兜底
 		// （ADR-0017「为什么不做指数退避」）。
 		return settingSpec{kind: kindInt, def: "900", min: 60, max: 86400}, true
+	case KeySegmentPrefetchBlocks:
+		// 分片预热的提前量：当前块剩余成员 + 后面 N 个块（MKACG-682）。默认 1 =
+		// 「当前块 + 下一块」；0 = 关闭（预热是后台收益，按需可关）。上限 10 防止
+		// 一次播放列表就把整部剧的 ffmpeg 排满。
+		return settingSpec{kind: kindInt, def: "1", min: 0, max: 10}, true
 	}
 	return pluginSpecFor(string(key))
 }

@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -17,9 +18,10 @@ func TestPrefetchMarksUntilPlayed(t *testing.T) {
 	spec := segSpec("e7")
 
 	calls := 0
-	gen := func(context.Context) ([]byte, error) {
+	gen := func(_ context.Context, w io.Writer) error {
 		calls++
-		return []byte(testSegmentBody), nil
+		_, err := w.Write([]byte(testSegmentBody))
+		return err
 	}
 	if err := tc.c.Prefetch(ctx, spec, gen); err != nil {
 		t.Fatalf("Prefetch: %v", err)
@@ -82,8 +84,9 @@ func TestEvictPrefersPrefetchedOverPlayed(t *testing.T) {
 		tc.clock.advance(time.Minute)
 	}
 	prefetched := segSpec("e9")
-	if err := tc.c.Prefetch(ctx, prefetched, func(context.Context) ([]byte, error) {
-		return blob(chunk, 'z'), nil
+	if err := tc.c.Prefetch(ctx, prefetched, func(_ context.Context, w io.Writer) error {
+		_, err := w.Write(blob(chunk, 'z'))
+		return err
 	}); err != nil {
 		t.Fatalf("预热水片: %v", err)
 	}

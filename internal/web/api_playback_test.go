@@ -67,7 +67,7 @@ func TestAPI_PlaybackSessions(t *testing.T) {
 		Slices: 3, TotalSec: 18,
 	}, time.Minute)
 	clock = base.Add(30 * time.Second)
-	srv.playback.Progress(clA, "m1_1_3", 2, 12, 3000, time.Minute)
+	srv.playback.Progress(clA, "m1_1_3", 2, 12, 3000, 250*time.Millisecond, time.Minute)
 
 	rec := do(t, srv, http.MethodGet, "/api/playback", "")
 	if rec.Code != http.StatusOK {
@@ -102,6 +102,9 @@ func TestAPI_PlaybackSessions(t *testing.T) {
 	if first.BytesServed != 3000 {
 		t.Errorf("第一条 bytes_served = %d, 期望 3000", first.BytesServed)
 	}
+	if first.TimeToFirstSegmentMS != 250 {
+		t.Errorf("第一条 time_to_first_segment_ms = %d, 期望 250", first.TimeToFirstSegmentMS)
+	}
 	if first.LastSeen != base.Add(30*time.Second).Format(time.RFC3339) {
 		t.Errorf("第一条 last_seen = %q, 期望 %q", first.LastSeen, base.Add(30*time.Second).Format(time.RFC3339))
 	}
@@ -118,5 +121,8 @@ func TestAPI_PlaybackSessions(t *testing.T) {
 	// 同一 uid 的两条会话各自累计自己的字节，不能互相串。
 	if second.BytesServed != 0 || third.BytesServed != 0 {
 		t.Errorf("未拉分片的会话 bytes_served = %d/%d, 期望 0", second.BytesServed, third.BytesServed)
+	}
+	if second.TimeToFirstSegmentMS != 0 {
+		t.Errorf("未拉分片的会话 time_to_first_segment_ms = %d, 期望 0", second.TimeToFirstSegmentMS)
 	}
 }

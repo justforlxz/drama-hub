@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"strconv"
@@ -97,12 +98,15 @@ func (c *Cutter) ServePlaylist(w http.ResponseWriter, r *http.Request) {
 }
 
 // ServeSegment 实现 `GET /video/{id}/{seq}.m4s`：鉴权 → 定位第 seq 集 → 缓存命中即回 /
-// 未命中整集转封装落缓存再回。
+// 未命中边转封装边出流（MKACG-686）。
 //
-// 缓存返回的 []byte 在 single-flight 下是多个等待者共享的只读字节，这里只读不写
-// （ServeContent 只读）。Range 与 HEAD 都由 http.ServeContent 处理：分片是完整
-// 不可变对象，不需要分段生成。
+// 两条路径：
+//   - 命中：读完整文件 → 平移时间轴 → http.ServeContent（Range / HEAD 精确）；
+//   - 未命中：边生成边出流（chunked，不设 Content-Length），首个分片落盘即可播。
+//     总长度要等 ffmpeg 跑完才知道，先给长度就只能等整集 —— 那正是首播慢的根因。
+//     HEAD 与带 Range 的请求仍走阻塞路径，WebDAV/rclone 的精确长度不受影响。
 func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
+	t0 := time.Now() // 首片耗时从请求进入算起（/api/playback 的 time_to_first_segment_ms）
 	ctx := r.Context()
 	seq, ok := parseSeqFile(r.PathValue("file"))
 	if !ok {
@@ -138,55 +142,6 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 		writeVideoError(w, err)
 		return
 	}
-	key := cache.SegmentKey(episodeUID(ep.ID), channel)
-	body, err := c.caches.GetOrGenerate(ctx,
-		cache.Spec{Kind: store.ArtifactKindSegment, Key: key, Ext: segmentSuffix},
-		func(ctx context.Context) ([]byte, error) {
-			// 直链只在真要生成时才解析：命中缓存的分片请求零外呼
-			// （契约「命中即回文件」，也是缓存存在的意义）。
-			src := direct
-			if !resolved {
-				var rerr error
-				if src, rerr = c.resolve(ctx, ep); rerr != nil {
-					return nil, resolveFailure(ep.ID, rerr)
-				}
-			}
-			out, err := remux(ctx, c.logger, src, c.fetchHeaders(src))
-			if err != nil && errors.Is(err, errRejected) {
-				// CDN 拒绝：作废这一集的直链、重解析一次、重试一次（ADR-0016）。
-				fresh, refreshErr := c.refreshRejected(ctx, ep, channel)
-				if refreshErr != nil {
-					return nil, refreshErr
-				}
-				src = fresh
-				out, err = remux(ctx, c.logger, src, c.fetchHeaders(src))
-			}
-			if err != nil {
-				return nil, err
-			}
-			c.touchStream(ctx, ep.ID)
-			// 每次真实生成一条 Info：AC「同一集第二次播放 ffmpeg 调用 0 次」的计次依据。
-			c.logger.InfoContext(ctx, "segment generated",
-				"episode_id", ep.ID, "channel", channel, "bytes", len(out))
-			return out, nil
-		})
-	if err != nil {
-		c.logger.WarnContext(ctx, "segment remux failed",
-			"uid", uid, "seq", seq, "episode_id", ep.ID, "channel", channel, "err", err)
-		// 生成失败（ffmpeg）是 502 且不写缓存；解析直链被拒（要登录）与「只有加密流」
-		// 按插件哨兵的语义原样报出（403 / 501），不冒充上游失败；缓存自身故障按 500
-		// 报，不冒充上游问题（MKACG-676）。
-		switch {
-		case errors.Is(err, httpx.ErrUpstream):
-			writeVideoError(w, fmt.Errorf("转封装 %s 分片 %d（%v）: %w", uid, seq, err, httpx.ErrUpstream))
-		case errors.Is(err, httpx.ErrForbidden), errors.Is(err, httpx.ErrUnsupported):
-			writeVideoError(w, err)
-		default:
-			httpx.WriteError(w, fmt.Errorf("写分片 %s %d: %w", uid, seq, err))
-		}
-		return
-	}
-
 	// 集边界的时间戳：缓存里的字节一律 0 基（键只由「集 + 通道」决定），出流时按本片在
 	// 播放单元里的起点平移 tfdt —— ffmpeg 系播放端（Emby 转码/DirectStream、mpv）按 PTS
 	// 解码，只有 DISCONTINUITY 不重定基准会丢帧（ADR-0011 D6'）。
@@ -195,18 +150,211 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 		writeVideoError(w, err)
 		return
 	}
+
+	key := cache.SegmentKey(episodeUID(ep.ID), channel)
+	spec := cache.Spec{Kind: store.ArtifactKindSegment, Key: key, Ext: segmentSuffix}
+	gen := func(ctx context.Context, w io.Writer) error {
+		return c.generateSegment(ctx, w, ep, channel, direct, resolved)
+	}
+	fetch := func() (*cache.Stream, error) { return c.caches.GetOrStream(ctx, spec, gen, false) }
+	c.streamSegment(w, r, fetch, uid, seq, ep, channel, start, t0)
+}
+
+// segmentReleads 是「换一个新领跑者」的次数上限。
+//
+// 领跑者可能是一次后台预热，它的 ctx 归 ffmpeg 闸所有（前台抢占、换集都会取消）。
+// 本请求一个字节都还没拿到时换个领跑者重领是对的，但不能无限换：预算耗尽必须写出
+// 明确的错误码——直接返回只会留下「200 + 空 body」，播放端会把它当成解码失败，
+// 比 5xx 更难定位（AC-4：不得返回长度错误的响应）。
+const segmentReleads = 1
+
+// streamSegment 领取分片并出流：命中即回文件，未命中边生成边出流；领跑者被取消
+// （预热被 preempt）时换一个新领跑者重试，最多 segmentReleads 次。
+func (c *Cutter) streamSegment(w http.ResponseWriter, r *http.Request, fetch func() (*cache.Stream, error), uid string, seq int, ep store.Episode, channel string, start time.Duration, t0 time.Time) {
+	ctx := r.Context()
+	for attempt := 0; ; attempt++ {
+		stream, err := fetch()
+		if err != nil {
+			httpx.WriteError(w, fmt.Errorf("写分片 %s %d: %w", uid, seq, err))
+			return
+		}
+		if stream.Cached() {
+			c.serveCachedSegment(w, r, stream, uid, seq, start, t0)
+			return
+		}
+		if !c.serveStreamingSegment(w, r, stream, uid, seq, ep, channel, start, t0) {
+			return
+		}
+		if attempt >= segmentReleads {
+			c.writeSegmentGenerateError(w, ctx, uid, seq, ep.ID, channel,
+				fmt.Errorf("%w: 分片 %s %d 的领跑者连续被取消（已重领 %d 次）",
+					httpx.ErrUnavailable, uid, seq, attempt))
+			return
+		}
+		c.logger.InfoContext(ctx, "segment re-led after leader cancel",
+			"uid", uid, "seq", seq, "episode_id", ep.ID, "channel", channel)
+	}
+}
+
+// serveCachedSegment 是命中路径：完整文件在手，交给 http.ServeContent 处理
+// Range/HEAD/Content-Length。
+func (c *Cutter) serveCachedSegment(w http.ResponseWriter, r *http.Request, stream *cache.Stream, uid string, seq int, start time.Duration, t0 time.Time) {
+	ctx := r.Context()
+	body, err := stream.Bytes()
+	if err != nil {
+		httpx.WriteError(w, fmt.Errorf("读分片 %s %d: %w", uid, seq, err))
+		return
+	}
 	served, err := shiftTimeline(body, start)
 	if err != nil {
 		httpx.WriteError(w, fmt.Errorf("平移分片 %s %d 的时间轴: %w", uid, seq, err))
 		return
 	}
-
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(served))
 	// 分片已经出流，再记进度（位置取本片在单元时间轴上的起点）。
 	c.markPlayed()
-	c.recordProgress(ctx, r, uid, seq, int(start.Seconds()), int64(len(served)))
+	c.recordProgress(ctx, r, uid, seq, int(start.Seconds()), int64(len(served)), 0)
+}
+
+// serveStreamingSegment 把正在生成的分片边生成边出流（MKACG-686）。
+//
+// 这里**不设 Content-Length**，响应是 chunked：字节与完整产物逐字节一致，只是先到
+// 先出。契约里「每个虚拟文件给出精确 Content-Length」的例外只有这一条冷路径
+// （docs/PLAYBACK-CONTRACT.md「冷启动的边生成边出流」），HEAD / Range 仍走精确路径。
+// 返回值 retry 表示「一个字节都没写出就被取消了，可以换一个新领跑者」。
+func (c *Cutter) serveStreamingSegment(w http.ResponseWriter, r *http.Request, stream *cache.Stream, uid string, seq int, ep store.Episode, channel string, start time.Duration, t0 time.Time) (retry bool) {
+	ctx := r.Context()
+	if r.Method == http.MethodHead || r.Header.Get("Range") != "" {
+		// 要的是精确长度或字节区间：等整片生成完再走 ServeContent。
+		if err := stream.Wait(ctx); err != nil {
+			// 还没写出任何字节：领跑者被取消时交给调用方换一个新领跑者重试。
+			if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				return true
+			}
+			c.writeSegmentGenerateError(w, ctx, uid, seq, ep.ID, channel, err)
+			return false
+		}
+		c.serveCachedSegment(w, r, stream, uid, seq, start, t0)
+		return false
+	}
+
+	rd, err := stream.Reader(ctx, 0)
+	if err != nil {
+		httpx.WriteError(w, fmt.Errorf("读分片 %s %d: %w", uid, seq, err))
+		return false
+	}
+	defer rd.Close()
+	src := shiftStream(rd, start)
+
+	buf := make([]byte, streamChunk)
+	// 先等第一块：一个字节都没产出就失败时，还能回干净的错误码，而不是半截 200。
+	n, rerr := src.Read(buf)
+	if n == 0 && rerr != nil {
+		gerr := stream.Err()
+		if gerr == nil {
+			gerr = rerr
+		}
+		// 一个字节都还没写给客户端：领跑者被取消（预热被 preempt / 换集）不是内容
+		// 错误，交给调用方换一个新领跑者重试，别把 500 甩给播放端。
+		if errors.Is(gerr, context.Canceled) && ctx.Err() == nil {
+			return true
+		}
+		c.writeSegmentGenerateError(w, ctx, uid, seq, ep.ID, channel, gerr)
+		return false
+	}
+	first := time.Since(t0)
+
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusOK)
+	rc := http.NewResponseController(w)
+
+	served := int64(0)
+	for {
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				// 客户端断开：Reader.Close 会让「没人读就停生成」生效。
+				return false
+			}
+			_ = rc.Flush()
+			served += int64(n)
+		}
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				c.logger.WarnContext(ctx, "segment stream interrupted",
+					"uid", uid, "seq", seq, "episode_id", ep.ID, "channel", channel, "err", rerr)
+			}
+			break
+		}
+		n, rerr = src.Read(buf)
+	}
+	_ = rc.Flush()
+
+	c.markPlayed()
+	c.recordProgress(ctx, r, uid, seq, int(start.Seconds()), served, first)
+	c.logger.InfoContext(ctx, "segment streamed",
+		"uid", uid, "seq", seq, "episode_id", ep.ID, "channel", channel,
+		"bytes", served,
+		"first_segment_ms", first.Milliseconds(),
+		"total_ms", time.Since(t0).Milliseconds())
+	return false
+}
+
+// generateSegment 是分片的生成函数（前台与预热共用同一份语义，只有日志文案不同）。
+func (c *Cutter) generateSegment(ctx context.Context, w io.Writer, ep store.Episode, channel string, direct stream.Direct, resolved bool) error {
+	// 直链只在真要生成时才解析：命中缓存的分片请求零外呼
+	// （契约「命中即回文件」，也是缓存存在的意义）。
+	src := direct
+	if !resolved {
+		var rerr error
+		if src, rerr = c.resolve(ctx, ep); rerr != nil {
+			return resolveFailure(ep.ID, rerr)
+		}
+	}
+	cw := &countingWriter{w: w}
+	err := remuxTo(ctx, c.logger, src, c.fetchHeaders(src), cw)
+	if err != nil && errors.Is(err, errRejected) {
+		// CDN 拒绝：作废这一集的直链、重解析一次、重试一次（ADR-0016）。
+		// 已经写出过字节就不能重试（第二遍会追加在半截内容后面）。
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if cw.n > 0 {
+			return err
+		}
+		fresh, refreshErr := c.refreshRejected(ctx, ep, channel)
+		if refreshErr != nil {
+			return refreshErr
+		}
+		src = fresh
+		err = remuxTo(ctx, c.logger, src, c.fetchHeaders(src), cw)
+	}
+	if err != nil {
+		return err
+	}
+	c.touchStream(ctx, ep.ID)
+	// 每次真实生成一条 Info：AC「同一集第二次播放 ffmpeg 调用 0 次」的计次依据。
+	c.logger.InfoContext(ctx, "segment generated",
+		"episode_id", ep.ID, "channel", channel, "bytes", cw.n)
+	return nil
+}
+
+// writeSegmentGenerateError 把生成失败映射成播放面的错误矩阵（与命中路径之前的语义
+// 一致）：ffmpeg 失败 502 且不写缓存；插件哨兵 403/501 原样；依赖暂不可用（重领预算
+// 耗尽等）503 + Retry-After；其余 500。
+func (c *Cutter) writeSegmentGenerateError(w http.ResponseWriter, ctx context.Context, uid string, seq int, epID int64, channel string, err error) {
+	c.logger.WarnContext(ctx, "segment remux failed",
+		"uid", uid, "seq", seq, "episode_id", epID, "channel", channel, "err", err)
+	switch {
+	case errors.Is(err, httpx.ErrUpstream):
+		writeVideoError(w, fmt.Errorf("转封装 %s 分片 %d（%v）: %w", uid, seq, err, httpx.ErrUpstream))
+	case errors.Is(err, httpx.ErrForbidden), errors.Is(err, httpx.ErrUnsupported):
+		writeVideoError(w, err)
+	default:
+		writeVideoError(w, fmt.Errorf("写分片 %s %d: %w", uid, seq, err))
+	}
 }
 
 // timelineStart 返回第 seq 片在播放单元时间轴上的起点（前面各集的 duration_sec 之和），

@@ -570,8 +570,10 @@ func TestSegment_RemuxThenCacheHit(t *testing.T) {
 	if ct := first.Header().Get("Content-Type"); ct != "video/mp4" {
 		t.Errorf("Content-Type = %q, 期望 video/mp4", ct)
 	}
-	if cl := first.Header().Get("Content-Length"); cl != strconv.Itoa(first.Body.Len()) {
-		t.Errorf("Content-Length = %q, body = %d 字节", cl, first.Body.Len())
+	// 冷路径是 chunked：总长度要等 ffmpeg 跑完才知道，先给长度就只能等整集
+	// （MKACG-686）。这里钉住「不谎报长度」：没有 Content-Length，字节仍是完整产物。
+	if cl := first.Header().Get("Content-Length"); cl != "" {
+		t.Errorf("冷启动响应不该带 Content-Length（边生成边出流），实际 %q", cl)
 	}
 	t.Logf("单片 fMP4：%d 字节，顶层 box = %v", first.Body.Len(), topLevelBoxes(t, first.Body.Bytes()))
 	assertSelfContainedSegment(t, first.Body.Bytes(), 0, 12)
@@ -607,6 +609,10 @@ func TestSegment_RemuxThenCacheHit(t *testing.T) {
 	}
 	if !bytes.Equal(first.Body.Bytes(), second.Body.Bytes()) {
 		t.Error("两次响应的字节不一致（命中缓存不该改变内容）")
+	}
+	// 命中路径有精确长度（硬约束 3）：WebDAV / rclone 依赖它。
+	if cl := second.Header().Get("Content-Length"); cl != strconv.Itoa(second.Body.Len()) {
+		t.Errorf("命中缓存 Content-Length = %q, body = %d 字节", cl, second.Body.Len())
 	}
 	if got := r.cdn[ep.ID].hits(); got != hitsBefore {
 		t.Errorf("命中缓存后外呼次数从 %d 变为 %d, 期望不变（零外呼）", hitsBefore, got)

@@ -3,6 +3,7 @@ package segment
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/cache"
@@ -36,9 +37,9 @@ var errGateBusy = errors.New("ffmpeg gate busy")
 // segmentPrefetchRun 是一次分片预热任务的生命周期句柄。
 //
 // 与前台的让路是「立即取消」而不是「跑完这批」：预热占用 ffmpeg 槽位，前台要用的
-// 时候必须马上让出来。取消可能落在某个前台也在等的 single-flight 上，cell 层
-// （cache.flightGroup）会把取消当成「领跑者作废」并让等待者重新领跑，不会把
-// context.Canceled 当成内容失败回报给播放端。
+// 时候必须马上让出来。取消可能落在某个前台也在等的在途生成上（cache 的在途表
+// builds）：前台若一个字节都还没拿到，由调用方（ServeSegment / GetOrGenerate）换一个
+// 新领跑者重试一次，不会把 context.Canceled 当成内容失败回报给播放端。
 type segmentPrefetchRun struct {
 	unitID  string
 	dramaID int64
@@ -183,35 +184,40 @@ func (c *Cutter) prefetchSegment(ctx context.Context, ep store.Episode) error {
 	}
 	defer release()
 
-	return c.caches.Prefetch(bg, spec, func(ctx context.Context) ([]byte, error) {
+	return c.caches.Prefetch(bg, spec, func(ctx context.Context, w io.Writer) error {
 		src := direct
 		if !resolved {
 			var rerr error
 			if src, rerr = c.resolve(ctx, ep); rerr != nil {
-				return nil, keepCancel(ctx, resolveFailure(ep.ID, rerr))
+				return keepCancel(ctx, resolveFailure(ep.ID, rerr))
 			}
 		}
-		out, err := remux(ctx, c.logger, src, c.fetchHeaders(src))
+		cw := &countingWriter{w: w}
+		err := remuxTo(ctx, c.logger, src, c.fetchHeaders(src), cw)
 		if err != nil && errors.Is(err, errRejected) {
 			// 已经被取消就不要再去作废/重解析一次：那会白烧一次上游配额。
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return ctx.Err()
+			}
+			if cw.n > 0 {
+				// 已经写出过字节：重试只会把第二遍追加在后面，宁可失败也不落坏产物。
+				return err
 			}
 			// 与前台同一条自愈路径：作废这一集的直链、重解析、重试一次（ADR-0016）。
 			fresh, refreshErr := c.refreshRejected(ctx, ep, channel)
 			if refreshErr != nil {
-				return nil, keepCancel(ctx, refreshErr)
+				return keepCancel(ctx, refreshErr)
 			}
 			src = fresh
-			out, err = remux(ctx, c.logger, src, c.fetchHeaders(src))
+			err = remuxTo(ctx, c.logger, src, c.fetchHeaders(src), cw)
 		}
 		if err = keepCancel(ctx, err); err != nil {
-			return nil, err
+			return err
 		}
 		c.touchStream(ctx, ep.ID)
 		c.logger.InfoContext(ctx, "segment prefetched",
-			"episode_id", ep.ID, "channel", channel, "bytes", len(out))
-		return out, nil
+			"episode_id", ep.ID, "channel", channel, "bytes", cw.n)
+		return nil
 	})
 }
 

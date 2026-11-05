@@ -197,8 +197,8 @@ App 通道也不可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `
 
 ## `GET /video/{id}/{seq}.m4s`
 
-返回**一整集**的自包含 fMP4。顺序是：**查本地缓存 → 命中即回文件；未命中 → 生成、
-落缓存、再回**。
+返回**一整集**的自包含 fMP4。顺序是：**查本地缓存 → 命中即回文件；未命中 → 边生成
+边出流（首个分片落盘即可播）、生成完落缓存**（MKACG-686）。
 
 - `seq` 直接是播放单元里的成员下标（第 `seq` 集），越界即 404。
 - 生成：`ffmpeg -c copy -movflags +frag_keyframe+empty_moov+default_base_moof -f mp4`，
@@ -231,9 +231,30 @@ App 通道也不可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `
   （`internal/segment` 不认识任何源，只按判据挑一份），理由见 `docs/PLUGIN-CONTRACT.md`
   硬性要求 8。
 - 生成失败：502，**不写缓存**（不许把坏值写进缓存）。
-- `Content-Type: video/mp4`。`Range`：分片是完整不可变对象，支持 `Range` 但不需要分段
-  生成；`HEAD` 返回同样的 `Content-Length`（硬约束 3）。
-- 并发同一个缓存键只生成一次（single-flight），其余请求等同一个结果。
+- **冷启动边生成边出流（MKACG-686）**：缓存未命中时不再「整集转完再回」，而是把
+  ffmpeg 的 stdout 直接接进出流：`ftyp+moov`、每个 `moof+mdat` 一落盘就发给客户端，
+  因此首播等待 ≈ 首个分片（默认 ffmpeg 的 `frag_keyframe`，关键帧 1 s 量级），不再
+  ≈ 整集 remux。响应因此是 **chunked、不设 `Content-Length`** —— 总长度只有整集转完
+  才知道，先给长度就只能等整集，那正是首播慢的根因。
+  - 这是硬约束 3「每个虚拟文件给出精确 `Content-Length`」的**唯一例外**，只适用于
+    `GET` 的冷路径；字节流仍是完整整集产物（与命中路径逐字节一致，回归钉子
+    `TestSegment_StreamedBytesEqualDirectRemux`）。
+  - `HEAD` 与带 `Range` 的请求**不走流式**：等整集生成完再回，长度与区间仍精确
+    （`Content-Length` / `206 + Content-Range`）。WebDAV / rclone 读的是文件元数据，
+    不受这条例外影响。
+  - 首字节前失败：仍回干净的错误码（与命中路径同一套 502/403/501 映射）；领跑者被
+    后台预热抢占取消时可换新领跑者重领一次（`segmentReleads = 1`），预算耗尽回
+    **503 + `Retry-After: 5`**，绝不留「200 + 空 body」。已经开始出流后失败：chunked
+    流中断（客户端看到 `unexpected EOF`），**绝不补一个假的 `Content-Length`**。
+  - 半成品落在 `<cache_dir>/tmp/.partial-*`，**不进 artifact 表**，因此进程重启后
+    不会被当成完整产物服务；只有转封装成功、原子 rename 到 `seg/` 并写行之后才可命中
+    （`docs/CACHE-MODEL.md`）。
+  - 可观测：日志 `segment streamed` 带 `bytes` / `first_segment_ms` / `total_ms`；
+    `/api/playback` 的会话里带 `time_to_first_segment_ms`（首个分片到达客户端前耗时）。
+- `Content-Type: video/mp4`。命中路径 `Range` 由 `ServeContent` 就地切完整文件；
+  冷路径见上一条。
+- 并发同一个缓存键只生成一次（在途表 single-flight，前台与预热共用），其余请求等
+  同一份字节；同一集还在生成时第二次播放会直接读这份在途字节，不会起第二个 ffmpeg。
 - **缓存键按集带通道**（ADR-0011 D3）：`cache.SegmentKey = sha256("e<episode.id>" \x1f channel)`，
   落 `<cache_dir>/seg/<hash 前 2 位>/<hash>.m4s`。`seq` 不进键：合并集第 k 片、单集播放、
   重新分组后的同一集命中同一个文件。通道必须进键 —— 同一集的网页源与 App 源字节流不同

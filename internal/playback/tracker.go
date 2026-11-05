@@ -35,9 +35,12 @@ type Session struct {
 	// TotalSec 是整个播放单元的时长。
 	PositionSec, TotalSec int
 	BytesServed           int64
-	ClientIP              string
-	UserAgent             string
-	FirstSeen, LastSeen   time.Time
+	// TimeToFirstSegment 是本次会话最近一次冷启动的首片耗时（MKACG-686）：
+	// 从分片请求进入到第一个字节写出。命中缓存时为 0（没有等待）。
+	TimeToFirstSegment  time.Duration
+	ClientIP            string
+	UserAgent           string
+	FirstSeen, LastSeen time.Time
 }
 
 // Snapshot 是一次快照：会话按最近活跃降序，另附汇总。
@@ -89,7 +92,7 @@ func (t *Tracker) Open(cl Client, s Session, ttl time.Duration) {
 
 // Progress 记录一次分片出流。会话不存在时建骨架（播放端直接取分片、playlist 还没到），
 // 描述字段留空由随后的 Open 补齐。
-func (t *Tracker) Progress(cl Client, uid string, seq, positionSec int, bytes int64, ttl time.Duration) {
+func (t *Tracker) Progress(cl Client, uid string, seq, positionSec int, bytes int64, firstSegment, ttl time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -105,6 +108,9 @@ func (t *Tracker) Progress(cl Client, uid string, seq, positionSec int, bytes in
 	cur.Seq = seq
 	cur.PositionSec = positionSec
 	cur.BytesServed += bytes
+	if firstSegment > 0 {
+		cur.TimeToFirstSegment = firstSegment
+	}
 	cur.ClientIP = cl.IP
 	cur.UserAgent = cl.UA
 	cur.LastSeen = now

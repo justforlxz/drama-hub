@@ -51,13 +51,14 @@ func (c *Cutter) recordOpen(ctx context.Context, r *http.Request, uid string, ep
 	c.playback.Open(clientOf(r), s, ttl)
 }
 
-// recordProgress 在分片写出后更新会话：第几片、本片在单元时间轴上的起点、本次出流字节。
-func (c *Cutter) recordProgress(ctx context.Context, r *http.Request, uid string, seq int, positionSec int, bytes int64) {
+// recordProgress 在分片写出后更新会话：第几片、本片在单元时间轴上的起点、本次出流字节，
+// 以及冷启动首片耗时（MKACG-686；命中缓存时为 0）。
+func (c *Cutter) recordProgress(ctx context.Context, r *http.Request, uid string, seq int, positionSec int, bytes int64, firstSegment time.Duration) {
 	ttl, ok := c.playbackTTL(ctx)
 	if !ok {
 		return
 	}
-	c.playback.Progress(clientOf(r), uid, seq, positionSec, bytes, ttl)
+	c.playback.Progress(clientOf(r), uid, seq, positionSec, bytes, firstSegment, ttl)
 }
 
 // clientOf 只认 r.RemoteAddr 的 host；不解析 X-Forwarded-For（设计契约明确不做）。

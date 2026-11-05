@@ -2,13 +2,13 @@ package cache
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/store"
@@ -91,9 +91,10 @@ type Cache struct {
 	logger   *slog.Logger
 	now      func() time.Time // 取当前时间；测试注入固定值（last_used_at 与淘汰要可断言）
 
-	flights *flightGroup // single-flight：同一 (kind, key) 的并发生成只做一次
-
-	hooks hooks // 测试注入的单飞观察点；生产为 nil，见 hooks 的注释
+	// builds 是在途的流式生成（GetOrStream / Prefetch 共用）：同一个 (kind, key)
+	// 只有一个领跑者，读者与预热都挂在它上面，加起来只跑一个 ffmpeg。
+	buildMu sync.Mutex
+	builds  map[string]*Stream
 }
 
 // New 构造缓存。st / settings / logger 由装配根注入，不可为 nil。
@@ -103,72 +104,47 @@ func New(st *store.Store, settings *store.Settings, logger *slog.Logger) *Cache 
 		settings: settings,
 		logger:   logger,
 		now:      time.Now,
-		flights:  newFlightGroup(),
+		builds:   make(map[string]*Stream),
 	}
 }
 
-// GetOrGenerate 返回一份缓存内容的完整字节：命中直接读本地文件，未命中调 gen 生成、
-// 落盘并写 artifact 行。
+// GetOrGenerate 返回一份缓存内容的完整字节（调用方要整块用，例如海报）。
 //
-// 返回完整字节（不返回文件句柄）：单片 10 s 约 2–5 MB，边界包用
-// http.ServeContent(w, r, name, modTime, bytes.NewReader(body)) 即可处理 Range。
-//
-// 并发：同一个 (kind, key) 的并发调用只生成一次，其余等同一份结果；不同键互不阻塞。
+// 与 GetOrStream 共用同一套在途表与落盘逻辑：命中直接读本地文件（并 touch、清掉
+// prefetched 标记），未命中生成、落盘并写 artifact 行。整块取用的调用方不需要
+// 「边生成边读」，所以这里就是「挂成读者读到底」。
 func (c *Cache) GetOrGenerate(ctx context.Context, spec Spec, gen GenerateFunc) ([]byte, error) {
-	if err := spec.validate(); err != nil {
-		return nil, err
+	body, err := c.readAll(ctx, spec, gen)
+	// 领跑者被取消（前台 preempt 掉预热等）：自己重新领跑一次。这不是内容错误，
+	// 不能映射成 502（MKACG-682 代码审查 blocker）。调用方自己取消时不重试。
+	if err != nil && errors.Is(err, context.Canceled) && ctx.Err() == nil {
+		return c.readAll(ctx, spec, gen)
 	}
-	if body, ok, err := c.hit(ctx, spec); err != nil || ok {
-		return body, err
-	}
-	if h := c.hooks.beforeEnter; h != nil {
-		h()
-	}
-	body, err := c.flights.do(ctx, spec.Kind+keySeparator+spec.Key, func() ([]byte, error) {
-		// 当上 leader 后再查一次：从上面的 hit() 到这里之间，可能有另一个 leader
-		// 已经生成完并摘掉了 flight（发布先于摘除，所以那时 hit() 必然命中）。
-		// 不复查就会成为第二个 leader，同一片被切两遍 —— MKACG-640。
-		if body, ok, err := c.hit(ctx, spec); err != nil || ok {
-			return body, err
-		}
-		return c.generate(ctx, spec, gen, false)
-	}, c.hooks.published)
-	if err != nil {
-		return nil, err
-	}
-	// 这次结果可能来自别人领跑的 flight（前台正好等到预热）：那条行写的是
-	// prefetched=true，可前台已经把字节交给播放端了。补一次标记，否则「用户播过」
-	// 会在容量吃紧时被当成「没播过」优先淘汰（MKACG-682 代码审查 nit）。
-	_ = c.st.MarkArtifactPlayed(ctx, spec.Kind, spec.Key, stamp(c.now()))
-	return body, nil
+	return body, err
 }
 
-// hit 查索引行并读文件：都成功才算命中，并把 last_used_at 推到现在、清掉预热标记。
-//
-// 行在、文件没了（被手删，或上一轮淘汰删了文件没删成行）按未命中处理，并顺手删掉
-// 这条脏行：淘汰用 SUM(bytes) 算总量，留着指向不存在文件的字节会虚高。
-func (c *Cache) hit(ctx context.Context, spec Spec) (body []byte, ok bool, err error) {
-	row, ok, err := c.cached(ctx, spec)
-	if err != nil || !ok {
-		return nil, false, err
-	}
-	body, err = os.ReadFile(row.Path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			// 与 cached 的判断之间刚被淘汰：删掉脏行，按未命中处理。
-			if derr := c.st.DeleteArtifact(ctx, spec.Kind, spec.Key); derr != nil &&
-				!errors.Is(derr, store.ErrNotFound) {
-				return nil, false, derr
-			}
-			return nil, false, nil
+// readAll 是 GetOrGenerate 的一次尝试：挂成读者把整份内容读到底。
+func (c *Cache) readAll(ctx context.Context, spec Spec, gen GenerateFunc) ([]byte, error) {
+	s, err := c.GetOrStream(ctx, spec, func(ctx context.Context, w io.Writer) error {
+		body, err := gen(ctx)
+		if err != nil {
+			return err
 		}
-		return nil, false, fmt.Errorf("读缓存文件 %s: %w", row.Path, err)
+		_, err = w.Write(body)
+		return err
+	}, false)
+	if err != nil {
+		return nil, err
 	}
-	// 命中即 touch（契约 MUST）：不 touch 的条目会被 cache_lru_days 当成过期删掉，
-	// 而它天天在用。同时清掉 prefetched —— 用户真的播到了这一片，容量吃紧时它不再
-	// 是「预热优先淘汰」的候选。失败只影响淘汰顺序，不影响这次正确性，因此忽略。
-	_ = c.st.MarkArtifactPlayed(ctx, spec.Kind, spec.Key, stamp(c.now()))
-	return body, true, nil
+	if s.Cached() {
+		return s.Bytes()
+	}
+	rd, err := s.Reader(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer rd.Close()
+	return io.ReadAll(rd)
 }
 
 // cached 确认一份缓存是否已经有本地字节：行在、文件在才算有。不读文件内容，也不
@@ -202,22 +178,20 @@ func (c *Cache) cached(ctx context.Context, spec Spec) (store.Artifact, bool, er
 // ffmpeg；反过来预热当 leader 时，前台等待者拿到同一份字节。
 //
 // 不返回字节：预热的结果不进当前请求。失败原样返回错误，调用方只记日志。
-func (c *Cache) Prefetch(ctx context.Context, spec Spec, gen GenerateFunc) error {
+func (c *Cache) Prefetch(ctx context.Context, spec Spec, gen WriteFunc) error {
 	if err := spec.validate(); err != nil {
 		return err
 	}
 	if ok, err := c.Has(ctx, spec); err != nil || ok {
 		return err
 	}
-	_, err := c.flights.do(ctx, spec.Kind+keySeparator+spec.Key, func() ([]byte, error) {
-		// 与 GetOrGenerate 同样的领跑复查：前台可能刚生成完并摘掉 flight，
-		// 不复查就会把同一片再切一遍（预热白跑一次 ffmpeg）。
-		if ok, err := c.Has(ctx, spec); err != nil || ok {
-			return nil, err
-		}
-		return c.generate(ctx, spec, gen, true)
-	}, c.hooks.published)
-	return err
+	// 与前台共用同一张在途表（GetOrStream）：前台正在生成这一集时预热只是等它，
+	// 反过来预热领跑时前台读同一份字节 —— 同一集永远只有一个 ffmpeg。
+	s, err := c.GetOrStream(ctx, spec, gen, true)
+	if err != nil {
+		return err
+	}
+	return s.Wait(ctx)
 }
 
 // Has 报告一份缓存是否已有本地字节（不读内容、不动 last_used_at）。
@@ -230,59 +204,6 @@ func (c *Cache) Has(ctx context.Context, spec Spec) (bool, error) {
 	}
 	_, ok, err := c.cached(ctx, spec)
 	return ok, err
-}
-
-// generate 生成 → 落盘 → 写行。任一步失败都不留缓存：没 rename 到位就不写行；
-// 写行失败就把刚落的文件删掉——否则它既不会被命中，也不会被淘汰扫到（淘汰按行驱动）。
-//
-// prefetched 写进 artifact.prefetched：前台生成是 false，后台预热是 true。
-func (c *Cache) generate(ctx context.Context, spec Spec, gen GenerateFunc, prefetched bool) ([]byte, error) {
-	body, err := gen(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if len(body) == 0 {
-		return nil, fmt.Errorf("生成 %s/%s 的内容为空", spec.Kind, spec.Key)
-	}
-	root, err := cacheRoot(ctx, c.settings)
-	if err != nil {
-		return nil, err
-	}
-	l := layoutOf(root)
-	target, err := l.file(spec.Kind, cacheHash(spec.Kind, spec.Key), spec.Ext)
-	if err != nil {
-		return nil, err
-	}
-	if err := writeFileAtomic(l.tmpDir(), target, body); err != nil {
-		return nil, fmt.Errorf("写入缓存文件 %s: %w", target, err)
-	}
-	digest := sha256.Sum256(body)
-	if err := c.st.PutArtifact(ctx, store.Artifact{
-		Kind:       spec.Kind,
-		Key:        spec.Key,
-		Path:       target,
-		Bytes:      int64(len(body)),
-		SHA256:     hex.EncodeToString(digest[:]),
-		LastUsedAt: stamp(c.now()),
-		Prefetched: prefetched,
-	}); err != nil {
-		_ = os.Remove(target)
-		return nil, err
-	}
-	return body, nil
-}
-
-// hooks 是单飞状态迁移的观察点，只给测试用：测试在 New 之后设 c.hooks 卡住某个瞬间，
-// 把本来要靠调度运气才撞上的窗口变成确定性的。两个字段为 nil（生产的唯一取值）时
-// GetOrGenerate / flightGroup.do 里各只剩一次 nil 判断。
-type hooks struct {
-	// beforeEnter 在「初次命中选择失败、即将进入单飞」之间调用，调用时不持锁。
-	beforeEnter func()
-
-	// published 在 leader 的结果已发布（close(done) 已完成）、flight 尚未摘除时调用，
-	// 调用时持有 flightGroup 的锁：钩子里只能做只读断言（或调 c.hit —— 它不碰那把锁），
-	// 回调 GetOrGenerate 会重入同一把锁而死锁。
-	published func(id string)
 }
 
 // stamp 是 artifact.last_used_at 的统一格式：UTC RFC3339（定长、可按字符串排序）。

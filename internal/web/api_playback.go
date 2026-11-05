@@ -32,10 +32,13 @@ type playbackSessionView struct {
 	PositionSec int    `json:"position_sec"`
 	TotalSec    int    `json:"total_sec"`
 	BytesServed int64  `json:"bytes_served"`
-	ClientIP    string `json:"client_ip"`
-	UserAgent   string `json:"user_agent"`
-	FirstSeen   string `json:"first_seen"`
-	LastSeen    string `json:"last_seen"`
+	// TimeToFirstSegmentMS 是最近一次冷启动的首片耗时（毫秒）；命中缓存时为 0
+	// （MKACG-686：改造前后对比看这一项）。
+	TimeToFirstSegmentMS int64  `json:"time_to_first_segment_ms"`
+	ClientIP             string `json:"client_ip"`
+	UserAgent            string `json:"user_agent"`
+	FirstSeen            string `json:"first_seen"`
+	LastSeen             string `json:"last_seen"`
 }
 
 // handlePlayback 处理 GET /api/playback：只读快照，不改会话表。
@@ -61,19 +64,20 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, sess := range snap.Sessions {
 		view.Sessions = append(view.Sessions, playbackSessionView{
-			UID:         sess.UID,
-			DramaID:     sess.DramaID,
-			Title:       sess.Title,
-			Unit:        sess.Unit,
-			Seq:         sess.Seq,
-			Slices:      sess.Slices,
-			PositionSec: sess.PositionSec,
-			TotalSec:    sess.TotalSec,
-			BytesServed: sess.BytesServed,
-			ClientIP:    sess.ClientIP,
-			UserAgent:   sess.UserAgent,
-			FirstSeen:   formatTime(sess.FirstSeen),
-			LastSeen:    formatTime(sess.LastSeen),
+			UID:                  sess.UID,
+			DramaID:              sess.DramaID,
+			Title:                sess.Title,
+			Unit:                 sess.Unit,
+			Seq:                  sess.Seq,
+			Slices:               sess.Slices,
+			PositionSec:          sess.PositionSec,
+			TotalSec:             sess.TotalSec,
+			BytesServed:          sess.BytesServed,
+			TimeToFirstSegmentMS: sess.TimeToFirstSegment.Milliseconds(),
+			ClientIP:             sess.ClientIP,
+			UserAgent:            sess.UserAgent,
+			FirstSeen:            formatTime(sess.FirstSeen),
+			LastSeen:             formatTime(sess.LastSeen),
 		})
 	}
 	writeJSON(w, http.StatusOK, view)

@@ -52,6 +52,7 @@ playlist 是派生数据的**纯函数**（`segment.BuildPlaylist`）：一次�
 ├── seg/<hash 前 2 位>/<hash>.m4s        # 分片（一整集 fMP4），内容寻址
 ├── cover/<hash 前 2 位>/<hash>.<ext>    # 海报
 └── tmp/                                 # 写入中的临时文件（rename 前）
+    └── .partial-*                       # 正在生成的半成品（见 PLAYBACK-CONTRACT「冷启动边生成边出流」）
 ```
 
 - 文件名里的 `<hash>` 按 kind 分两种取法（`internal/cache/keys.go` 的 `cacheHash`）：
@@ -68,6 +69,8 @@ playlist 是派生数据的**纯函数**（`segment.BuildPlaylist`）：一次�
   （`plugin.Stream.Key`）**不进键**：通道段就是它在键里的替身，判据只有
   `segment.channelOf` 一处。
 - 文件**不可变**：内容只由键决定，所以写用「临时文件 + `rename`」，读到半截文件的可能为零。
+  半成品是 `tmp/.partial-*`，**不进 `artifact` 表**：它是「还没转完」的唯一证据，
+  重启后没有任何行指向它，因此不会被当成完整产物服务（MKACG-686）。
 - **海报的下载超时与失败口径（MKACG-620）**：单次出站超时按 `cover_timeout_sec`
   现读（默认 5 s，1–60，见 `docs/DEV-STANDARDS.md`「配置」表），不跟插件的
   `base_url` / `request_timeout_sec` 走 —— 封面 URL 是上游页面里的三方 CDN 绝对地址。
@@ -103,8 +106,10 @@ playlist 是派生数据的**纯函数**（`segment.BuildPlaylist`）：一次�
 
 淘汰循环（单 goroutine，启动后每 5 分钟一次，与请求路径无关）：
 
-1. `DELETE` 过期：`artifact WHERE last_used_at < now - cache_lru_days`
-2. 若 `SUM(bytes) WHERE kind='segment' > cache_max_mb`，分两轮：
+1. 清扫 `tmp/`：删掉 mtime 早于 1 小时的普通文件。半成品（`.partial-*`）只会待在这里，
+   且永远排在所有淘汰动作之前——它们是纯垃圾，不需要按 LRU 排，越早删越好
+2. `DELETE` 过期：`artifact WHERE last_used_at < now - cache_lru_days`
+3. 若 `SUM(bytes) WHERE kind='segment' > cache_max_mb`，分两轮：
    先按 `last_used_at` 升序删 `prefetched = TRUE` 的分片（预热生成、还没有被任何一次
    播放请求用过），删到上限内就停；仍然超限才按 `last_used_at` 升序动播过的分片
    （一次删一批，避免长事务）
@@ -150,7 +155,8 @@ GET /webdav/<分类>/<剧>/poster.jpg
 
 | 场景 | 做法 |
 |---|---|
-| 同一缓存键并发请求 | single-flight：一个生成，其余等结果 |
+| 同一缓存键并发请求 | 在途表 single-flight（`Cache.builds`）：一个领跑者生成，其余挂同一份字节；**前台与预热共用这张表**，所以同一集同时被播放与预热也只起一个 ffmpeg（MKACG-686）。进锁前查一次缓存、**进锁后再查一次**，堵住「领跑者写完 artifact 行、还没摘在途表」时晚到者变成第二个领跑者的窗口 |
+| 生成中读者 | 读者按已落盘长度读，写一段读一段；`Reader` 在锁内 `open`，而 `rename` 与读路径切换在同一临界区 —— 读者不会打开已被搬走的半成品。领跑者失败/被 preempt 时读者立刻看见终止，**一个字节都没拿到的请求由调用方（`ServeSegment` / `GetOrGenerate`）换新领跑者重领一次**（`segmentReleads = 1`；预算耗尽写 503 + `Retry-After`，不留空 200），已出流的按中断收尾 |
 | 同一封面的并发请求（同步 + poster.jpg） | 同一套 single-flight（`CoverCache` 的 `flightGroup`），只回源一次 |
 | 多个不同分片同时生成 | 受现有 ffmpeg 闸限制（`min(4, max(1, NumCPU/2))`，不新增配置） |
 | 淘汰与读取撞车 | 读先打开文件句柄再查行；行被删但文件还在 → 命中；文件被删 → 重新生成。不需要锁 |
@@ -164,9 +170,11 @@ GET /video/{id}/{seq}.m4s
   → 查 segment 行拿通道（episode_id 主键查询）    ← 行在就不解析直链
   → 查 artifact(kind='segment', key=sha256(键))    1 次主键查询
   → 命中：打开文件，http.ServeContent（Range 由它处理），touch last_used_at
-  → 未命中：取直链（未过期的库内行优先，ADR-0016）→ single-flight 整集转封装
-    → 落缓存 → 回字节; CDN 401/403/404 时作废这一集并重解析一次再试
-  → 生成失败：502，不写缓存
+  → 未命中：取直链（未过期的库内行优先，ADR-0016）→ 在途表 single-flight 整集转封装
+    → **边转边出流**（chunked，首个 `moof+mdat` 落盘即发；不设 Content-Length）
+    → 转完 rename 到 `seg/` + 写 artifact 行（下次命中）
+    CDN 401/403/404 时作废这一集并重解析一次再试（只在一个字节都没写出时）
+  → 生成失败（出流前）：502，不写缓存；出流后失败：流中断，不补假长度
 ```
 
 `segment` 行是「这一集走哪条通道」的持久事实，也是命中路径零外呼的前提。

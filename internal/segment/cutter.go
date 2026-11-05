@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os/exec"
@@ -466,21 +467,49 @@ func remuxArgs(src stream.Direct, headers string) []string {
 // src.Key 非空时解密交给 ffmpeg 原生 `-decryption_key`（不自己解 CENC、不落整集
 // 明文）：同一条 `-c copy` 路径，只是多一个输入选项。
 func remux(ctx context.Context, logger *slog.Logger, src stream.Direct, headers string) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := remuxTo(ctx, logger, src, headers, &buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// countingWriter 数已经写出的字节：失败重试前要确认「一个字节都还没写」，
+// 否则第二遍会追加在第一遍半截内容后面。
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// remuxTo 是 remux 的流式形态：ffmpeg 的 stdout 直接写进 w，字节一到就交给调用方
+// （MKACG-686：冷启动时首个分片落盘即可对外服务，不必等整集转封装完成）。
+//
+// 错误语义与 remux 完全一致：失败返回 httpx.ErrUpstream，**错误文本只有稳定类别**，
+// ffmpeg 的 stderr 带签名直链，只按 loggableStderr 的判据进日志（MKACG-639）。
+// 返回错误时 w 里可能已经有半截字节：调用方要么丢弃（缓存生成失败即删临时文件），
+// 要么断开响应 —— 绝不能把它当成完整产物。
+func remuxTo(ctx context.Context, logger *slog.Logger, src stream.Direct, headers string, w io.Writer) error {
 	dctx, cancel := context.WithTimeout(ctx, timeoutRemux)
 	defer cancel()
 	cmd := exec.CommandContext(dctx, "ffmpeg", remuxArgs(src, headers)...)
-	out, err := cmd.Output()
-	if err != nil {
-		// out 是 stdout（失败时可能是半截字节），既不进日志也不进错误文本：
-		// stderr 只从 ExitError 取。
-		tail := stderrTail(err, nil)
+	var stderr bytes.Buffer
+	cmd.Stdout = w
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		tail := stderrTail(err, stderr.Bytes())
 		class := failureClass(classRemuxFailed, []byte(tail))
 		logger.WarnContext(ctx, "ffmpeg remux failed",
 			"host", safeHost(src.URL), "class", class,
 			"stderr", loggableStderr(tail))
-		return nil, subprocessError(class)
+		return subprocessError(class)
 	}
-	return out, nil
+	return nil
 }
 
 // formatSeconds 把秒格式化成三位十进制（EXTINF 用；整数秒时长写成 `123.000`）。

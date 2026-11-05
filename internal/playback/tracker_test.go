@@ -28,9 +28,9 @@ func TestTrackerOpenAndProgress(t *testing.T) {
 	}
 
 	clock.Step(5 * time.Second)
-	tr.Progress(cl, "u1", 2, 120, 1000, ttl)
+	tr.Progress(cl, "u1", 2, 120, 1000, 0, ttl)
 	clock.Step(5 * time.Second)
-	tr.Progress(cl, "u1", 3, 180, 2000, ttl)
+	tr.Progress(cl, "u1", 3, 180, 2000, 0, ttl)
 
 	got := tr.Snapshot(ttl)
 	if len(got.Sessions) != 1 {
@@ -56,7 +56,7 @@ func TestTrackerOpenKeepsProgress(t *testing.T) {
 	cl := Client{IP: "10.0.0.1", UA: "UA"}
 
 	tr.Open(cl, Session{UID: "u1", Title: "剧一"}, ttl)
-	tr.Progress(cl, "u1", 4, 240, 500, ttl)
+	tr.Progress(cl, "u1", 4, 240, 500, 0, ttl)
 	clock.Step(time.Second)
 	tr.Open(cl, Session{UID: "u1", Title: "剧一改名", Unit: "第 1–10 集", Slices: 10, TotalSec: 600}, ttl)
 
@@ -76,7 +76,7 @@ func TestTrackerProgressSkeleton(t *testing.T) {
 	ttl := 120 * time.Second
 	cl := Client{IP: "10.0.0.2", UA: "UA"}
 
-	tr.Progress(cl, "u9", 0, 0, 100, ttl)
+	tr.Progress(cl, "u9", 0, 0, 100, 0, ttl)
 	s := tr.Snapshot(ttl).Sessions[0]
 	if s.UID != "u9" || s.Title != "" || s.DramaID != 0 || s.BytesServed != 100 {
 		t.Fatalf("骨架 = %+v，期望只有 uid 与字节", s)
@@ -115,7 +115,7 @@ func TestTrackerOrderedByLastSeen(t *testing.T) {
 	clock.Step(time.Second)
 	tr.Open(Client{IP: "2", UA: "B"}, Session{UID: "new"}, ttl)
 	clock.Step(time.Second)
-	tr.Progress(Client{IP: "1", UA: "A"}, "old", 1, 60, 1, ttl)
+	tr.Progress(Client{IP: "1", UA: "A"}, "old", 1, 60, 1, 0, ttl)
 
 	got := tr.Snapshot(ttl)
 	if got.Sessions[0].UID != "old" {

@@ -52,40 +52,54 @@ func shiftTimeline(body []byte, offset time.Duration) ([]byte, error) {
 		if b.typ != boxMoof {
 			continue
 		}
-		for _, traf := range mustBoxes(out, b.payload, b.end) {
-			if traf.typ != boxTraf {
-				continue
-			}
-			var trackID uint32
-			for _, child := range mustBoxes(out, traf.payload, traf.end) {
-				if child.typ == boxTfhd {
-					// tfhd 是 full box：version/flags(4) 之后才是 track_ID。
-					if child.payload+8 > child.end {
-						return nil, fmt.Errorf("tfhd 长度不足（%d）", child.end-child.payload)
-					}
-					trackID = binary.BigEndian.Uint32(out[child.payload+4:])
-				}
-			}
-			timescale, ok := tracks[trackID]
-			if !ok {
-				return nil, fmt.Errorf("tfhd 的 track_id=%d 在 moov 里没有对应轨道", trackID)
-			}
-			ticks := durationTicks(offset, timescale)
-			for _, child := range mustBoxes(out, traf.payload, traf.end) {
-				if child.typ != boxTfdt {
-					continue
-				}
-				if err := addTicks(out, child, ticks); err != nil {
-					return nil, err
-				}
-				shifted++
-			}
+		n, err := shiftMoofBox(out, b, tracks, offset)
+		if err != nil {
+			return nil, err
 		}
+		shifted += n
 	}
 	if shifted == 0 {
 		return nil, fmt.Errorf("片段的 moof 里没有 tfdt（不是 fragmented MP4？）")
 	}
 	return out, nil
+}
+
+// shiftMoofBox 把 buf 里一个 moof box 的 tfdt 全部加上 offset，返回改了几处。
+//
+// buf 既可以是整集字节（shiftTimeline），也可以是单独一块 moof（shiftStream 的
+// 增量路径）——b 的坐标按 buf 算，两种调用方式语义相同。
+func shiftMoofBox(buf []byte, b box, tracks map[uint32]uint32, offset time.Duration) (int, error) {
+	shifted := 0
+	for _, traf := range mustBoxes(buf, b.payload, b.end) {
+		if traf.typ != boxTraf {
+			continue
+		}
+		var trackID uint32
+		for _, child := range mustBoxes(buf, traf.payload, traf.end) {
+			if child.typ == boxTfhd {
+				// tfhd 是 full box：version/flags(4) 之后才是 track_ID。
+				if child.payload+8 > child.end {
+					return 0, fmt.Errorf("tfhd 长度不足（%d）", child.end-child.payload)
+				}
+				trackID = binary.BigEndian.Uint32(buf[child.payload+4:])
+			}
+		}
+		timescale, ok := tracks[trackID]
+		if !ok {
+			return 0, fmt.Errorf("tfhd 的 track_id=%d 在 moov 里没有对应轨道", trackID)
+		}
+		ticks := durationTicks(offset, timescale)
+		for _, child := range mustBoxes(buf, traf.payload, traf.end) {
+			if child.typ != boxTfdt {
+				continue
+			}
+			if err := addTicks(buf, child, ticks); err != nil {
+				return 0, err
+			}
+			shifted++
+		}
+	}
+	return shifted, nil
 }
 
 // durationTicks 把时长换算成某个 timescale 下的刻度数（四舍五入）。

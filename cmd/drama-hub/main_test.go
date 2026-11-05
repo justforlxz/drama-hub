@@ -959,14 +959,14 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 		return fmt.Sprintf("%s/回填剧 - S01E%02d - 第%d集.nfo", season, epNo, epNo)
 	}
 
-	// 播放前：两集都是 0，.nfo 的 <runtime> 是 0 —— G4 要修的现状。
+	// 播放前：两集时长都未知，.nfo 不写 <runtime> —— 未知不冒充 0 分钟（MKACG-689）。
 	for _, epNo := range []int{1, 2} {
 		body, err := tree.Render(ctx, nfoOf(epNo))
 		if err != nil {
 			t.Fatalf("播放前取第 %d 集 .nfo: %v", epNo, err)
 		}
-		if want := "<runtime>0</runtime>"; !strings.Contains(string(body), want) {
-			t.Errorf("播放前第 %d 集 .nfo 缺 %s：%s", epNo, want, body)
+		if strings.Contains(string(body), "<runtime>") {
+			t.Errorf("播放前第 %d 集 .nfo 不该写 runtime（时长未知）：%s", epNo, body)
 		}
 	}
 	before, err := st.EpisodeByID(ctx, playedID)
@@ -1004,7 +1004,7 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 	t.Logf("回填后：episode.duration_sec=%d, 派生 runtime_sec=%d, .nfo=%s",
 		got.DurationSec, items[0].RuntimeSec, strings.TrimSpace(string(body)))
 
-	// 没播过的集：库里仍是 0，.nfo 照常出、仍是 0（不报错、不阻断）。
+	// 没播过的集：库里仍是 0，.nfo 照常出、但不写 runtime（未知不等于 0 分钟，MKACG-689）。
 	ep, err := st.EpisodeByID(ctx, unplayedID)
 	if err != nil {
 		t.Fatalf("EpisodeByID 未播放集: %v", err)
@@ -1016,8 +1016,8 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("未播放集取 .nfo: %v", err)
 	}
-	if want := "<runtime>0</runtime>"; !strings.Contains(string(body), want) {
-		t.Errorf("未播放集 .nfo 缺 %s：%s", want, body)
+	if strings.Contains(string(body), "<runtime>") {
+		t.Errorf("未播放集 .nfo 不该写 runtime：%s", body)
 	}
 }
 

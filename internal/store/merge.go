@@ -16,12 +16,18 @@ import (
 // 里 `{id}` 的 uid 段：单集 `e<episode.id>`、合并集
 // `m<dramaID>_<epFrom>_<epTo>`（两个空间互不匹配，docs/adr/0010）。
 type EmbyItem struct {
-	DramaID    int64
-	Season     int
-	EpNo       int
-	Kind       string // single | merged
-	UID        string
+	DramaID int64
+	Season  int
+	EpNo    int
+	Kind    string // single | merged
+	UID     string
+	// RuntimeSec 是已知时长之和：单集取该集时长、合并集取块内时长之和。
+	// 块内还有没探测过的成员时它只是「部分之和」，是否完整看 RuntimeUnknown。
 	RuntimeSec int
+	// RuntimeUnknown 是块内时长未知（duration_sec 仍为 0，还没首播探测）的集数。
+	// >0 时 RuntimeSec 不是这块的真实总时长，调用方 MUST NOT 把它当完整值展示
+	// （.nfo 因此不写 <runtime>，见 internal/vfs/render.go）。MKACG-689。
+	RuntimeUnknown int
 	// EpisodeID 是单集对应的源集主键；合并集为 0。
 	EpisodeID int64
 	// EpFrom / EpTo 是这条对外剧集覆盖的源集号：单集两者都等于自身 ep_no，
@@ -58,7 +64,8 @@ func chunkEpisodes(eps []Episode, n int) [][]Episode {
 // 派生规则（docs/adr/0010）：episode 按 ep_no 升序，每 n 集切一块，第 i 块占
 // 对外集号 i；块内 1 集是单集、≥2 集是合并集。0 集 → 0 条，不留空组。
 // uid 只由 (episode.id) 或 (dramaID, epFrom, epTo) 派生，不含自增主键。
-// runtime_sec 单集取该集时长、合并集取块内时长之和。
+// runtime_sec 单集取该集时长、合并集取块内时长之和；块内还有没探测过的成员时
+// runtime_unknown 记下这些集数，调用方据此判断总和是否完整（MKACG-689）。
 func deriveEmbyItems(dramaID int64, eps []Episode, n int) []EmbyItem {
 	blocks := chunkEpisodes(eps, n)
 	out := make([]EmbyItem, 0, len(blocks))
@@ -71,6 +78,10 @@ func deriveEmbyItems(dramaID int64, eps []Episode, n int) []EmbyItem {
 			EpTo:    block[len(block)-1].EpNo,
 		}
 		for _, ep := range block {
+			if ep.DurationSec <= 0 {
+				it.RuntimeUnknown++
+				continue
+			}
 			it.RuntimeSec += ep.DurationSec
 		}
 		if len(block) == 1 {

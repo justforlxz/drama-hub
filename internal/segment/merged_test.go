@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/httpx"
@@ -472,4 +473,59 @@ func probeURL(t *testing.T, url string) float64 {
 		t.Fatalf("解析 ffprobe 时长 %q: %v", out, err)
 	}
 	return v
+}
+
+// TestPlaylist_SessionTotalMatchesExtinf 钉住 MKACG-689 的 AC-1 / AC-2 / AC-5：
+// 首次打开从未播放过的合并块时，后台「正在播放」的本单元总时长必须等于 playlist 的
+// EXTINF 总和、且约等于成员之和（不得退化成「一集长度」）；补齐时长后再次打开不漂移。
+func TestPlaylist_SessionTotalMatchesExtinf(t *testing.T) {
+	r, uid, wantSum := mergedRig(t, 6)
+
+	open := func() (float64, int) {
+		t.Helper()
+		rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+".m3u8")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+		}
+		var extinfSum float64
+		for _, line := range strings.Split(rec.Body.String(), "\n") {
+			rest, ok := strings.CutPrefix(line, "#EXTINF:")
+			if !ok {
+				continue
+			}
+			sec, err := strconv.ParseFloat(strings.TrimSuffix(rest, ","), 64)
+			if err != nil {
+				t.Fatalf("解析 EXTINF 失败 %q: %v", line, err)
+			}
+			extinfSum += sec
+		}
+		snap := r.pb.Snapshot(time.Minute)
+		if len(snap.Sessions) != 1 {
+			t.Fatalf("会话数 = %d, 期望 1", len(snap.Sessions))
+		}
+		return extinfSum, snap.Sessions[0].TotalSec
+	}
+
+	// AC-1 / AC-5：成员此时都还没探测过（duration_sec=0），playlist 一次补齐并现算。
+	extinfSum, sessionTotal := open()
+	if sessionTotal != int(math.Round(extinfSum)) {
+		t.Errorf("会话总时长 = %d, EXTINF 总和 = %v, 期望同口径", sessionTotal, extinfSum)
+	}
+	if diff := math.Abs(float64(sessionTotal) - wantSum); diff > 2 {
+		t.Errorf("会话总时长 = %d, 成员时长之和 = %.2f, 偏差 %.2f 超过 2s",
+			sessionTotal, wantSum, diff)
+	}
+	// 「看起来只有一集」的直接回归钉：两集合并块的总时长必须大于单集时长。
+	if single := rigMembers(t, r)[0].DurationSec; sessionTotal <= single {
+		t.Errorf("合并块总时长 = %d, 单集 = %d, 期望大于单集", sessionTotal, single)
+	}
+
+	// AC-2：成员时长已回填，再次打开总时长与首次一致，不因回填而漂移。
+	extinfSum2, sessionTotal2 := open()
+	if sessionTotal2 != sessionTotal {
+		t.Errorf("回填后总时长 = %d, 首次 = %d, 期望不漂移", sessionTotal2, sessionTotal)
+	}
+	if sessionTotal2 != int(math.Round(extinfSum2)) {
+		t.Errorf("回填后会话总时长 = %d, EXTINF 总和 = %v, 期望同口径", sessionTotal2, extinfSum2)
+	}
 }

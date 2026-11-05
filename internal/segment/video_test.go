@@ -21,6 +21,7 @@ import (
 
 	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/pgtest"
+	"github.com/justforlxz/drama-hub/internal/playback"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/stream"
 )
@@ -308,6 +309,8 @@ type rig struct {
 	st       *store.Store
 	settings *store.Settings
 	logs     *bytes.Buffer
+	// pb 是播放会话表：playlist 请求写它，MKACG-689 用它比对「本单元总时长」。
+	pb *playback.Tracker
 
 	dramaID int64
 	// cacheRoot 是本次测试的 <cache_dir>（断言落盘文件数用）。
@@ -348,6 +351,8 @@ func newRig(t *testing.T) *rig {
 		// 分块大小 1：本rig 的每个 addEpisode 都是一条独立的播放单元（e<id>）。
 		// 合并集的用例自己把这一项调成 10（见 mergedRig）。
 		store.KeyMergeChunkSize: "1",
+		// 播放会话保留时长：AC-5 要读会话表里的「本单元总时长」。
+		store.KeyPlaySessionTTL: "60",
 	} {
 		if err := settings.Set(ctx, k, v); err != nil {
 			t.Fatalf("Set %s: %v", k, err)
@@ -360,6 +365,7 @@ func newRig(t *testing.T) *rig {
 
 	r := &rig{
 		db: db, st: st, settings: settings, logs: &bytes.Buffer{},
+		pb:      playback.NewTracker(time.Now),
 		dramaID: dramaID, cacheRoot: root, cdn: map[int64]*fakeCDN{}, keys: map[int64][]byte{},
 		resolveErr: map[int64]error{}, healOnInvalidate: map[int64]bool{},
 	}
@@ -399,7 +405,7 @@ func newRig(t *testing.T) *rig {
 				out[i] = d
 			}
 			return out, nil
-		}, r.invalidate, Headers{Web: testWebHeaders, App: testAppHeaders}, nil)
+		}, r.invalidate, Headers{Web: testWebHeaders, App: testAppHeaders}, r.pb)
 	return r
 }
 

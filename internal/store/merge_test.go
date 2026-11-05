@@ -453,3 +453,67 @@ func TestConcurrentUpsertAndList(t *testing.T) {
 		t.Fatalf("episode 行数 = %d, 期望 %d（并发 upsert 不得重复建集）", n, episodes)
 	}
 }
+
+// TestDeriveEmbyItems_RuntimeUnknown 钉住 MKACG-689：未知时长不得当作完整的 0。
+// 合并块里还有没探测过的成员时，RuntimeSec 只是已知部分之和，RuntimeUnknown 记这些集数。
+func TestDeriveEmbyItems_RuntimeUnknown(t *testing.T) {
+	eps := []Episode{
+		{ID: 1, DramaID: 7, EpNo: 1, DurationSec: 0},
+		{ID: 2, DramaID: 7, EpNo: 2, DurationSec: 50},
+		{ID: 3, DramaID: 7, EpNo: 3, DurationSec: 0},
+	}
+	merged := deriveEmbyItems(7, eps, 3)
+	if len(merged) != 1 {
+		t.Fatalf("对外剧集数 = %d, 期望 1", len(merged))
+	}
+	if got := merged[0]; got.RuntimeSec != 50 || got.RuntimeUnknown != 2 {
+		t.Errorf("合并集 = (runtime=%d, unknown=%d), 期望 (50, 2)", got.RuntimeSec, got.RuntimeUnknown)
+	}
+
+	// 所有成员都已知时 unknown 归零，RuntimeSec 就是完整总时长。
+	complete := deriveEmbyItems(7, []Episode{
+		{ID: 1, EpNo: 1, DurationSec: 40},
+		{ID: 2, EpNo: 2, DurationSec: 60},
+	}, 10)
+	if got := complete[0]; got.RuntimeSec != 100 || got.RuntimeUnknown != 0 {
+		t.Errorf("完整合并集 = (runtime=%d, unknown=%d), 期望 (100, 0)", got.RuntimeSec, got.RuntimeUnknown)
+	}
+
+	// N=1 时未知集自成一条单集，它的 Unknown 同样为 1（NFO 也因此不写 runtime）。
+	singles := deriveEmbyItems(7, eps, 1)
+	if len(singles) != 3 {
+		t.Fatalf("N=1 对外剧集数 = %d, 期望 3", len(singles))
+	}
+	for i, wantUnknown := range []int{1, 0, 1} {
+		if singles[i].RuntimeUnknown != wantUnknown {
+			t.Errorf("N=1 items[%d] unknown = %d, 期望 %d", i, singles[i].RuntimeUnknown, wantUnknown)
+		}
+	}
+}
+
+// TestDeriveEmbyItems_PerEpisodeRuntimeIndependentOfChunkSize 钉住 MKACG-689 AC-4：
+// 单集时长口径与 merge_chunk_size 无关 —— N=1 的单集时长之和等于 N=10 的合并集总时长。
+func TestDeriveEmbyItems_PerEpisodeRuntimeIndependentOfChunkSize(t *testing.T) {
+	eps := []Episode{
+		{ID: 1, DramaID: 9, EpNo: 1, DurationSec: 100},
+		{ID: 2, DramaID: 9, EpNo: 2, DurationSec: 200},
+		{ID: 3, DramaID: 9, EpNo: 3, DurationSec: 300},
+	}
+
+	perEpisodeTotal := 0
+	for _, it := range deriveEmbyItems(9, eps, 1) {
+		if it.Kind != "single" {
+			t.Fatalf("N=1 出现非单集 %+v", it)
+		}
+		perEpisodeTotal += it.RuntimeSec
+	}
+
+	merged := deriveEmbyItems(9, eps, 10)
+	if len(merged) != 1 {
+		t.Fatalf("N=10 对外剧集数 = %d, 期望 1", len(merged))
+	}
+	if merged[0].RuntimeSec != perEpisodeTotal {
+		t.Errorf("N=10 合并集总时长 = %d, N=1 单集之和 = %d, 期望一致",
+			merged[0].RuntimeSec, perEpisodeTotal)
+	}
+}

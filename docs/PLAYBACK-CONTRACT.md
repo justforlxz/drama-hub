@@ -138,8 +138,11 @@ App 通道也不可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `
 对全库 ffprobe 是不可完成的任务（`docs/L1-CORPUS-SCOPE.md` 取证 D/E）。
 
 探测到的源时长会回填 `episode.duration_sec`（只填 0，不覆盖非零值）；对外 runtime 在
-列举时现算，`.nfo` 的 `<runtime>` 与 playlist 的 `#EXTINF` 下一次读取就是真实值；没播过
-的集仍是 0。细节见 `docs/DEV-STANDARDS.md`「时长探测」。
+列举时现算，`.nfo` 的 `<runtime>` 与 playlist 的 `#EXTINF` 下一次读取就是真实值。
+没播过的集仍是 0：合并块里还有这种成员时 `.nfo` **不写** `<runtime>`（缺该元素即视为
+未知，不拿「已知部分之和」冒充整块时长，MKACG-689）；playlist 则一律先把成员补齐再出，
+所以 `#EXTINF` 总和永远是这几个成员的真实时长之和。后台「正在播放」的「本单元总时长」
+取同一份 `Timeline`，与 `#EXTINF` 总和同口径。细节见 `docs/DEV-STANDARDS.md`「时长探测」。
 
 ## 直链复用与失败自愈（ADR-0016）
 

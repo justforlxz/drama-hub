@@ -63,6 +63,9 @@ func (t *Tree) renderStrm(ctx context.Context, item store.EmbyItem) ([]byte, err
 // episodeNFO 是集 NFO 的 XML 结构，根元素 episodedetails（Emby EpisodeNfoParser 契约）。
 //
 // runtime 单位是分钟：Emby 用 TimeSpan.FromMinutes 解析，写秒会被放大 60 倍。
+// 时长不完整时整个元素不出现（指针为 nil）：合并块里有没探测过的成员时，
+// RuntimeSec 只是「已知部分之和」，写进去就是偏小的假总值（MKACG-689）。
+// Emby 把缺 <runtime> 视为未知，由探测媒体补。
 // plot 是集简介：上游没有单集简介字段，调用方传剧简介兜底；空串时整个元素不出现
 // （空 `<plot></plot>` 会被客户端当成「有简介但为空」）。
 type episodeNFO struct {
@@ -70,7 +73,7 @@ type episodeNFO struct {
 	Title   string   `xml:"title"`
 	Season  int      `xml:"season"`
 	Episode int      `xml:"episode"`
-	Runtime int      `xml:"runtime"`
+	Runtime *int     `xml:"runtime,omitempty"`
 	Plot    string   `xml:"plot,omitempty"`
 }
 
@@ -103,14 +106,22 @@ type showThumb struct {
 // 字段全部来自运行时派生的对外剧集：title 与文件名共用 embyLabel，episode 是对外
 // 集号（合并集也是 1 集），runtime 取派生出的块时长/60 向下取整（短于 60 秒为 0，
 // Emby 视为未知，由探测媒体文件补）。plot 由调用方给（当前是剧简介），空则不写元素。
+//
+// 只要块内有成员的时长还没探测出来（RuntimeUnknown > 0），就不写 runtime：
+// 否则客户端会把「已知成员之和」当成整块总时长（实测 10 集合并块只显示 2:40，
+// MKACG-689）。缺 runtime = 未知，等首播回填后再列举就是真实值。
 func renderItemNFO(item store.EmbyItem, plot string) ([]byte, error) {
-	return marshalNFO(episodeNFO{
+	nfo := episodeNFO{
 		Title:   embyLabel(item),
 		Season:  item.Season,
 		Episode: item.EpNo,
-		Runtime: item.RuntimeSec / 60,
 		Plot:    plot,
-	})
+	}
+	if item.RuntimeUnknown == 0 {
+		minutes := item.RuntimeSec / 60
+		nfo.Runtime = &minutes
+	}
+	return marshalNFO(nfo)
 }
 
 // renderShowNFO 渲染剧 NFO：根 tvshow，字段

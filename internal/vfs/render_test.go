@@ -107,8 +107,11 @@ func TestRenderEpisodeNFO(t *testing.T) {
 		if got.Episode != tt.ep.EpNo {
 			t.Errorf("episode = %d, 期望 %d", got.Episode, tt.ep.EpNo)
 		}
-		if got.Runtime != tt.wantRuntime {
-			t.Errorf("runtime = %d, 期望 %d（秒=%d）", got.Runtime, tt.wantRuntime, tt.ep.DurationSec)
+		if got.Runtime == nil {
+			t.Fatalf("ep_no=%d 的 runtime 缺失（秒=%d）", tt.ep.EpNo, tt.ep.DurationSec)
+		}
+		if *got.Runtime != tt.wantRuntime {
+			t.Errorf("runtime = %d, 期望 %d（秒=%d）", *got.Runtime, tt.wantRuntime, tt.ep.DurationSec)
 		}
 		// 集简介没有单集来源，用剧简介兜底；不能是空元素。
 		if got.Plot != "第一行 & <第二行>" {
@@ -534,5 +537,33 @@ func TestStrmContentIndependentOfPath(t *testing.T) {
 	// 旧路径随之失效（剧已搬走），不是另一份拷贝。
 	if _, err := f.tree.Render(ctx, f.dirA+"/"+seasonDir+"/"+titleA+" - S01E01 - 开局.strm"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("旧路径仍可渲染（err = %v），期望 ErrNotFound", err)
+	}
+}
+
+// TestRenderEpisodeNFO_PartialRuntimeOmitted 钉住 MKACG-689：块内还有没探测过的成员时
+// 不写 <runtime>（不拿「已知部分之和」当整块时长）；补齐后正常写真实分钟数。
+func TestRenderEpisodeNFO_PartialRuntimeOmitted(t *testing.T) {
+	item := store.EmbyItem{
+		Kind: "merged", Season: 1, EpNo: 1, EpFrom: 1, EpTo: 10,
+		RuntimeSec: 160, RuntimeUnknown: 8,
+	}
+
+	body, err := renderItemNFO(item, "")
+	if err != nil {
+		t.Fatalf("renderItemNFO: %v", err)
+	}
+	if bytes.Contains(body, []byte("<runtime>")) {
+		t.Errorf("部分未知的集不应写 runtime，实际输出：%s", body)
+	}
+
+	// 同一块补齐后（unknown=0）写出真实分钟数。
+	item.RuntimeUnknown = 0
+	item.RuntimeSec = 642
+	body, err = renderItemNFO(item, "")
+	if err != nil {
+		t.Fatalf("renderItemNFO: %v", err)
+	}
+	if !bytes.Contains(body, []byte("<runtime>10</runtime>")) {
+		t.Errorf("补齐后应写 <runtime>10</runtime>，实际输出：%s", body)
 	}
 }

@@ -3,6 +3,7 @@ package segment
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"time"
@@ -32,18 +33,24 @@ func (c *Cutter) playbackTTL(ctx context.Context) (time.Duration, bool) {
 
 // recordOpen 在播放列表写出后建立/续接会话。剧名查库失败只留空标题，
 // 其余字段照样记 —— 会话表是展示用的，不参与出流。
-func (c *Cutter) recordOpen(ctx context.Context, r *http.Request, uid string, eps []store.Episode) {
+//
+// Slices / TotalSec 取**刚生成 playlist 的那个时间轴**，不重新累加 eps：
+// 后台「正在播放」的「本单元总时长」必须与 m3u8 的 EXTINF 总和同口径（MKACG-689）。
+// 时间轴生成时已保证每个成员都有真实时长（探测失败就不出 playlist），所以这里
+// 记下的总值不会是「部分之和」。
+func (c *Cutter) recordOpen(ctx context.Context, r *http.Request, uid string, eps []store.Episode, tl *Timeline) {
 	ttl, ok := c.playbackTTL(ctx)
 	if !ok {
 		return
 	}
-	s := playback.Session{UID: uid, Slices: len(eps)}
+	s := playback.Session{UID: uid}
+	if tl != nil {
+		s.Slices = tl.Len()
+		s.TotalSec = int(math.Round(tl.Total()))
+	}
 	if len(eps) > 0 {
 		s.DramaID = eps[0].DramaID
 		s.Unit = playUnitText(eps)
-		for _, ep := range eps {
-			s.TotalSec += ep.DurationSec
-		}
 		if d, err := c.st.DramaByID(ctx, eps[0].DramaID); err == nil {
 			s.Title = d.Title
 		}

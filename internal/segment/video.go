@@ -101,7 +101,7 @@ func (c *Cutter) ServePlaylist(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 	// 响应已写完再记会话：采集在任何情况下都不能影响出流。
-	c.recordOpen(ctx, r, uid, u.eps)
+	c.recordOpen(ctx, r, uid, u.eps, tl)
 }
 
 // ServeSegment 实现 `GET /video/{id}/{seq}.m4s`：鉴权 → 定位第 seq 集 → 缓存命中即回 /
@@ -416,8 +416,16 @@ func (c *Cutter) timelineStart(ctx context.Context, uid string, eps []store.Epis
 	if !exact {
 		// 补齐后仍然为 0：这一集的源探测不出时长（异常源）。此时没有正确的时间轴可用，
 		// 记一条 warn 继续用已有值出流 —— 比让整块播不了更可接受，也不会污染缓存。
+		// 这条路径不是展示用的总时长，但「补齐未成功」必须可观测，不许静默当 0。
+		missingAfter := 0
+		for i := 0; i < seq && i < len(eps); i++ {
+			if eps[i].DurationSec <= 0 {
+				missingAfter++
+			}
+		}
 		c.logger.WarnContext(ctx, "segment timeline start is approximate",
-			"uid", uid, "seq", seq, "reason", "probe 拿不到前面某集的时长")
+			"uid", uid, "seq", seq, "missing_durations", missingAfter,
+			"reason", "probe 拿不到前面某集的时长")
 	}
 	return start, nil
 }
@@ -508,6 +516,10 @@ func (c *Cutter) timelineFor(ctx context.Context, u playbackUnit) (*Timeline, er
 	for i, ep := range u.eps {
 		dur, err := c.ensureDuration(ensureCtx, ep, directs[i])
 		if err != nil {
+			// 任何一个成员补不出时长，整块的总时长就不完整：不出 playlist（按错误矩阵
+			// 502/503），更不能把「已知成员之和」当总时长放出去（MKACG-689）。
+			c.logger.WarnContext(ctx, "playlist duration incomplete",
+				"drama_id", ep.DramaID, "episode_id", ep.ID, "err", err)
 			return nil, err
 		}
 		if err := c.ensureChannel(ctx, ep.ID, channelOf(directs[i])); err != nil {

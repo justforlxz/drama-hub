@@ -270,9 +270,11 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
 - **失败不写**：探测失败不写任何东西（`duration_sec` 保持 0、也没有 `segment` 行）。
 - **回填**：探测到的源时长回填 `episode.duration_sec`
   （`store.BackfillEpisodeDuration`：只填 0、不覆盖非零值，非正时长视为探测失败）。
-  回填不碰派生数据：对外 `runtime_sec` 在列举时现算（单集取本集时长、合并集取组内之
-  和），`.nfo` 的 `<runtime>` 取 `runtime_sec / 60`，所以回填后下一次读取就是真实值；
-  没播过的集仍是 0，`.nfo` 照常渲染（`<runtime>0</runtime>`，Emby 视为未知）。
+  回填不碰派生数据：对外 `runtime_sec` 在列举时现算（单集取本集时长、合并集取已知
+  成员之和），`.nfo` 的 `<runtime>` 取 `runtime_sec / 60`，所以回填后下一次读取就是
+  真实值。块内还有没探测过的成员时派生出的 `runtime_unknown` > 0，`.nfo` 因此
+  **不写** `<runtime>`：缺这个元素就是「未知」，绝不拿「已知部分之和」冒充整块时长
+  （MKACG-689）。补齐后下一次读取写出真实分钟数。
 - **整数秒**：时长按整数秒写库（每集 ≤ 0.5 s 误差，合并 10 集最多累计 ~5 s 显示差），
   不为它加 float 列（第二份真值）。
 - **顺带对齐通道行**：同一次解析出的通道与 `segment.channel` 不一致时覆盖它

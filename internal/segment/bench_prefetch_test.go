@@ -18,8 +18,9 @@ import (
 //
 // 只有在 DRAMA_HUB_BENCH=1 时运行（不进 CI 的常规门禁，参考
 // internal/webdav/bench_propfind_test.go）。同一个构建里用
-// `segment_prefetch_blocks=0` 复现「改造前」（没有分片预热）的路径，
-// 默认值复现「改造后」——口径写进 docs/adr/0018 与 PR。
+// `segment_prefetch_blocks=0` 复现「改造前」（没有分片预热）的路径；
+// MKACG-687 之后 `prefetch_on` 决定预热在播放列表后还是首个分片后触发，
+// 三条口径的 P50/P95 一起打印，写进 PR。
 //
 //	DRAMA_HUB_BENCH=1 go test ./internal/segment -run TestBenchSegmentPrefetch -v
 func TestBenchSegmentPrefetch(t *testing.T) {
@@ -31,10 +32,13 @@ func TestBenchSegmentPrefetch(t *testing.T) {
 		cold, jump []time.Duration
 	}
 
-	run := func(ahead string) result {
+	run := func(ahead, prefetchOn string) result {
 		var out result
 		for i := 0; i < rounds; i++ {
 			r := newPrefetchRig(t, 3) // 一块 3 集
+			if err := r.settings.Set(context.Background(), store.KeyPrefetchOn, prefetchOn); err != nil {
+				t.Fatalf("设置 prefetch_on=%s: %v", prefetchOn, err)
+			}
 			if ahead != "" {
 				if err := r.settings.Set(context.Background(), store.KeySegmentPrefetchBlocks, ahead); err != nil {
 					t.Fatalf("设置 segment_prefetch_blocks=%s: %v", ahead, err)
@@ -73,8 +77,11 @@ func TestBenchSegmentPrefetch(t *testing.T) {
 		return out
 	}
 
-	before := run("0")
-	after := run("")
+	// MKACG-687：先量「预热在播放列表之后」（旧触发点）与「预热在首个分片之后」
+	// （新默认）对冷启动首片的影响，再与没有预热的路径对比。
+	before := run("0", store.PrefetchOnPlaylist)
+	after := run("", store.PrefetchOnPlaylist)
+	afterFS := run("", store.PrefetchOnFirstSegment)
 
 	report := func(name string, d []time.Duration) {
 		sorted := append([]time.Duration(nil), d...)
@@ -87,7 +94,9 @@ func TestBenchSegmentPrefetch(t *testing.T) {
 	}
 	t.Logf("首片耗时（同机同网、1 秒 fixture、每轮新建库与缓存目录，n=%d）", rounds)
 	report("冷启动首片 · 改造前(segment_prefetch_blocks=0)", before.cold)
-	report("冷启动首片 · 改造后(默认 1)", after.cold)
+	report("冷启动首片 · 预热在 playlist 后(旧触发点)", after.cold)
+	report("冷启动首片 · 预热在首片后(默认触发点)", afterFS.cold)
 	report("拖到下一集首片 · 改造前", before.jump)
-	report("拖到下一集首片 · 改造后", after.jump)
+	report("拖到下一集首片 · 预热在 playlist 后", after.jump)
+	report("拖到下一集首片 · 预热在首片后", afterFS.jump)
 }

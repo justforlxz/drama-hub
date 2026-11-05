@@ -158,14 +158,19 @@ App 通道也不可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `
 
 ## 播放触发的预取与退避（ADR-0017）
 
-播放列表成功之后，播放面会为**整部剧**起一次后台预取（`ServePlaylist` 里的
-`kickPrefetch`）：只申请直链、不生成分片，按「当前块 → 下一块 → 其余块」的顺序，
-让拖到相邻块时落到 `episode_stream` 的缓存命中。
+播放列表成功之后，播放面会为**整部剧**起一次后台预取（`kickPrefetch`）：只申请直链、
+不生成分片，按「当前块 → 下一块 → 其余块」的顺序，让拖到相邻块时落到
+`episode_stream` 的缓存命中。
+
+- **触发点**：默认在**首个分片请求之后**（`prefetch_on=first_segment`，MKACG-687），
+  这样只读播放列表的探测（ffprobe 读 m3u8 之类）不会白烧预取、也不占前台 ffmpeg 闸位；
+  `prefetch_on=playlist` 回退旧的「播放列表成功即预取」行为。
 
 - **只复用 `Resolver.DirectMany`**：缓存判定、单飞、落库、通道判据都只有那一份实现；
   预取不是第二条解析路径，也不改变任何对外路由与 id 形态。
 - **前台不等预取**：任务在后台跑，结果不进入当前请求；预取失败不影响本次播放。
-  `ServeSegment` 不触发预取（拖动不会反复重启任务）。
+  `ServeSegment` 只在分片出流之后触发预热（`startPlaybackWarmup`），不在请求前抢闸
+  （MKACG-687）。
 - **限速**：`prefetch_concurrency`（默认 1，`0` = 关闭）限制同时在途的批数（一批 =
   一个合并块）；默认串行，避免和前台抢 App 通道的换身份配额。
 - **失败退避**：失败落 `episode_stream_fail`（`reason` + `retry_after`），一次任务对
@@ -181,9 +186,10 @@ App 通道也不可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `
 
 ## 播放触发的分片预热（ADR-0018）
 
-同一个触发点（播放列表成功后）还会起一次**分片**预热（`kickSegmentPrefetch`）：
-把当前块里当前集之后的成员、以及后面 `segment_prefetch_blocks` 个块
-（默认 1，`0` = 关闭）真的转封装成 `.m4s` 落进缓存，让「拖到下一集」的首片直接命中。
+同一个触发点（默认：首个分片请求之后；`prefetch_on=playlist` 时仍是播放列表成功后）
+还会起一次**分片**预热（`kickSegmentPrefetch`）：把当前块里当前集之后的成员、以及后面
+`segment_prefetch_blocks` 个块（默认 1，`0` = 关闭）真的转封装成 `.m4s` 落进缓存，
+让「拖到下一集」的首片直接命中（MKACG-687 之后探测不再触发它）。
 
 - **有界**：不做整库 / 整剧预切；顺序执行（同时只跑一个 ffmpeg），不越上游闸。
 - **前台优先**：与前台共用 ffmpeg 闸与 single-flight。槽位被预热占满时，前台请求会
@@ -260,8 +266,9 @@ App 通道也不可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `
   重新分组后的同一集命中同一个文件。通道必须进键 —— 同一集的网页源与 App 源字节流不同
   （App 源是 CENC 密文），只按集算键会串味。通道的唯一判据是「本次解析有没有带内容
   密钥」：带 `Key` = App 通道，否则网页通道——契约里没有通道名字段，不新增。
-- 预取：**分片预热**按合并块做（MKACG-682 / ADR-0018）：播放列表成功后预热当前块
-  剩余成员与后面 `segment_prefetch_blocks` 个块，与前台共用 single-flight 与 ffmpeg 闸，
+- 预取：**分片预热**按合并块做（MKACG-682 / ADR-0018）：默认在首个分片请求之后预热
+  当前块剩余成员与后面 `segment_prefetch_blocks` 个块（`prefetch_on=playlist` 时回到
+  播放列表成功后触发，MKACG-687），与前台共用 single-flight 与 ffmpeg 闸，
   预热生成的分片先淘汰。**直链**的整剧预取是另一件事（ADR-0017）：它只申请播放直链、
   落 `episode_stream`，不生成、不落任何分片字节。
 

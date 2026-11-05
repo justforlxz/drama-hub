@@ -76,7 +76,7 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | `/api/dramas/{id}/episodes` | GET | 200 / 400 / 404 | 剧详情页的集分块（`merge_chunk_size` + 每块的 `play_id` / `play_url` / 成员集）；id 非法 400、剧不存在 404 |
 | `/api/dramas/{id}/cover` | GET | 200 / 404 | 海报字节（`image/*` + 精确 `Content-Length`）；没有海报或上游失败 404 |
 | `/api/status` | GET | 200 | 同步计数、运行配置现状（含各键的现读值；密钥只报「是否已设置」）、各源调度状态、`jellyfin` 块（媒体库同步现状：配置、上次结果、运行中进度、孤儿库；API key 只报 `api_key_set`）、`admin_token_set`（写操作能不能用） |
-| `/api/playback` | GET | 200 | 正在播放（只读、纯内存会话）：`sessions` 为当前几条流，每条带 uid、剧名、集号或合并块范围、已请求到第几片、播放位置/总时长、已出字节、客户端 IP 与 UA、首末活跃时间；`streams`/`clients`/`bytes` 是汇总，没有播放时 `sessions` 为 `[]`。会话超过 settings `play_session_ttl_sec` 无活动即回收，重启清空；同步轮次不计入 |
+| `/api/playback` | GET | 200 | 正在播放（只读、纯内存会话）：`sessions` 为当前几条流，每条带 uid、状态（`state`：`playing` 出过分片 / `probing` 只取过播放列表）、剧名、集号或合并块范围、已请求到第几片、播放位置/总时长、已出字节、客户端 IP 与 UA、首末活跃时间；`streams` 只算正在播放的会话数、`probing` 是只取播放列表的探测会话数、`clients`/`bytes` 也按播放中统计（探测不计入），没有播放时 `sessions` 为 `[]`。会话超过 settings `play_session_ttl_sec` 无活动即回收，重启清空；同步轮次不计入 |
 | `/api/jellyfin/libraries` | GET / POST | 200 / 202 / 400 / 401 / 409 | GET = 一轮媒体库同步的现状与进度（`running` / `phase_label` / `processed` / `total` / `started_at`；收尾后 `created` / `unchanged` / `removed` / `duration_ms` / `delete_failed`），页面每秒轮询它、不碰 drama 表；POST = 手动跑一轮（无 body 参数，删不删库由分类开关决定）；400 = 三项配置没配齐（点名缺哪个键），409 = 上一轮还在跑（接着 GET 看那一轮进度） |
 | `/api/jellyfin/categories` | GET / PATCH | 200 / 400 / 401 | GET = 全部分类 + 开关状态（`{"categories":[{"name","enabled"}]}`）；PATCH = 开关一个分类（`{"name":"都市","enabled":false}`），只写库、不碰 Jellyfin |
 | `/api/settings` | PATCH | 200 / 400 / 401 | 按 key 批量写配置：`{"settings":{"<key>":"<值>"}}` → 归一化后的值；未知键 / 非法值 400 且整批不落库；写操作要 `X-Admin-Token` |

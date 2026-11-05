@@ -13,9 +13,12 @@ import (
 // 页面按 this 直接渲染，不需要再拼别的接口；空表时 sessions 是 []，不是 null。
 type playbackView struct {
 	// Now 是本次快照时间（UTC RFC3339），页面用它算「刚刚 / N 分钟前」。
-	Now      string                `json:"now"`
-	Streams  int                   `json:"streams"` // 会话数
-	Clients  int                   `json:"clients"` // 去重后的客户端数
+	Now string `json:"now"`
+	// Streams 是正在播放的会话数（出过至少一个分片）；只取播放列表的探测会话
+	// 不算播放，单独计在 Probing（MKACG-687）。
+	Streams  int                   `json:"streams"`
+	Probing  int                   `json:"probing"`
+	Clients  int                   `json:"clients"` // 正在播放的会话去重后的客户端数
 	Bytes    int64                 `json:"bytes"`   // 累计出流字节
 	Sessions []playbackSessionView `json:"sessions"`
 }
@@ -23,7 +26,9 @@ type playbackView struct {
 // playbackSessionView 是一条播放会话。时间写成 UTC RFC3339 文本，零值写空串，
 // 时区转换归页面 JS（与 /api/status 同一约定）。
 type playbackSessionView struct {
-	UID         string `json:"uid"`
+	UID string `json:"uid"`
+	// State 是 "playing"（出过分片）或 "probing"（只取过播放列表）。
+	State       string `json:"state"`
 	DramaID     int64  `json:"drama_id"`
 	Title       string `json:"title"`
 	Unit        string `json:"unit"`
@@ -57,7 +62,8 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 
 	view := playbackView{
 		Now:      formatTime(time.Now()),
-		Streams:  len(snap.Sessions),
+		Streams:  snap.Playing,
+		Probing:  snap.Probing,
 		Clients:  snap.Clients,
 		Bytes:    snap.Bytes,
 		Sessions: make([]playbackSessionView, 0, len(snap.Sessions)),
@@ -65,6 +71,7 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	for _, sess := range snap.Sessions {
 		view.Sessions = append(view.Sessions, playbackSessionView{
 			UID:                  sess.UID,
+			State:                sess.State,
 			DramaID:              sess.DramaID,
 			Title:                sess.Title,
 			Unit:                 sess.Unit,

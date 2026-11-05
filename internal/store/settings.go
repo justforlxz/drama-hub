@@ -84,6 +84,18 @@ const (
 	// 几个合并块（默认 1，0 = 关闭；范围 0–10）。每个预热任务开始时读一次，
 	// 热改在下次播放列表请求生效（MKACG-682）。
 	KeySegmentPrefetchBlocks SettingKey = "segment_prefetch_blocks"
+	// KeyPrefetchOn 是预热的触发点（MKACG-687）：
+	//   - "first_segment"（默认）：首个分片请求之后才预热，只读播放列表的探测
+	//     （ffprobe 读 m3u8 之类）不会白烧整集 remux，也不占前台 ffmpeg 闸位。
+	//   - "playlist"：播放列表成功后立刻预热（旧的触发点，留作回退）。
+	// 每个播放列表 / 分片请求现读，热改即生效。
+	KeyPrefetchOn SettingKey = "prefetch_on"
+)
+
+// KeyPrefetchOn 的取值。
+const (
+	PrefetchOnPlaylist     = "playlist"
+	PrefetchOnFirstSegment = "first_segment"
 )
 
 // 插件配置的项名（docs/PLUGIN-CONTRACT.md「配置」）。
@@ -502,6 +514,10 @@ func specFor(key SettingKey) (settingSpec, bool) {
 		// 「当前块 + 下一块」；0 = 关闭（预热是后台收益，按需可关）。上限 10 防止
 		// 一次播放列表就把整部剧的 ffmpeg 排满。
 		return settingSpec{kind: kindInt, def: "1", min: 0, max: 10}, true
+	case KeyPrefetchOn:
+		// 预热触发点（MKACG-687）：默认等首个分片请求，避免只读播放列表的探测
+		// （ffprobe）白烧整集 remux；playlist 是旧行为，留作回退。
+		return settingSpec{kind: kindString, def: PrefetchOnFirstSegment}, true
 	}
 	return pluginSpecFor(string(key))
 }
@@ -564,6 +580,15 @@ func parseSetting(key SettingKey, raw string) (any, error) {
 	spec, ok := specFor(key)
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownSetting, key)
+	}
+	if key == KeyPrefetchOn {
+		// 枚举值：只有两个触发点，拼错不该被当成「另一个合法值」静默走默认分支。
+		v := strings.TrimSpace(raw)
+		if v != PrefetchOnPlaylist && v != PrefetchOnFirstSegment {
+			return nil, fmt.Errorf("%w: %s 只能是 %s 或 %s，实际 %q",
+				ErrInvalidSetting, key, PrefetchOnPlaylist, PrefetchOnFirstSegment, raw)
+		}
+		return v, nil
 	}
 	switch spec.kind {
 	case kindURL:

@@ -90,7 +90,8 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 > 库里若还有这两行，`Settings` 会按 `ErrUnknownSetting` 忽略它们，不需要数据迁移。
 > 播放触发的**直链**预取（MKACG-681 / ADR-0017）不是分片预热：它只申请直链、落
 > `episode_stream`，不生成任何分片字节；**分片**预热由 MKACG-682 / ADR-0018 引入，
-> 参数是 `segment_prefetch_blocks`（默认 1，0 = 关闭）。
+> 参数是 `segment_prefetch_blocks`（默认 1，0 = 关闭），触发点由 `prefetch_on`
+> 决定（默认 `first_segment` = 首个分片请求之后，MKACG-687）。
 
 **生效时机逐键标注在配置表里**，只有四种取值（MKACG-617 的生效性矩阵是实测真值来源）：
 
@@ -150,7 +151,8 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 | `stream_secret` | 必填 | ≥ 32 字节 | 即时（每请求） | 出流 HMAC 签名密钥（见 ADR-0003）；换了之后所有旧 URL 失效 |
 | `stream_url_ttl_sec` | `900` | 60–86400 | 即时（下一次解析直链） | 直链的默认有效期（秒）：插件给了 `Stream.ExpiresAt` 时以上游为准，没给就用「解析时刻 + 本值」写进 `episode_stream.expires_at`。未过期的直链直接复用、零外呼；过期或 CDN 拒绝（401/403/404）才重解析（ADR-0016）。默认 900 s 的取值理由见 ADR-0016「决策」 |
 | `merge_chunk_size` | `10` | 1–500 | 即时（每次派生对外剧集） | 每 N 集并成 1 条对外剧集（ADR-0010 / 0014）。库里只存原始集，列举与播放每次现读本值重算，改完下一次读取即生效、不用重启也不用同步；改 N 会重排全库对外集号，旧合并 uid 随即 404（分片缓存靠 LRU 过期，不主动清） |
-| `play_session_ttl_sec` | `120` | 30–3600 | 即时（每请求现读） | 「正在播放」会话的闲置回收阈值（秒）：某个 (客户端, 播放单元) 超过该秒数没有新的分片请求，就从 `/api/playback` 消失。会话只存内存、不落库，重启清空；同步轮次不计入（MKACG-683） |
+| `play_session_ttl_sec` | `120` | 30–3600 | 即时（每请求现读） | 「正在播放」会话的闲置回收阈值（秒）：某个 (客户端, 播放单元) 超过该秒数没有新的分片请求，就从 `/api/playback` 消失。只有出过分片的会话算「播放中」计入流数；只取过播放列表的记为「探测」（`probing`），单独计数、不计入流数（MKACG-683 / 687）。会话只存内存、不落库，重启清空；同步轮次不计入 |
+| `prefetch_on` | `first_segment` | `playlist` / `first_segment` | 即时（每个播放列表 / 分片请求现读） | 预热触发点：`first_segment` = 首个分片请求之后才起整剧预取与分片预热，只读播放列表的探测（ffprobe 读 m3u8 之类）不会白烧整集 remux、也不占前台 ffmpeg 闸位；`playlist` = 播放列表成功后立刻预热（MKACG-687 之前的旧行为，留作回退） |
 | `prefetch_concurrency` | `1` | 0–4 | 下一个预取任务开始时 | 整剧直链预取的并发上限：同时在途的批数（一批 = 一个合并块），默认 1 = 串行；`0` = 关闭预取。一次任务开始时读一次，改值由下一次播放触发的任务生效（ADR-0017） |
 | `prefetch_retry_sec` | `900` | 60–86400 | 下一个预取任务开始时 | 某集预取失败后的固定退避（秒）：`retry_after = 失败时刻 + 本值`，退避期内的集不再被预取；不做指数退避。前台播放该集不受影响、仍现解析（ADR-0017） |
 | `segment_prefetch_blocks` | `1` | 0–10 | 下一次播放列表触发时（每个任务开始时读一次） | 分片预热提前量：除当前块剩余成员外，再预热后面几个合并块；`0` = 关闭。预热与前台共用 ffmpeg 闸且前台优先，生成的分片在容量吃紧时先淘汰（MKACG-682 / ADR-0018） |
@@ -338,10 +340,11 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
 - ffmpeg/ffprobe 一律带硬超时（`timeoutProbe=30s` / `timeoutRemux=300s`，整集要读完
   CDN 全程）；stderr 尾部只进日志，不落响应体；日志只记源 host，不落完整直链。并发闸
   `min(4, max(1, NumCPU/2))`，超出的请求排队不丢弃。
-- **预热**：播放列表成功后按合并块预热分片（当前块剩余成员 + 后面
-  `segment_prefetch_blocks` 个块，默认 1、0 = 关闭；ADR-0018）。与前台共用
-  single-flight 与 ffmpeg 闸，前台优先（预热在跑时前台到达会取消它）；预热拿不到
-  空槽位就跳过该集，从不排队。换单元 / 换剧 / 停机 / 前台静默 30 s 即取消。
+- **预热**：默认在首个分片请求之后按合并块预热分片（`prefetch_on=first_segment`；
+  当前块剩余成员 + 后面 `segment_prefetch_blocks` 个块，默认 1、0 = 关闭；ADR-0018 /
+  MKACG-687）。只读播放列表的探测不触发预热；`prefetch_on=playlist` 回退旧行为。
+  与前台共用 single-flight 与 ffmpeg 闸，前台优先（预热在跑时前台到达会取消它）；
+  预热拿不到空槽位就跳过该集，从不排队。换单元 / 换剧 / 停机 / 前台静默 30 s 即取消。
   预热生成的分片带 `prefetched` 标记，容量吃紧时先淘汰。1.0 的两个占位键
   `seg_prefetch` / `pin_days` 仍是删除状态（MKACG-616）。
 

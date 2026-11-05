@@ -236,6 +236,15 @@ func newPrefetchRig(t *testing.T, chunkSize int) *prefetchRig {
 	return &prefetchRig{c: c, st: st, settings: settings, src: src, cdn: cdn, logs: logs, dramaID: dramaID}
 }
 
+// setPrefetchOnPlaylist 把预热触发点钉回「播放列表成功即预热」（MKACG-687 之前的
+// 行为）。验预热内容 / 单飞 / 关闭的用例与触发时机无关，用它避免随默认值变化而失效。
+func setPrefetchOnPlaylist(t *testing.T, r *prefetchRig) {
+	t.Helper()
+	if err := r.settings.Set(context.Background(), store.KeyPrefetchOn, store.PrefetchOnPlaylist); err != nil {
+		t.Fatalf("设置 prefetch_on: %v", err)
+	}
+}
+
 // addDrama 建一部剧与若干集，时长写成 10 秒（预取不触发 ffprobe，测试只关心直链）。
 func (r *prefetchRig) addDrama(t *testing.T, providerID string, epNos ...int) (int64, []store.Episode) {
 	t.Helper()
@@ -643,6 +652,7 @@ func TestPrefetchFailureBackoffAndForegroundFallback(t *testing.T) {
 // 都不等它、不报预取错误。
 func TestPrefetchForegroundNotBlocked(t *testing.T) {
 	r := newPrefetchRig(t, 1)
+	setPrefetchOnPlaylist(t, r)
 	eps := r.addEpisodes(t, 1, 2, 3)
 	gate := r.src.setGate("d1/3", false)
 	uid := "e" + strconv.FormatInt(eps[0].ID, 10)

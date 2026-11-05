@@ -20,9 +20,13 @@ MKACG-652 / ADR-0011 已经齐了，缺的是**预读**与**淘汰优先级细�
 
 ## 决策
 
-### 1. 按合并块预热，触发点仍只有播放列表成功
+### 1. 按合并块预热，触发点是播放列表或首个分片（MKACG-687 后默认后者）
 
-`ServePlaylist` 在 `kickPrefetch`（直链预取）之后调 `kickSegmentPrefetch(uid, u.eps)`：
+`ServePlaylist` 在 `kickPrefetch`（直链预取）之后调 `kickSegmentPrefetch(uid, u.eps)`；
+MKACG-687 起默认把这个触发点推迟到**首个分片请求之后**（`ServeSegment` 出流后调
+`startPlaybackWarmup`，settings `prefetch_on=first_segment`）：只读播放列表的探测
+（ffprobe 读 m3u8 之类）不再白烧整集 remux，也不占前台 ffmpeg 闸位。
+`prefetch_on=playlist` 回退本 ADR 最初的行为。
 
 - 计划 = **当前块里当前集之后的成员** + 后面 `segment_prefetch_blocks` 个块
   （默认 1 = 「当前块 + 下一块」；`0` = 关闭）。当前集不预热，它走前台生成。

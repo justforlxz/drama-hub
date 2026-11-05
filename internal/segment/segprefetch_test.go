@@ -67,6 +67,9 @@ func TestSegmentPrefetchPlan(t *testing.T) {
 // 播放列表成功后，后台把块内剩余成员生成成分片并标 prefetched；前台一播就清标记。
 func TestSegmentPrefetchWarmsRemainingBlock(t *testing.T) {
 	r := newPrefetchRig(t, 3)
+	// 预热触发点钉在播放列表（MKACG-687 的默认值已改成首个分片）：
+	// 这个用例验的是「playlist 之后的预热内容」，不是触发时机。
+	setPrefetchOnPlaylist(t, r)
 	dramaID, eps := r.addDrama(t, "d1", 1, 2, 3)
 	if len(eps) != 3 {
 		t.Fatalf("成员数 = %d, 期望 3", len(eps))
@@ -105,6 +108,7 @@ func TestSegmentPrefetchWarmsRemainingBlock(t *testing.T) {
 // segment_prefetch_blocks = 0 时整段关闭：播放列表不生成任何分片。
 func TestSegmentPrefetchDisabled(t *testing.T) {
 	r := newPrefetchRig(t, 1)
+	setPrefetchOnPlaylist(t, r)
 	if err := r.settings.Set(context.Background(), store.KeySegmentPrefetchBlocks, "0"); err != nil {
 		t.Fatalf("设置 segment_prefetch_blocks: %v", err)
 	}
@@ -123,6 +127,47 @@ func TestSegmentPrefetchDisabled(t *testing.T) {
 	if _, err := r.st.ArtifactByKey(context.Background(), store.ArtifactKindSegment,
 		cache.SegmentKey(episodeUID(eps[1].ID), "web")); err == nil {
 		t.Fatalf("关闭时仍生成了分片")
+	}
+}
+
+// MKACG-687 AC-3：默认 prefetch_on=first_segment 时，只拉播放列表（探测）不触发任何
+// 预热；首个分片请求之后才起整剧预取与分片预热。
+func TestPrefetchWaitsForFirstSegment(t *testing.T) {
+	r := newPrefetchRig(t, 3)
+	dramaID, eps := r.addDrama(t, "d1", 1, 2, 3)
+	uid := "m" + strconv.FormatInt(dramaID, 10) + "_1_3"
+
+	if rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+".m3u8"); rec.Code != http.StatusOK {
+		t.Fatalf("playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	for _, m := range r.logs.records() {
+		if m["msg"] == "prefetch run started" || m["msg"] == "segment prefetch run started" {
+			t.Fatalf("只读播放列表就起了预热: %v", m)
+		}
+	}
+	for _, ep := range eps[1:] {
+		if _, err := r.st.ArtifactByKey(context.Background(), store.ArtifactKindSegment,
+			cache.SegmentKey(episodeUID(ep.ID), "web")); err == nil {
+			t.Fatalf("只读播放列表就生成了分片 %d", ep.ID)
+		}
+	}
+
+	// 真正播放：首个分片出流之后预热才启动。
+	if rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+"/0.m4s"); rec.Code != http.StatusOK {
+		t.Fatalf("分片状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	r.waitLog(t, "分片预热启动", func(m map[string]any) bool {
+		return m["msg"] == "segment prefetch run started"
+	})
+	r.waitLog(t, "整剧预取启动", func(m map[string]any) bool {
+		return m["msg"] == "prefetch run started" && logDrama(m, dramaID)
+	})
+	for _, ep := range eps[1:] {
+		key := cache.SegmentKey(episodeUID(ep.ID), "web")
+		waitFor(t, 20*time.Second, "等待分片预热落地", func() bool {
+			row, err := r.st.ArtifactByKey(context.Background(), store.ArtifactKindSegment, key)
+			return err == nil && row.Prefetched
+		})
 	}
 }
 
@@ -158,6 +203,7 @@ func TestSegmentPrefetchStopsWhenIdle(t *testing.T) {
 // 同一播放单元重复请求播放列表不重启预热任务（单飞）。
 func TestSegmentPrefetchSingleFlightPerUnit(t *testing.T) {
 	r := newPrefetchRig(t, 1)
+	setPrefetchOnPlaylist(t, r)
 	_, eps := r.addDrama(t, "d1", 1, 2, 3)
 	target := "/video/" + r.id(episodeUID(eps[0].ID)) + ".m3u8"
 	for i := 0; i < 3; i++ {

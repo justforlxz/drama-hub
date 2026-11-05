@@ -90,6 +90,7 @@ func TestTrackerProgressSkeleton(t *testing.T) {
 }
 
 // 客户端隔离：同一播放单元、不同客户端各自一条；不同单元互不串。
+// MKACG-687：只有 Open 的会话算探测，不出现在播放中计数与客户端数里。
 func TestTrackerKeyIsolation(t *testing.T) {
 	clock := newClock()
 	tr := NewTracker(clock.Now)
@@ -100,8 +101,41 @@ func TestTrackerKeyIsolation(t *testing.T) {
 	tr.Open(Client{IP: "10.0.0.2", UA: "A"}, Session{UID: "u2", Title: "剧二"}, ttl)
 
 	got := tr.Snapshot(ttl)
-	if len(got.Sessions) != 3 || got.Clients != 3 {
-		t.Fatalf("= %d 条 / %d 客户端，期望 3 / 3", len(got.Sessions), got.Clients)
+	if len(got.Sessions) != 3 || got.Probing != 3 || got.Playing != 0 || got.Clients != 0 {
+		t.Fatalf("= %d 条 / %d 探测 / %d 播放 / %d 客户端，期望 3 / 3 / 0 / 0",
+			len(got.Sessions), got.Probing, got.Playing, got.Clients)
+	}
+
+	tr.Progress(Client{IP: "10.0.0.1", UA: "A"}, "u1", 0, 0, 10, 0, ttl)
+	got = tr.Snapshot(ttl)
+	if got.Playing != 1 || got.Probing != 2 || got.Clients != 1 {
+		t.Fatalf("出片后 = %d 播放 / %d 探测 / %d 客户端，期望 1 / 2 / 1",
+			got.Playing, got.Probing, got.Clients)
+	}
+}
+
+// AC-5 会话状态机：只有 open → probing；open + progress → playing；超 TTL 清理。
+func TestTrackerProbingStateMachine(t *testing.T) {
+	clock := newClock()
+	tr := NewTracker(clock.Now)
+	ttl := 120 * time.Second
+	cl := Client{IP: "192.168.12.8", UA: "trim_player"}
+
+	tr.Open(cl, Session{UID: "u1", Title: "剧一", Slices: 1}, ttl)
+	if got := tr.Snapshot(ttl); got.Sessions[0].State != StateProbing || got.Probing != 1 {
+		t.Fatalf("只 Open = %+v，期望 probing 且 Probing=1", got.Sessions[0])
+	}
+
+	tr.Progress(cl, "u1", 0, 0, 1024, 300*time.Millisecond, ttl)
+	got := tr.Snapshot(ttl)
+	if got.Sessions[0].State != StatePlaying || got.Playing != 1 || got.Probing != 0 {
+		t.Fatalf("出片后 = %+v，期望 playing 且 Playing=1", got.Sessions[0])
+	}
+
+	clock.Step(2 * ttl)
+	got = tr.Snapshot(ttl)
+	if len(got.Sessions) != 0 || got.Playing != 0 || got.Probing != 0 || got.Clients != 0 {
+		t.Fatalf("超 TTL 后 = %+v，期望清空", got)
 	}
 }
 

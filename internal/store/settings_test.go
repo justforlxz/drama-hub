@@ -923,3 +923,29 @@ func TestPrefetchSettings(t *testing.T) {
 		t.Errorf("Set(prefetch_retry_sec, 60) = %v, 期望通过（闭区间端点）", err)
 	}
 }
+
+// 预热触发点（MKACG-687）：默认 first_segment（等首个分片请求，探测不白烧 remux）；
+// 只接受 playlist / first_segment 两个值。
+func TestPrefetchOnSettings(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	if got, err := s.String(ctx, KeyPrefetchOn); err != nil || got != PrefetchOnFirstSegment {
+		t.Fatalf("prefetch_on 默认 = %q, %v, 期望 %q", got, err, PrefetchOnFirstSegment)
+	}
+	for _, raw := range []string{"", "first", "segment", "always"} {
+		if err := s.Set(ctx, KeyPrefetchOn, raw); !errors.Is(err, ErrInvalidSetting) {
+			t.Errorf("Set(prefetch_on, %q) = %v, 期望 ErrInvalidSetting", raw, err)
+		}
+	}
+	if err := s.Set(ctx, KeyPrefetchOn, PrefetchOnPlaylist); err != nil {
+		t.Fatalf("Set(prefetch_on, playlist) = %v, 期望通过", err)
+	}
+	if got, err := s.String(ctx, KeyPrefetchOn); err != nil || got != PrefetchOnPlaylist {
+		t.Errorf("Set(playlist) 后读回 = %q, %v, 期望 %q", got, err, PrefetchOnPlaylist)
+	}
+	if err := s.Set(ctx, KeyPrefetchOn, PrefetchOnFirstSegment); err != nil {
+		t.Errorf("Set(prefetch_on, first_segment) = %v, 期望通过", err)
+	}
+}

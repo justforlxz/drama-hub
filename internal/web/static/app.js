@@ -465,6 +465,9 @@ function initOverview() {
   function playbackRow(s) {
     const title = s.title === '' ? '未知剧目' : s.title;
     const unit = s.unit === '' ? '未知块' : s.unit;
+    // 只有播放列表请求、还没出过分片的会话是探测（MKACG-687）：照实列出来，
+    // 但不计入「正在播放」的条数，行内标一下免得看起来像卡住的播放。
+    const probing = s.state === 'probing';
     const seq = s.slices > 0 ? '第 ' + (s.seq + 1) + '/' + s.slices + ' 片' : '第 ' + (s.seq + 1) + ' 片';
     const pos = s.total_sec > 0
       ? fmtClock(s.position_sec) + '/' + fmtClock(s.total_sec)
@@ -472,7 +475,7 @@ function initOverview() {
     return el('article', { class: 'playback-row' },
       el('div', { class: 'playback-head' },
         el('strong', { text: title }),
-        el('span', { class: 'card-sub', text: unit + ' · ' + seq })),
+        el('span', { class: 'card-sub', text: (probing ? '探测 · ' : '') + unit + ' · ' + seq })),
       el('dl', { class: 'kv' },
         el('dt', { text: '进度' }), el('dd', { text: pos }),
         el('dt', { text: '已出' }), el('dd', { text: fmtBytes(s.bytes_served) }),
@@ -483,12 +486,18 @@ function initOverview() {
 
   function renderPlayback(pb) {
     const n = pb.streams;
-    pbSummary.textContent = n === 0
-      ? '没有客户端在拉流'
-      : n + ' 条流 · ' + pb.clients + ' 个客户端 · 已出 ' + fmtBytes(pb.bytes);
-    pbBadge.textContent = n === 0 ? '空闲' : n + ' 条流';
+    const probing = pb.probing || 0;
+    let summary = '没有客户端在拉流';
+    if (n > 0) {
+      summary = n + ' 条流 · ' + pb.clients + ' 个客户端 · 已出 ' + fmtBytes(pb.bytes);
+    }
+    if (probing > 0) {
+      summary += (n > 0 ? ' · ' : '') + '探测中 ' + probing;
+    }
+    pbSummary.textContent = summary;
+    pbBadge.textContent = n === 0 ? (probing > 0 ? '仅探测' : '空闲') : n + ' 条流';
     pbBadge.dataset.tone = n === 0 ? 'muted' : 'ok';
-    pbEmpty.hidden = n !== 0;
+    pbEmpty.hidden = n + probing !== 0;
     pbList.replaceChildren(...pb.sessions.map(playbackRow));
   }
 

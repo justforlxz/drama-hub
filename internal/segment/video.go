@@ -69,14 +69,21 @@ func (c *Cutter) ServePlaylist(w http.ResponseWriter, r *http.Request) {
 		writeVideoError(w, err)
 		return
 	}
-	// 时间轴已就绪：为整部剧起一次后台预取（非阻塞、失败不影响本次响应，ADR-0017）。
-	// 分片端点不触发：拖动会让它反复重启任务，而播放列表本来就是一次播放的起点。
-	c.kickPrefetch(u.eps[0].DramaID, u.eps)
-	// 记录播放入口时间：分片预热的「前台是否已静默」以它为准。先于 kick：
-	// 进程首次播放时 lastPlay 还是 0，预热会在空闲判定处直接退出。
-	c.markPlayed()
-	// 同一个起点再起分片预热（MKACG-682）：当前块剩余成员 + 后面 N 个块。
-	c.kickSegmentPrefetch(uid, u.eps)
+	// 只拉播放列表、不取分片的客户端是探测（ffprobe 读 m3u8 之类）：留一条来源日志，
+	// 方便下次认出「多出来的那条会话」是谁（MKACG-687）。
+	c.logPlaylistRequest(r, uid)
+	// 预热触发点（MKACG-687）：默认推迟到首个分片请求之后 —— 探测不该白烧整集 remux，
+	// 也不该占着前台 ffmpeg 闸位影响首片耗时。prefetch_on=playlist 保留旧的「播放列表
+	// 成功即预热」行为。
+	if !c.prefetchWaitsForSegment(ctx) {
+		// 记录播放入口时间：分片预热的「前台是否已静默」以它为准。先于 kick：
+		// 进程首次播放时 lastPlay 还是 0，预热会在空闲判定处直接退出。
+		c.markPlayed()
+		// 整部剧起一次后台预取（非阻塞、失败不影响本次响应，ADR-0017）。
+		c.kickPrefetch(u.eps[0].DramaID, u.eps)
+		// 同一个起点再起分片预热（MKACG-682）：当前块剩余成员 + 后面 N 个块。
+		c.kickSegmentPrefetch(uid, u.eps)
+	}
 
 	body := BuildPlaylist(id, tl.slices)
 	etag := playlistETag(body)
@@ -158,6 +165,9 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 	}
 	fetch := func() (*cache.Stream, error) { return c.caches.GetOrStream(ctx, spec, gen, false) }
 	c.streamSegment(w, r, fetch, uid, seq, ep, channel, start, t0)
+	// 分片已经出流（或已明确失败）之后再起预热（MKACG-687）：此刻前台不再需要 ffmpeg
+	// 闸位，预热不会把本次首片耗时拖长。streamSegment 内部两条路径都已 markPlayed。
+	c.startPlaybackWarmup(ctx, uid, u.eps)
 }
 
 // segmentReleads 是「换一个新领跑者」的次数上限。

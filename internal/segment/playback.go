@@ -74,6 +74,36 @@ func clientOf(r *http.Request) playback.Client {
 	return playback.Client{IP: ip, UA: ua}
 }
 
+// prefetchWaitsForSegment 报告预热是否应等到首个分片请求之后再触发（settings 键
+// prefetch_on，MKACG-687）。读不到或值非 "playlist" 都按默认 "first_segment" 处理：
+// 提前预热是「多烧一次 remux」的副作用，宁可晚一点也不要白烧。
+func (c *Cutter) prefetchWaitsForSegment(ctx context.Context) bool {
+	v, err := c.settings.String(ctx, store.KeyPrefetchOn)
+	if err != nil {
+		return true
+	}
+	return v != store.PrefetchOnPlaylist
+}
+
+// startPlaybackWarmup 在首个分片出流之后起预热（MKACG-687）。此时前台已经拿到字节，
+// 预热不会抢走它需要的 ffmpeg 闸位。prefetch_on=playlist 时预热点在播放列表，
+// 这里不重复触发（kick* 自身也有单飞保护，重复调用无害）。
+func (c *Cutter) startPlaybackWarmup(ctx context.Context, uid string, eps []store.Episode) {
+	if len(eps) == 0 || !c.prefetchWaitsForSegment(ctx) {
+		return
+	}
+	c.kickPrefetch(eps[0].DramaID, eps)
+	c.kickSegmentPrefetch(uid, eps)
+}
+
+// logPlaylistRequest 记录一次播放列表请求的来源（MKACG-687）。会话表只按「IP + UA」
+// 合并，多出来的那条 0 B 会话（探测）只能靠这条日志认出是谁。
+func (c *Cutter) logPlaylistRequest(r *http.Request, uid string) {
+	cl := clientOf(r)
+	c.logger.InfoContext(r.Context(), "playlist requested",
+		"uid", uid, "remote", cl.IP, "ua", cl.UA)
+}
+
 // playUnitText 把播放单元成员折成一句人读的块描述：「第 3 集」或「第 11–20 集」。
 func playUnitText(eps []store.Episode) string {
 	if len(eps) == 0 {

@@ -17,7 +17,9 @@ import (
 // 的首片请求直接命中。
 //
 // 边界：
-//   - 触发点只有播放列表成功后（ServePlaylist），分片端点不触发 —— 拖动不重启任务；
+//   - 触发点默认是首个分片请求之后（ServeSegment 出流后 startPlaybackWarmup，
+//     prefetch_on=first_segment，MKACG-687）；prefetch_on=playlist 时回到播放列表
+//     成功后（ServePlaylist）。只读播放列表的探测不触发；
 //   - 只预热当前块里当前集**之后**的成员 + 后面 segment_prefetch_blocks 个块，
 //     有界、顺序执行（同一时刻一个 ffmpeg），不越上游闸；
 //   - 与前台共用 single-flight 与 ffmpeg 闸；闸被前台占满时这一集直接跳过，

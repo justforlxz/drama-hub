@@ -28,17 +28,17 @@ func TestAPI_PlaybackEmpty(t *testing.T) {
 	}
 
 	got := decode[playbackView](t, rec)
-	if got.Streams != 0 || got.Clients != 0 || got.Bytes != 0 || len(got.Sessions) != 0 {
-		t.Errorf("空态汇总 = streams:%d clients:%d bytes:%d sessions:%d, 期望全 0",
-			got.Streams, got.Clients, got.Bytes, len(got.Sessions))
+	if got.Streams != 0 || got.Probing != 0 || got.Clients != 0 || got.Bytes != 0 || len(got.Sessions) != 0 {
+		t.Errorf("空态汇总 = streams:%d probing:%d clients:%d bytes:%d sessions:%d, 期望全 0",
+			got.Streams, got.Probing, got.Clients, got.Bytes, len(got.Sessions))
 	}
 	if got.Now == "" {
 		t.Error("now 为空，期望 RFC3339 时间")
 	}
 }
 
-// TestAPI_PlaybackSessions 覆盖 AC-2：两部剧各一条 + 同剧第二个客户端一条，
-// 三条互不串；汇总按客户端去重、字节求和；列表按最近活跃降序。
+// TestAPI_PlaybackSessions 覆盖 AC-2 与 MKACG-687：两部剧各一条 + 同剧第二个客户端一条，
+// 三条互不串；出过分片的才算播放，只取播放列表的记为探测；汇总只算播放中的客户端。
 func TestAPI_PlaybackSessions(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
@@ -75,11 +75,14 @@ func TestAPI_PlaybackSessions(t *testing.T) {
 	}
 	got := decode[playbackView](t, rec)
 
-	if got.Streams != 3 {
-		t.Errorf("streams = %d, 期望 3", got.Streams)
+	if got.Streams != 1 {
+		t.Errorf("streams = %d, 期望 1（只有出过分片的 clA/甲剧）", got.Streams)
 	}
-	if got.Clients != 2 {
-		t.Errorf("clients = %d, 期望 2（同一 IP 不同 UA 算两个客户端）", got.Clients)
+	if got.Probing != 2 {
+		t.Errorf("probing = %d, 期望 2（只取过播放列表的两条）", got.Probing)
+	}
+	if got.Clients != 1 {
+		t.Errorf("clients = %d, 期望 1（只算正在播放的客户端）", got.Clients)
 	}
 	if got.Bytes != 3000 {
 		t.Errorf("bytes = %d, 期望 3000", got.Bytes)
@@ -89,6 +92,9 @@ func TestAPI_PlaybackSessions(t *testing.T) {
 	}
 
 	first := got.Sessions[0]
+	if first.State != playback.StatePlaying {
+		t.Errorf("第一条 state = %q, 期望 %q", first.State, playback.StatePlaying)
+	}
 	if first.UID != "m1_1_3" || first.ClientIP != "10.0.0.1" || first.UserAgent != "player-A" {
 		t.Errorf("最近活跃的第一条 = %+v, 期望甲剧的 player-A", first)
 	}
@@ -121,6 +127,9 @@ func TestAPI_PlaybackSessions(t *testing.T) {
 	// 同一 uid 的两条会话各自累计自己的字节，不能互相串。
 	if second.BytesServed != 0 || third.BytesServed != 0 {
 		t.Errorf("未拉分片的会话 bytes_served = %d/%d, 期望 0", second.BytesServed, third.BytesServed)
+	}
+	if second.State != playback.StateProbing || third.State != playback.StateProbing {
+		t.Errorf("未拉分片的会话 state = %q/%q, 期望 %q", second.State, third.State, playback.StateProbing)
 	}
 	if second.TimeToFirstSegmentMS != 0 {
 		t.Errorf("未拉分片的会话 time_to_first_segment_ms = %d, 期望 0", second.TimeToFirstSegmentMS)

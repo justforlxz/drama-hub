@@ -18,13 +18,14 @@ ADR-0016 把直链连同 `expires_at` 落库之后，**同一块内**的重复�
 
 ## 决策
 
-### 1. 触发点只有播放列表成功之后
+### 1. 触发点是播放列表成功之后（MKACG-687 起默认推迟到首个分片）
 
 `ServePlaylist` 在 `timelineFor` 成功、响应写出**之前**调 `kickPrefetch(dramaID, u.eps)`：
 此时当前块成员必然已经落库（播放列表的解析路径），预取从「下一块」开始就有真实收益。
 
-- **分片端点不触发**：拖动会让 `ServeSegment` 反复到来，每来一次就重启任务，等于把
-  后台任务变成前台请求的副作用；播放列表本来就是一次播放的起点。
+- **MKACG-687**：默认 `prefetch_on=first_segment`，把触发点推迟到 `ServeSegment` 出流
+  之后（`startPlaybackWarmup`）——只读播放列表的探测（ffprobe）不再白烧整集预取，
+  也不占前台 ffmpeg 闸位。`prefetch_on=playlist` 回退本条最初的行为。
 - **非阻塞**：`kickPrefetch` 只加锁、起 goroutine，不查库、不等待。预取结果永远不进入
   当前请求的返回值 —— 预取失败不影响这一次播放。
 

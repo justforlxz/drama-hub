@@ -16,6 +16,13 @@ import (
 	"time"
 )
 
+// 会话状态（MKACG-687）：只取过播放列表、还没出过一个分片的会话是「探测」
+// （ffprobe 读 m3u8 之类），不该被算成正在播放。
+const (
+	StateProbing = "probing"
+	StatePlaying = "playing"
+)
+
 // Client 是一次播放请求的客户端身份。只有两件事实：来源 IP 与 User-Agent。
 type Client struct {
 	IP string
@@ -26,6 +33,8 @@ type Client struct {
 type Session struct {
 	UID   string // 播放单元 id（单集或合并块）
 	Title string // 剧名；空 = 未知
+	// State 是快照时派生的会话状态：StateProbing / StatePlaying。
+	State string
 	// Unit 是人读的块描述（「第 3 集」/「第 11–20 集」）；空 = 未知。
 	Unit    string
 	DramaID int64 // 0 = 未知
@@ -41,11 +50,19 @@ type Session struct {
 	ClientIP            string
 	UserAgent           string
 	FirstSeen, LastSeen time.Time
+
+	// played 表示这条会话出过至少一个分片；只有 Open 的会话是探测。
+	played bool
 }
 
 // Snapshot 是一次快照：会话按最近活跃降序，另附汇总。
+//
+// Streams 的语义由 /api/playback 决定：Playing 是出过分片的会话数，Probing 是
+// 只取过播放列表的会话数。Clients 只统计 Playing 会话的去重客户端。
 type Snapshot struct {
 	Sessions []Session
+	Playing  int
+	Probing  int
 	Clients  int
 	Bytes    int64
 }
@@ -108,6 +125,7 @@ func (t *Tracker) Progress(cl Client, uid string, seq, positionSec int, bytes in
 	cur.Seq = seq
 	cur.PositionSec = positionSec
 	cur.BytesServed += bytes
+	cur.played = true
 	if firstSegment > 0 {
 		cur.TimeToFirstSegment = firstSegment
 	}
@@ -129,9 +147,17 @@ func (t *Tracker) Snapshot(ttl time.Duration) Snapshot {
 	out := Snapshot{Sessions: make([]Session, 0, len(t.sessions))}
 	clients := make(map[string]struct{}, len(t.sessions))
 	for _, s := range t.sessions {
-		out.Sessions = append(out.Sessions, *s)
-		clients[s.ClientIP+"\x00"+s.UserAgent] = struct{}{}
-		out.Bytes += s.BytesServed
+		cp := *s
+		if cp.played {
+			cp.State = StatePlaying
+			out.Playing++
+			clients[cp.ClientIP+"\x00"+cp.UserAgent] = struct{}{}
+		} else {
+			cp.State = StateProbing
+			out.Probing++
+		}
+		out.Sessions = append(out.Sessions, cp)
+		out.Bytes += cp.BytesServed
 	}
 	// 最近活跃优先；同一时刻按 UID、再按客户端定序，保证输出稳定。
 	sort.SliceStable(out.Sessions, func(i, j int) bool {

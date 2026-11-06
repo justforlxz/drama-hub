@@ -315,10 +315,55 @@ func (p *Plugin) ResolveSeries(ctx context.Context, ref plugin.WorkRef, epNos []
 		return nil, err
 	}
 	out := make([]plugin.Stream, len(epNos))
+	var appIdx []int
+	var appVids []string
+	seenVid := make(map[string]struct{}, len(epNos))
+
 	for i, epNo := range epNos {
-		st, err := p.resolveFromSeries(ctx, ref, vids, protected, epNo)
-		if err != nil {
-			return nil, fmt.Errorf("%s 第 %d 集: %w", ref.ID, epNo, err)
+		if epNo < 1 || epNo > len(vids) {
+			return nil, fmt.Errorf("%s 第 %d 集: %w: %s 没有第 %d 集（共 %d 集）",
+				ref.ID, epNo, plugin.ErrNotFound, ref.ID, epNo, len(vids))
+		}
+		vid := vids[epNo-1]
+		if !protected {
+			st, err := p.resolveWeb(ctx, ref.ID, vid)
+			if err == nil {
+				out[i] = st
+				continue
+			}
+			if !errors.Is(err, plugin.ErrNoStream) {
+				return nil, fmt.Errorf("%s 第 %d 集: %w", ref.ID, epNo, err)
+			}
+		}
+		appIdx = append(appIdx, i)
+		if _, ok := seenVid[vid]; !ok {
+			seenVid[vid] = struct{}{}
+			appVids = append(appVids, vid)
+		}
+	}
+
+	if len(appIdx) == 0 {
+		return out, nil
+	}
+
+	batchMap, batchErr := p.resolveAppMany(ctx, appVids)
+	for _, i := range appIdx {
+		epNo := epNos[i]
+		vid := vids[epNo-1]
+		if batchErr == nil {
+			if st, ok := batchMap[vid]; ok && st.URL != "" {
+				out[i] = st
+				continue
+			}
+		}
+		// 批量未命中或整批失败时，对该集走完整回落链（含站点接口与登录态兜底）
+		appErr := batchErr
+		if appErr == nil {
+			appErr = fmt.Errorf("%w: App 取流响应缺集 %s 的载荷", plugin.ErrNoStream, vid)
+		}
+		st, fallbackErr := p.resolveSiteFallback(ctx, ref.ID, vid, appErr)
+		if fallbackErr != nil {
+			return nil, fmt.Errorf("%s 第 %d 集: %w", ref.ID, epNo, fallbackErr)
 		}
 		out[i] = st
 	}
@@ -347,16 +392,20 @@ func (p *Plugin) resolveFromSeries(ctx context.Context, ref plugin.WorkRef, vids
 	if appErr == nil {
 		return st, nil
 	}
+	return p.resolveSiteFallback(ctx, ref.ID, vid, appErr)
+}
+
+func (p *Plugin) resolveSiteFallback(ctx context.Context, sid, vid string, appErr error) (plugin.Stream, error) {
 	p.logger.WarnContext(ctx, "App 通道不可用，回落站点播放通道",
 		"plugin", Name, "vid", vid, "reason", errorClass(appErr))
 
-	st, siteErr := p.resolveSite(ctx, ref.ID, vid, false)
+	st, siteErr := p.resolveSite(ctx, sid, vid, false)
 	if siteErr == nil {
 		return st, nil
 	}
 	if errors.Is(siteErr, plugin.ErrLoginRequired) && p.cookie(ctx) != "" {
 		// 最后兜底：配了登录态就带 Cookie 再要一次（站点对锁定集只认登录态）。
-		st, retryErr := p.resolveSite(ctx, ref.ID, vid, true)
+		st, retryErr := p.resolveSite(ctx, sid, vid, true)
 		if retryErr == nil {
 			return st, nil
 		}

@@ -41,6 +41,10 @@ const (
 	// defaultAppVideoAltURL 是主域名被拒后的备用取流端点（参考实现同款备用域名）。
 	defaultAppVideoAltURL = "https://api5-normal-hl.fqnovel.com/novel/player/multi_video_model/v1/"
 
+	// defaultAppSingleVideoURL 是单集取流端点（sinfonlinea 节点），
+	// 在 multi_video_model 主备节点均被拒时作为二级 App 通道自动兜底。
+	defaultAppSingleVideoURL = "https://api5-normal-sinfonlinea.fqnovel.com/novel/player/video_model/v1/"
+
 	// appRetryDelay 是换身份重试前的等待（参考实现的 300ms；只用于一次重试）。
 	appRetryDelay = 300 * time.Millisecond
 
@@ -79,22 +83,64 @@ const (
 // 它是协议事实而不是可调参数——白名单之外的一律拒绝，宁可不播也不出站。
 var appMediaDomains = []string{"qznovelvod.com", "fqnovelvod.com", "douyinvod.com"}
 
+// appBatchLimit 是单次 multi_video_model 请求携带的 vid 上限（与默认合并块 10 集对齐）。
+const appBatchLimit = 10
+
 // resolveApp 走 App 通道取某集完整片源。
 //
 // 上游把取流身份当一次性的：同一条身份第二次请求会被网关 200 + 空体拒绝
 // （MKACG-676 实测）。所以每次取流先注册一条新身份；被拒时按参考实现再换一条
 // 身份、改走备用域名、Connection: close 重试一次，仍失败就回原错误。
 func (p *Plugin) resolveApp(ctx context.Context, vid string) (plugin.Stream, error) {
+	res, err := p.resolveAppBatch(ctx, []string{vid})
+	if err != nil {
+		return plugin.Stream{}, err
+	}
+	st, ok := res[vid]
+	if !ok {
+		return plugin.Stream{}, fmt.Errorf("%w: App 取流响应缺集 %s 的载荷", plugin.ErrNoStream, vid)
+	}
+	return st, nil
+}
+
+// resolveAppMany 批量走 App 通道一次取多集完整片源（按 appBatchLimit 分批）。
+//
+// 相比逐集调 resolveApp：10 集合并块只需 1 次设备注册 + 1 次 multi_video_model 请求，
+// 出站请求数减少 90%，规避连续注册 10 台设备触发的上游频控。
+func (p *Plugin) resolveAppMany(ctx context.Context, vids []string) (map[string]plugin.Stream, error) {
+	out := make(map[string]plugin.Stream, len(vids))
+	for start := 0; start < len(vids); start += appBatchLimit {
+		end := start + appBatchLimit
+		if end > len(vids) {
+			end = len(vids)
+		}
+		chunk := vids[start:end]
+		batchMap, err := p.resolveAppBatch(ctx, chunk)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range batchMap {
+			out[k] = v
+		}
+	}
+	return out, nil
+}
+
+func (p *Plugin) resolveAppBatch(ctx context.Context, vids []string) (map[string]plugin.Stream, error) {
+	if len(vids) == 0 {
+		return nil, nil
+	}
+	firstVid := vids[0]
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		id, err := p.playbackIdentity(ctx)
 		if err != nil {
-			p.logAppFailure(ctx, vid, err)
-			return plugin.Stream{}, err
+			p.logAppFailure(ctx, firstVid, err)
+			return nil, err
 		}
-		st, err := p.appPlayback(ctx, id, vid, attempt)
+		res, err := p.appPlaybackBatch(ctx, id, vids, attempt)
 		if err == nil {
-			return st, nil
+			return res, nil
 		}
 		lastErr = err
 		if attempt == 1 || !errors.Is(err, plugin.ErrRejected) {
@@ -102,15 +148,108 @@ func (p *Plugin) resolveApp(ctx context.Context, vid string) (plugin.Stream, err
 		}
 		// 空体只说明「这条身份不被接受」：换身份 + 备用域名再试一次。
 		p.logger.WarnContext(ctx, "App 通道取址被拒，换身份重试",
-			"plugin", Name, "channel", "app", "vid", vid, "reason", errorClass(err))
+			"plugin", Name, "channel", "app", "vid", firstVid, "batch", len(vids), "reason", errorClass(err))
 		select {
 		case <-ctx.Done():
-			return plugin.Stream{}, ctx.Err()
+			return nil, ctx.Err()
 		case <-time.After(appRetryDelay):
 		}
 	}
-	p.logAppFailure(ctx, vid, lastErr)
-	return plugin.Stream{}, lastErr
+	if len(vids) == 1 && errors.Is(lastErr, plugin.ErrRejected) && p.appVideoURL == defaultAppVideoURL {
+		if st, serr := p.resolveAppSingleV1(ctx, firstVid); serr == nil {
+			return map[string]plugin.Stream{firstVid: st}, nil
+		}
+	}
+	p.logAppFailure(ctx, firstVid, lastErr)
+	return nil, lastErr
+}
+
+// resolveAppSingleV1 走 /novel/player/video_model/v1/ 单集端点兜底。
+func (p *Plugin) resolveAppSingleV1(ctx context.Context, vid string) (plugin.Stream, error) {
+	id, err := p.playbackIdentity(ctx)
+	if err != nil {
+		return plugin.Stream{}, err
+	}
+	body, err := json.Marshal(map[string]any{
+		"video_id": vid,
+		"biz_param": map[string]any{
+			"video_id_type":             0,
+			"need_all_video_definition": true,
+			"video_platform":            3,
+		},
+	})
+	if err != nil {
+		return plugin.Stream{}, fmt.Errorf("%w: 构造单集取流请求体: %v", plugin.ErrSchema, err)
+	}
+	signed, err := p.sign.Playback(
+		strings.TrimRight(defaultAppSingleVideoURL, "/"),
+		appSignParams(),
+		sign.Identity{
+			DeviceID:    id.DeviceID,
+			IID:         id.IID,
+			CDID:        id.CDID,
+			VersionName: appVersionName,
+		},
+		body, appUA,
+	)
+	if err != nil {
+		return plugin.Stream{}, fmt.Errorf("%w: %v", plugin.ErrSchema, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, signed.URL, bytes.NewReader(body))
+	if err != nil {
+		return plugin.Stream{}, fmt.Errorf("%w: 构造单集取流请求", plugin.ErrUpstream)
+	}
+	for name, value := range signed.Headers {
+		req.Header.Set(name, value)
+	}
+	req.Close = true
+	req.Header.Set("Connection", "close")
+	logPath := req.URL.Path
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return plugin.Stream{}, ctxErr
+		}
+		return plugin.Stream{}, fmt.Errorf("%w: POST %s 网络失败", plugin.ErrUpstream, logPath)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	payload, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAppResponseBytes+1))
+	if readErr != nil || resp.StatusCode != http.StatusOK || len(payload) == 0 || int64(len(payload)) > maxAppResponseBytes {
+		return plugin.Stream{}, fmt.Errorf("%w: POST %s 返回 status=%d bytes=%d", plugin.ErrRejected, logPath, resp.StatusCode, len(payload))
+	}
+	var env struct {
+		Code      json.RawMessage `json:"Code"`
+		CodeLower json.RawMessage `json:"code"`
+		Data      struct {
+			VideoModel json.RawMessage `json:"video_model"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &env); err != nil {
+		return plugin.Stream{}, fmt.Errorf("%w: 单集取流响应不是 JSON", plugin.ErrSchema)
+	}
+	code := rawText(env.Code)
+	if code == "" {
+		code = rawText(env.CodeLower)
+	}
+	if code != "" && code != "0" {
+		return plugin.Stream{}, fmt.Errorf("%w: 单集取流响应 code=%s", plugin.ErrRejected, code)
+	}
+	model, err := parseAppModel(env.Data.VideoModel)
+	if err != nil {
+		return plugin.Stream{}, err
+	}
+	st, err := appStreamFromModel(model)
+	if err != nil {
+		return plugin.Stream{}, err
+	}
+	host := ""
+	if u, uerr := url.Parse(st.URL); uerr == nil {
+		host = u.Hostname()
+	}
+	p.logger.InfoContext(ctx, "App 单集备用通道取址成功",
+		"plugin", Name, "channel", "app_v1", "vid", vid, "host", host, "decrypt", st.Key != nil)
+	return st, nil
 }
 
 // playbackIdentity 取一条本次取流专用身份。注册失败时退回缓存身份
@@ -155,18 +294,18 @@ func errorClass(err error) string {
 	return "unknown"
 }
 
-// appPlayback 发一次取流请求并把它翻成 plugin.Stream。
-func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string, attempt int) (plugin.Stream, error) {
+// appPlaybackBatch 发一次批量取流请求（支持 1..N 个 vid）并把结果翻成 map[vid]plugin.Stream。
+func (p *Plugin) appPlaybackBatch(ctx context.Context, id deviceIdentity, vids []string, attempt int) (map[string]plugin.Stream, error) {
 	body, err := json.Marshal(appRequestBody{
 		BizParam: appBizParam{
 			DeviceLevel:            3,
 			NeedAllVideoDefinition: true,
 			VideoPlatform:          1024,
 		},
-		MixedVideoIDMap: map[string][]string{appVideoIDKind: {vid}},
+		MixedVideoIDMap: map[string][]string{appVideoIDKind: vids},
 	})
 	if err != nil {
-		return plugin.Stream{}, fmt.Errorf("%w: 构造取流请求体: %v", plugin.ErrSchema, err)
+		return nil, fmt.Errorf("%w: 构造取流请求体: %v", plugin.ErrSchema, err)
 	}
 	// 签名与发送共用同一份 body 字节：签名覆盖 query + body，签名后重新 marshal
 	// 会让上游验签失败（MKACG-676 的硬约束），所以这里只 marshal 这一次。
@@ -188,13 +327,13 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string,
 	if err != nil {
 		// 签名生成本身失败（128 次 ticket 都没落进分支 0）：显式报结构错误，
 		// 不得静默回退到无签名请求（那只会拿回 200+空体，把根因藏起来）。
-		return plugin.Stream{}, fmt.Errorf("%w: %v", plugin.ErrSchema, err)
+		return nil, fmt.Errorf("%w: %v", plugin.ErrSchema, err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, signed.URL, bytes.NewReader(body))
 	if err != nil {
 		// 不带上游错误的原文：*url.Error 会把带设备身份的完整 URL 打进错误文本，
 		// 而错误文本会进日志与 502 响应体（626：签名参数 MUST NOT 出现）。
-		return plugin.Stream{}, fmt.Errorf("%w: 构造取流请求", plugin.ErrUpstream)
+		return nil, fmt.Errorf("%w: 构造取流请求", plugin.ErrUpstream)
 	}
 	for name, value := range signed.Headers {
 		req.Header.Set(name, value)
@@ -210,12 +349,12 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string,
 	resp, err := p.client.Do(req)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return plugin.Stream{}, ctxErr
+			return nil, ctxErr
 		}
 		p.logger.WarnContext(ctx, "App 取流请求失败",
 			"plugin", Name, "channel", "app", "path", logPath, "upstream_status", 0, "bytes", 0)
 		// 同上：传输错误的原文含完整 URL（查询串里是设备身份），只报类别。
-		return plugin.Stream{}, fmt.Errorf("%w: POST %s 网络失败", plugin.ErrUpstream, logPath)
+		return nil, fmt.Errorf("%w: POST %s 网络失败", plugin.ErrUpstream, logPath)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -241,16 +380,16 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string,
 	p.logger.Log(ctx, level, "App 取流",
 		"plugin", Name, "channel", "app", "path", logPath,
 		"upstream_status", resp.StatusCode, "bytes", len(payload),
-		"content_type", contentType, "logid", logID)
+		"batch", len(vids), "content_type", contentType, "logid", logID)
 
 	if readErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return plugin.Stream{}, ctxErr
+			return nil, ctxErr
 		}
-		return plugin.Stream{}, fmt.Errorf("%w: 读取 %s 响应体: %v", plugin.ErrUpstream, logPath, readErr)
+		return nil, fmt.Errorf("%w: 读取 %s 响应体: %v", plugin.ErrUpstream, logPath, readErr)
 	}
 	if int64(len(payload)) > maxAppResponseBytes {
-		return plugin.Stream{}, fmt.Errorf("%w: POST %s 响应体超过 %d 字节",
+		return nil, fmt.Errorf("%w: POST %s 响应体超过 %d 字节",
 			plugin.ErrSchema, logPath, maxAppResponseBytes)
 	}
 	// 判定顺序（MKACG-635）：状态码先判，响应体后判。空体不是「身份被挡」的证据——
@@ -259,33 +398,38 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string,
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden ||
 		resp.StatusCode == statusDropped:
-		return plugin.Stream{}, fmt.Errorf("%w: POST %s 返回 %d", plugin.ErrRejected, logPath, resp.StatusCode)
+		return nil, fmt.Errorf("%w: POST %s 返回 %d", plugin.ErrRejected, logPath, resp.StatusCode)
 	case resp.StatusCode == http.StatusNotFound:
-		return plugin.Stream{}, fmt.Errorf("%w: POST %s 返回 404", plugin.ErrNoStream, logPath)
+		return nil, fmt.Errorf("%w: POST %s 返回 404", plugin.ErrNoStream, logPath)
 	case resp.StatusCode != http.StatusOK:
-		return plugin.Stream{}, fmt.Errorf("%w: POST %s 返回 %d", plugin.ErrUpstream, logPath, resp.StatusCode)
+		return nil, fmt.Errorf("%w: POST %s 返回 %d", plugin.ErrUpstream, logPath, resp.StatusCode)
 	}
 	// 200 + 空体（MKACG-673）：这个 agw 拒绝请求时回 200 但不写响应体，不是契约结构
 	// 变了。归 ErrRejected 才能走 resolveApp 的换身份重试；按结构不符归类会把本来
 	// 可自愈的故障变成不可恢复，错误文案也误导。
 	if len(payload) == 0 {
-		return plugin.Stream{}, fmt.Errorf("%w: POST %s 返回 200 但响应体为空", plugin.ErrRejected, logPath)
+		return nil, fmt.Errorf("%w: POST %s 返回 200 但响应体为空", plugin.ErrRejected, logPath)
 	}
 
-	st, err := appStream(payload, vid, appReply{
+	reply := appReply{
 		status: resp.StatusCode, contentType: contentType, bytes: len(payload),
-	})
-	if err != nil {
-		return plugin.Stream{}, err
 	}
-	host := ""
-	if u, uerr := url.Parse(st.URL); uerr == nil {
-		host = u.Hostname()
+	out := make(map[string]plugin.Stream, len(vids))
+	for _, vid := range vids {
+		st, err := appStream(payload, vid, reply)
+		if err != nil {
+			return nil, err
+		}
+		host := ""
+		if u, uerr := url.Parse(st.URL); uerr == nil {
+			host = u.Hostname()
+		}
+		// 域名在校验通过之后才落日志；密钥只记「有没有」。
+		p.logger.InfoContext(ctx, "App 通道取址成功",
+			"plugin", Name, "channel", "app", "vid", vid, "host", host, "decrypt", st.Key != nil)
+		out[vid] = st
 	}
-	// 域名在校验通过之后才落日志；密钥只记「有没有」。
-	p.logger.InfoContext(ctx, "App 通道取址成功",
-		"plugin", Name, "channel", "app", "vid", vid, "host", host, "decrypt", st.Key != nil)
-	return st, nil
+	return out, nil
 }
 
 // appSignParams 把设备参数摊成有序切片（签名对 query 字节敏感，顺序必须稳定，

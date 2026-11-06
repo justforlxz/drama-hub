@@ -619,3 +619,42 @@ func TestResolveSeriesEmpty(t *testing.T) {
 		t.Fatalf("上游请求 = %v, 期望零请求", reqs)
 	}
 }
+
+func TestResolveSeriesBatchesAppRequests(t *testing.T) {
+	spade := buildSpadeA(t, appTestKey)
+	vids := fixtureVidList(t, "page-series-protected.html")
+	vid1, vid3 := vids[0], vids[2]
+	url1 := "https://v3-web.fqnovelvod.com/video/full/" + vid1 + ".mp4?sig=1"
+	url3 := "https://v3-web.fqnovelvod.com/video/full/" + vid3 + ".mp4?sig=3"
+
+	web, webSrv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series-protected.html"))
+	app, appSrv := newFakeApp(t)
+	app.replyVideo(func(int) (int, string) {
+		return http.StatusOK, string(mustJSON(t, map[string]any{
+			"Code": 0,
+			"data": map[string]any{
+				vid1: map[string]any{"video_model": appModelPlainFixture(map[string]any{
+					"360p": appRow("h264", url1, spade, 640, 360, 640_000),
+				})},
+				vid3: map[string]any{"video_model": appModelPlainFixture(map[string]any{
+					"360p": appRow("h264", url3, spade, 640, 360, 640_000),
+				})},
+			},
+		}))
+	})
+	p := newAppTestPlugin(t, webSrv, appSrv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	got, err := p.ResolveSeries(context.Background(), testRef(), []int{1, 3})
+	if err != nil {
+		t.Fatalf("ResolveSeries: %v", err)
+	}
+	if len(got) != 2 || got[0].URL != url1 || got[1].URL != url3 {
+		t.Fatalf("ResolveSeries = %+v, 期望 [%s, %s]", got, url1, url3)
+	}
+	if reqs := web.requests(); len(reqs) != 1 {
+		t.Fatalf("网页请求 = %v, 期望仅 1 次详情页", reqs)
+	}
+	if registers, videos := app.count(); registers != 1 || videos != 1 {
+		t.Fatalf("App 请求 = 注册 %d / 取流 %d, 期望合并为各 1 次", registers, videos)
+	}
+}

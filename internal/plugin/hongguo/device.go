@@ -30,6 +30,9 @@ const (
 	// （tt_data / cronet / ttnet 版本），与站点无关；测试注入 httptest 地址。
 	defaultDeviceRegisterURL = "https://log5-applog-lf.fqnovel.com/service/2/device_register/" +
 		"?tt_data=a&cronet_version=8d40f833_2026-03-03&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1"
+	// defaultDeviceRegisterAltURL 是备用匿名设备注册端点（lq 节点容灾）。
+	defaultDeviceRegisterAltURL = "https://log5-applog-lq.fqnovel.com/service/2/device_register/" +
+		"?tt_data=a&cronet_version=8d40f833_2026-03-03&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1"
 	// deviceAid 是红果在头条系里的产品号（信封 header 与 x-ss-dp 头都用它）。
 	deviceAid = 8662
 	// deviceUA 是 App 通道的 User-Agent：Android 形态，与官网页的浏览器身份
@@ -48,6 +51,7 @@ type deviceIdentity struct {
 	DeviceID string // 注册响应 device_id（数字文本）
 	IID      string // 注册响应 install_id（数字文本）
 	CDID     string // 本进程生成的设备标识，同时写进信封 header
+	Cookie   string // 注册响应下发的游客 Cookie（ttreq / store-region 等）
 }
 
 // deviceCache 是插件唯一的进程内可变状态：一条身份，成功与失败都只存这一条。
@@ -163,6 +167,25 @@ func (d *deviceCache) attempt(ctx context.Context) (deviceIdentity, error) {
 // register 发一次注册请求。失败一律 plugin.ErrRejected（626 错误表：设备注册失败、
 // 空响应、业务拒绝、风控 403/风控页都归这一条），取消则回 ctx 自己的错误。
 func (d *deviceCache) register(ctx context.Context) (deviceIdentity, error) {
+	urls := []string{d.registerURL}
+	if d.registerURL == defaultDeviceRegisterURL {
+		urls = append(urls, defaultDeviceRegisterAltURL)
+	}
+	var lastErr error
+	for _, regURL := range urls {
+		id, err := d.registerTo(ctx, regURL)
+		if err == nil {
+			return id, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return deviceIdentity{}, ctxErr
+		}
+		lastErr = err
+	}
+	return deviceIdentity{}, lastErr
+}
+
+func (d *deviceCache) registerTo(ctx context.Context, regURL string) (deviceIdentity, error) {
 	now := d.now()
 	cdid, err := deviceUUID(d.rand)
 	if err != nil {
@@ -172,7 +195,7 @@ func (d *deviceCache) register(ctx context.Context) (deviceIdentity, error) {
 	if err != nil {
 		return deviceIdentity{}, fmt.Errorf("%w: 构造注册信封: %v", plugin.ErrRejected, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.registerURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, regURL, bytes.NewReader(body))
 	if err != nil {
 		return deviceIdentity{}, fmt.Errorf("%w: 构造注册请求: %v", plugin.ErrRejected, err)
 	}
@@ -216,7 +239,27 @@ func (d *deviceCache) register(ctx context.Context) (deviceIdentity, error) {
 		return deviceIdentity{}, err
 	}
 	id.CDID = cdid
+	id.Cookie = extractGuestCookie(resp.Cookies(), id.IID)
 	return id, nil
+}
+
+func extractGuestCookie(cookies []*http.Cookie, installID string) string {
+	var ttreq, storeRegion, storeRegionSrc string
+	for _, c := range cookies {
+		switch c.Name {
+		case "ttreq":
+			ttreq = c.Value
+		case "store-region":
+			storeRegion = c.Value
+		case "store-region-src":
+			storeRegionSrc = c.Value
+		}
+	}
+	if ttreq == "" {
+		return ""
+	}
+	return "passport_csrf_token=; passport_csrf_token_default=; store-region=" + storeRegion +
+		"; store-region-src=" + storeRegionSrc + "; install_id=" + installID + "; ttreq=" + ttreq
 }
 
 // setDeviceRegisterHeaders 挂上报文与身份头：信封是二进制体，Content-Type 带
@@ -279,18 +322,19 @@ type deviceProfile struct {
 	NotRequestSender    int          `json:"not_request_sender"`
 	Carrier             string       `json:"carrier"`
 	MCCMNC              string       `json:"mcc_mnc"`
-	ROM                 string       `json:"rom"`
-	ROMVersion          string       `json:"rom_version"`
+	ROM                 string       `json:"rom,omitempty"`
+	ROMVersion          string       `json:"rom_version,omitempty"`
 	Cdid                string       `json:"cdid"`
-	SigHash             string       `json:"sig_hash"`
+	SigHash             string       `json:"sig_hash,omitempty"`
 	Openudid            string       `json:"openudid"`
 	Clientudid          string       `json:"clientudid"`
 	IPv6List            []string     `json:"ipv6_list"`
 	Region              string       `json:"region"`
 	TZName              string       `json:"tz_name"`
 	TZOffset            int          `json:"tz_offset"`
-	SimRegion           string       `json:"sim_region"`
+	SimRegion           string       `json:"sim_region,omitempty"`
 	SimSerialNumber     []string     `json:"sim_serial_number"`
+	OAID                *deviceOAID  `json:"oaid,omitempty"`
 	OaidMaySupport      bool         `json:"oaid_may_support"`
 	ReqID               string       `json:"req_id"`
 	DevicePlatform      string       `json:"device_platform"`
@@ -300,6 +344,18 @@ type deviceProfile struct {
 	IsSystemApp         int          `json:"is_system_app"`
 	SdkFlavor           string       `json:"sdk_flavor"`
 	GuestMode           int          `json:"guest_mode"`
+	DeviceID            string       `json:"device_id,omitempty"`
+	InstallID           string       `json:"install_id,omitempty"`
+}
+
+type deviceOAID struct {
+	ReqID           string `json:"req_id"`
+	HwIDVersionCode string `json:"hw_id_version_code"`
+	TakeMs          string `json:"take_ms"`
+	IsTrackLimited  string `json:"is_track_limited"`
+	QueryTimes      string `json:"query_times"`
+	ID              string `json:"id"`
+	Time            string `json:"time"`
 }
 
 // deviceCustom 是 header 里的 custom 段（区域与设备形态声明）。
@@ -357,8 +413,8 @@ func buildDeviceRegisterBody(random io.Reader, cdid string, nowMillis int64) ([]
 		NotRequestSender:    0,
 		Carrier:             "CHINA MOBILE",
 		MCCMNC:              "46000",
-		ROM:                 "eng.root.20231116.160340",
-		ROMVersion:          "W528JS release-keys",
+		ROM:                 "BP2A.250605.031.A3",
+		ROMVersion:          "OS2.0.102.0.VOCCNXM release-keys",
 		Cdid:                cdid,
 		SigHash:             "56a962410c494bbaf0b58dba20cae56f",
 		Openudid:            openudid,
@@ -369,9 +425,18 @@ func buildDeviceRegisterBody(random io.Reader, cdid string, nowMillis int64) ([]
 		TZOffset:            28800,
 		SimRegion:           "cn",
 		SimSerialNumber:     []string{},
-		OaidMaySupport:      false,
-		ReqID:               reqID,
-		DevicePlatform:      "android",
+		OAID: &deviceOAID{
+			ReqID:           reqID,
+			HwIDVersionCode: "0",
+			TakeMs:          "6",
+			IsTrackLimited:  "false",
+			QueryTimes:      "1",
+			ID:              clientudid,
+			Time:            strconv.FormatInt(nowMillis-200, 10),
+		},
+		OaidMaySupport: true,
+		ReqID:          reqID,
+		DevicePlatform: "android",
 		Custom: deviceCustom{
 			AccountRegionSrc: "fallback",
 			AccountRegion:    "cn",
@@ -383,6 +448,8 @@ func buildDeviceRegisterBody(random io.Reader, cdid string, nowMillis int64) ([]
 		IsSystemApp:         0,
 		SdkFlavor:           "china",
 		GuestMode:           0,
+		DeviceID:            "0",
+		InstallID:           "0",
 	}
 	plaintext, err := json.Marshal(deviceRegisterEnvelope{
 		MagicTag: "ss_app_log",

@@ -199,6 +199,9 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string,
 	for name, value := range signed.Headers {
 		req.Header.Set(name, value)
 	}
+	if id.Cookie != "" {
+		req.Header.Set("Cookie", id.Cookie)
+	}
 	if attempt > 0 {
 		// 备用路由按参考实现的写法强制换连接，避免复用被判重的那条。
 		req.Close = true

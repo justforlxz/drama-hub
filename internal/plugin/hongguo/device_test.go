@@ -315,6 +315,15 @@ func TestDeviceRegisterBody(t *testing.T) {
 	if h.ApkFirstInstallTime != nowMillis {
 		t.Fatalf("apk_first_install_time = %d, 期望 %d", h.ApkFirstInstallTime, nowMillis)
 	}
+	if !h.OaidMaySupport || h.OAID == nil || h.OAID.ID != h.Clientudid || h.OAID.ReqID != h.ReqID {
+		t.Fatalf("oaid = %+v (may_support=%v), 期望带完整 OAID 对象", h.OAID, h.OaidMaySupport)
+	}
+	if h.DeviceID != "0" || h.InstallID != "0" {
+		t.Fatalf("首次注册占位 device_id=%q install_id=%q, 期望均为 \"0\"", h.DeviceID, h.InstallID)
+	}
+	if strings.HasPrefix(h.ROM, "eng.root") {
+		t.Fatalf("ROM = %q, 不应包含测试工程 ROM 指纹", h.ROM)
+	}
 
 	again, err := buildDeviceRegisterBody(bytes.NewReader(seedBytes(0x3C)), "cdid-under-test", nowMillis)
 	if err != nil {
@@ -348,6 +357,23 @@ func TestParseDeviceRegisterResponse(t *testing.T) {
 				t.Fatalf("身份 = %+v, 期望 %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestExtractGuestCookie(t *testing.T) {
+	cookies := []*http.Cookie{
+		{Name: "ttreq", Value: "1$deadbeef"},
+		{Name: "store-region", Value: "cn-zj"},
+		{Name: "store-region-src", Value: "did"},
+	}
+	got := extractGuestCookie(cookies, "2002")
+	for _, want := range []string{"ttreq=1$deadbeef", "store-region=cn-zj", "store-region-src=did", "install_id=2002"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("extractGuestCookie = %q, 缺 %q", got, want)
+		}
+	}
+	if empty := extractGuestCookie(nil, "2002"); empty != "" {
+		t.Errorf("无 ttreq 时 extractGuestCookie = %q, 期望空字符串", empty)
 	}
 }
 

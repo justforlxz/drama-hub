@@ -169,6 +169,15 @@ func (c *Cutter) ensureDuration(ctx context.Context, ep store.Episode, d stream.
 	if ep.DurationSec > 0 {
 		return float64(ep.DurationSec), nil
 	}
+	if d.DurationSec > 0 {
+		if _, err := c.st.BackfillEpisodeDuration(ctx, ep.ID, d.DurationSec); err != nil {
+			return 0, fmt.Errorf("回填剧集 %d 时长: %w", ep.ID, err)
+		}
+		c.touchStream(ctx, ep.ID)
+		c.logger.InfoContext(ctx, "episode duration from model",
+			"episode_id", ep.ID, "duration_sec", d.DurationSec, "channel", channelOf(d))
+		return float64(d.DurationSec), nil
+	}
 	if err := c.acquire(ctx); err != nil {
 		return 0, err
 	}

@@ -113,7 +113,11 @@ func parseSitePlayInfo(body []byte) (plugin.Stream, error) {
 		if err != nil || u.Scheme != "https" || u.Host == "" {
 			return plugin.Stream{}, fmt.Errorf("%w: 站点片源地址不是 https 绝对地址", plugin.ErrSchema)
 		}
-		return plugin.Stream{URL: u.String(), Key: nil}, nil
+		return plugin.Stream{
+			URL:         u.String(),
+			Key:         nil,
+			DurationSec: int(li.Duration + 0.5),
+		}, nil
 	}
 	if out.PlayInfo != nil {
 		// DASH-CENC：响应里只有 kid（密钥标识）与 player_access_key（取密钥的

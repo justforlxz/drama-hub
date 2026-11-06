@@ -968,6 +968,30 @@ func TestAppResolveRejectsNonWhitelisted(t *testing.T) {
 	}
 }
 
+func TestAppStreamFromModelExtractsDurationAndExpiry(t *testing.T) {
+	raw := mustJSON(t, map[string]any{
+		"video_duration": 124.6,
+		"url_expire":     int64(1762466400),
+		"video_list": map[string]any{
+			"360p": appRow("h264", appTestMediaURL, buildSpadeA(t, appTestKey), 640, 360, 640_000),
+		},
+	})
+	model, err := parseAppModel(json.RawMessage(raw))
+	if err != nil {
+		t.Fatalf("parseAppModel: %v", err)
+	}
+	st, err := appStreamFromModel(model)
+	if err != nil {
+		t.Fatalf("appStreamFromModel: %v", err)
+	}
+	if st.DurationSec != 125 {
+		t.Errorf("DurationSec = %d, 期望四舍五入为 125", st.DurationSec)
+	}
+	if got := st.ExpiresAt.Unix(); got != 1762466400 {
+		t.Errorf("ExpiresAt = %d, 期望 1762466400", got)
+	}
+}
+
 // mustJSON 把夹具结构序列化成 JSON 文本。
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()

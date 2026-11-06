@@ -438,7 +438,23 @@ func appStreamFromModel(model appModel) (plugin.Stream, error) {
 				lastErr = err
 				continue
 			}
-			return plugin.Stream{URL: checked, Key: key}, nil
+			var expiresAt time.Time
+			if model.URLExpire > 0 {
+				expiresAt = time.Unix(model.URLExpire, 0).UTC()
+			}
+			durSec := 0
+			if model.VideoDuration > 0 {
+				durSec = int(model.VideoDuration + 0.5)
+				if durSec <= 0 {
+					durSec = 1
+				}
+			}
+			return plugin.Stream{
+				URL:         checked,
+				Key:         key,
+				ExpiresAt:   expiresAt,
+				DurationSec: durSec,
+			}, nil
 		}
 	}
 	if lastErr == nil {

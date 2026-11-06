@@ -87,8 +87,9 @@ type Stream struct {
 	// Key 是 URL 指向内容的 AES-128 解密密钥（16 字节，CENC-AES-CTR），
 	// nil = 明文。与 URL 同生命周期：框架一起落库以复用（ADR-0016），
 	// 但 MUST NOT 进日志与错误文本（docs/PLUGIN-CONTRACT.md「加密切片与 Key」）。
-	Key       []byte
-	ExpiresAt time.Time // 零值 = 不知道或不过期
+	Key         []byte
+	ExpiresAt   time.Time // 零值 = 不知道或不过期
+	DurationSec int       // >0 表示源接口直接给出了该集时长（秒），无需再跑 ffprobe
 }
 
 // Plugin 是播放源插件契约。实现必须可并发调用（框架会并行取多部剧）。

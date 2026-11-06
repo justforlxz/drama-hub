@@ -36,8 +36,9 @@ func ChannelOf(d Direct) string {
 // nil = 明文。URL 与 Key 同生命周期：一起落库、一起失效、一起重取，但都不进日志、
 // 不进错误文本（docs/adr/0016-episode-stream-cache.md）。
 type Direct struct {
-	URL string
-	Key []byte // 16 字节 AES-128；nil = 明文
+	URL         string
+	Key         []byte // 16 字节 AES-128；nil = 明文
+	DurationSec int    // >0 表示源接口直接给出了该集时长（秒）
 }
 
 // Resolver 在请求时把一集解析成可播放直链（docs/PLAYBACK-CONTRACT.md「两个口子」）。
@@ -97,8 +98,11 @@ func (r *Resolver) Direct(ctx context.Context, ep store.Episode) (Direct, error)
 	s, err := r.fetch(ctx, ep)
 	var d Direct
 	if err == nil {
-		d = Direct{URL: s.URL, Key: s.Key}
+		d = Direct{URL: s.URL, Key: s.Key, DurationSec: s.DurationSec}
 		err = r.persist(ctx, ep.ID, s)
+		if err == nil && s.DurationSec > 0 && ep.DurationSec <= 0 {
+			_, _ = r.st.BackfillEpisodeDuration(ctx, ep.ID, s.DurationSec)
+		}
 	}
 	r.finish(ep.ID, f, d, err)
 	return d, err
@@ -383,8 +387,11 @@ func (r *Resolver) fillMany(ctx context.Context, eps []store.Episode, owned []in
 	}
 	for j, i := range owned {
 		s := streams[j]
-		d := Direct{URL: s.URL, Key: s.Key}
+		d := Direct{URL: s.URL, Key: s.Key, DurationSec: s.DurationSec}
 		err := r.persist(ctx, eps[i].ID, s)
+		if err == nil && s.DurationSec > 0 && eps[i].DurationSec <= 0 {
+			_, _ = r.st.BackfillEpisodeDuration(ctx, eps[i].ID, s.DurationSec)
+		}
 		r.finish(eps[i].ID, flights[i], d, err)
 		if err != nil {
 			return err

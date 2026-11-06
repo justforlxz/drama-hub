@@ -44,8 +44,10 @@ type appEntry struct {
 
 // appModel 是一集的片源模型。key_seed 存在时，片源地址是密文（AES-128-CBC）。
 type appModel struct {
-	VideoList appVideoList `json:"video_list"`
-	KeySeed   string       `json:"key_seed"`
+	VideoList     appVideoList `json:"video_list"`
+	KeySeed       string       `json:"key_seed"`
+	VideoDuration float64      `json:"video_duration"`
+	URLExpire     int64        `json:"url_expire"`
 }
 
 // appVideo 是片源列表里的一行。

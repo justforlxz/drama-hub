@@ -879,44 +879,37 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 ### 页面
 
-页面集合 = 四个页面 + 一个对象详情页，同一个 `base.html` + 各自模板；`pages.go` 的
-`pages` 与 `dramaPage` 是唯一答案，未登记路径（含旧的 `/status`）一律 404。
+页面集合 = 三个页面，同一个 `base.html` + 各自模板；`pages.go` 的 `pages` 是唯一答案，
+未登记路径（含旧的 `/status`，以及已删除的 `/library` / `/library/{id}` / `/categories`）
+一律 404。
 
 | 路径 | 页面 | 能干的事 |
 |---|---|---|
-| `/` | 概览（`data-page=overview`） | 健康带：摘要条（剧/集/对外集计数与最近同步时间）；每个播放源一张卡片：状态徽标（已启用/已停用/正在刷新）、上次运行/上次成功/下次计划（`title` 给完整 ISO）、仅非空时出现的上次错误、停用原因与「重启后生效」提示、页脚「立即刷新」；Jellyfin 卡片：状态徽标（未配置/已启用/正在同步/上次失败 + 缺哪几项）、上次同步时间、664 的进度与结果行、孤儿/冲突/被拒分类（空则整段不出）、页脚「同步媒体库」；「正在播放」卡片：当前几条流与剧名/集块、进度、已出字节、客户端，空态写「当前没有播放」，4 秒轮询且仅页面可见时发（MKACG-683）。补录入口已迁到剧库页（MKACG-675） |
-| `/library` | 剧库（`data-page=library`） | 工具条：搜索（剧名 / 上游 id）、分类下拉、状态筛选（无封面 / 集数不齐）、视图切换（列表 / 海报墙，默认列表）、补录开关；**台账**九列（封面 / 标题 / 年份 / 分类 / 集数 / 上游 id / 上次同步 / Jellyfin 归属 / 操作），ARIA `table` 语义 + CSS Grid，≤640px 按行塌成卡片；海报墙是同一数据的第二种渲染（`loading=lazy`、2:3 占位）；前端 50 条/页；`<details>` 补录表单（`POST /api/dramas`，201 新建 / 200 只更新） |
-| `/library/{id}` | 剧详情（`data-page=drama`） | 封面、标题/年份/分类、简介、WebDAV 路径（可复制）、Jellyfin 归属、单剧刷新（`POST /api/dramas` 传 `series_id`）、按当前 `merge_chunk_size` 分块的集列表：每块「第 A-B 集」+ 成员集与时长 + 播放地址 `…/video/<签名 id>.m3u8` 与复制按钮；id 非法或剧不存在 → 404（显式路由，不是 catch-all） |
-| `/categories` | 分类（`data-page=categories`） | 分类名、剧数 / 集数、Jellyfin 库状态、启用开关（一行一个分类）；关掉的分类在下一轮同步时删除对应的自管库，剧与文件不动（MKACG-668） |
-| `/settings` | 设置（`data-page=settings`） | 单表单、单「保存」，五组按人话排序：访问（WebDAV 用户/密码、`strm_prefix`）、同步与刷新（`refresh_interval_sec`）、合并与对外集号（`merge_chunk_size`）、缓存（`cache_max_mb` / `cache_lru_days`）、Jellyfin（地址 / API key / 媒体库根 / 库名前缀 / 单次超时）；每项带生效时机徽标与 settings key 提示，只提交改动过的项；底部可折叠「只读运行参数」（`cache_dir` / `refresh_batch` / `refresh_timeout_sec` / 密钥与凭据是否已设置） |
+| `/` | 概览（`data-page=overview`） | 系统状态卡：整机状态徽标 + 说明，其下「内容同步」「播放源」两行聚合状态；内容同步卡：剧 / 集 / 对外集计数、最近同步、最近运行 / 成功 / 下次计划；「正在播放」卡：活跃流数、剧名与集 / 合并块、进度、已出字节、客户端，空态写「当前没有播放」，4 秒轮询且仅页面可见时发（MKACG-683）。不出现媒体库列表 / 开关 / 同步按钮 |
+| `/sync` | 同步（`data-page=sync`） | Jellyfin 摘要：连接状态徽标、服务器地址、最近同步、上次结果、托管库计数、「立即同步」（202 / 409 都归一到「接着显示这一轮进度」，1 秒轮询 `GET /api/jellyfin/libraries`）；托管媒体库列表：库名、剧数（按 `internal/vfs` 的 `genreDir` 分类目录名归并 `GET /api/dramas`）、库状态、启用开关（`PATCH /api/jellyfin/categories`，关闭前用原生 `<dialog>` 二次确认）；说明关掉后下一轮周期同步或立即同步时删库、不碰用户手建的库 |
+| `/settings` | 设置（`data-page=settings`） | 单表单、单「保存」+「重置」（恢复服务器当前值），五组按人话排序：访问（WebDAV 用户 / 密码、`strm_prefix`）、同步与刷新（`refresh_interval_sec`）、合并与对外集号（`merge_chunk_size`）、缓存（`cache_max_mb` / `cache_lru_days`）、Jellyfin（地址 / API key / 媒体库根 / 库名前缀 / 单次超时）；每项带生效时机徽标，只提交改动过的项；底部可折叠「只读运行参数」 |
 
-剧目的查看入口是 `/library` → `/library/{id}`（MKACG-675）；删除仍没有入口（对外集号
-由运行时派生并按 `merge_chunk_size` 自动切块，ADR-0014），补录走剧库页的 `<details>`
-或 `POST /api/dramas`。
+旧剧库 / 剧详情 / 分类页已随 ADR-0020 删除：路由不注册、模板与 `static/paging.js` 删除，
+后端 `/api/dramas*` 端点保留但管理界面不再消费。
 
-设计系统（MKACG-667）：
+设计系统（ADR-0020，取代 MKACG-667 的那套 token）：
 
-- **单一 token 层**在 `:root`：颜色角色 `--bg` / `--surface` / `--ink` / `--ink-2` /
-  `--ink-3` / `--line` / `--line-strong` / `--accent` / `--accent-ink` / `--ok` / `--warn` /
-  `--danger` + 三档状态底 `--ok-bg` / `--warn-bg` / `--danger-bg`；间距 `--s1..--s7` =
-  4/8/12/16/24/32/48；字号 11/12.5/14/17/22；圆角 2（徽标、输入）/ 6（卡片）。
-  深色只在 `@media (prefers-color-scheme: dark)` 里覆盖颜色 token，不写第二套规则。
-- **所有页面的 `<table>` 计数为 0**：播放源与媒体库用卡片，键值用 `dl` —— 删表就是移动端
-  策略，不做 data-label 表格转卡片。剧库台账是唯一的表格形态，但用的是 ARIA `table` /
-  `row` / `cell` 语义 + CSS Grid（ADR-0017），不是 `<table>` 元素：≥880px 是九列，≤640px
-  同一份 DOM 按行塌成卡片。窄屏单列、触控目标 ≥44px、长值 `overflow-wrap: anywhere`；
-  ≥880px 概览与设置项两列。断点只有 `max-width: 640px` 与 `min-width: 880px` 两个。
-- **复用一组状态件**：`.badge[data-tone]` 状态徽标、`.badge[data-timing]` 生效时机
-  （`immediate` / `refresh` / `evict` / `restart`）、`.alert` 错误与警告、
-  `.state[data-state=loading|empty|error]` 三态。不引入图标库、字体文件、动画关键帧、
-  主题切换开关或任何构建步骤（ADR-0002）。
+- **单一 token 层**在 `:root`：`--canvas` / `--sidebar` / `--surface` / `--surface-muted` /
+  `--text` / `--secondary` / `--tertiary` / `--separator` / `--blue` / `--green` /
+  `--orange` / `--red`，各自另有 `*-soft` 底色；圆角 `--radius-card` 18px /
+  `--radius-control` 10px / `--radius-field` 8px；字体栈 `-apple-system…`。只有浅色：
+  `@media (prefers-color-scheme: dark)` 只把 `color-scheme` 钉回 light。
+- **所有页面的 `<table>` 计数为 0**：状态与计数用卡片 + `dl` + 徽标，不做 data-label 表格。
+- **状态一律「小圆点 + 文字」**（`.badge[data-tone]`、`.dot[data-tone]`），不只用颜色；
+  生效时机仍用 `.badge[data-timing]`（`immediate` / `refresh` / `evict`）。
+- 断点两档：`980px` 收成图标侧栏、`700px` 收成底部三个入口；触控目标不低于 40px；
+  尊重 `prefers-reduced-motion`。
 
-模板 `templates/*.html` 与 `static/app.css`、`static/app.js`、`static/paging.js` 用
-`//go:embed` 进二进制：界面没有构建步骤、没有 `package.json`（ADR-0002）。`paging.js`
-只放剧库的纯逻辑（筛选 / 分页 / 台账单元格），不碰 DOM —— 浏览器里挂
-`window.DramaHubPaging`，node 里可 `require`，`TestPagingContract` 用同一份源码做表驱动
-单测（e2e 镜像装 nodejs 就是为了它，运行时镜像不需要）。页面 JS 只调下面这些 API，渲染结果
-与 API 返回一一对应；页面响应同样给出精确 `Content-Length`（渲染成字节 → 再写响应）。
+模板 `templates/*.html` 与 `static/app.css`、`static/app.js` 用 `//go:embed` 进二进制：
+界面没有构建步骤、没有 `package.json`（ADR-0002），也没有 node 单测。浏览器端唯一的业务
+算法是 `/sync` 页的 `genreDir`（分类目录名），它必须与 `internal/vfs/tree.go` 的
+`genreDir` 同字符集、同「其他」兜底，由 `TestGenreDirContract` 直接读两侧源码断言。
+页面 JS 只调下面这些 API，渲染结果与 API 返回一一对应；页面响应同样给出精确 `Content-Length`。
 
 ### 管理 API
 

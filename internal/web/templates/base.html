@@ -3,46 +3,67 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
+<meta name="color-scheme" content="light">
 <title>{{.Title}} · drama-hub</title>
+<!-- 站点图标内联为 data URI：无法引用 :root 的 var()，色值与 --blue / #fff 同值，
+     是「设计 token 只在 CSS 变量层」的唯一例外（ADR-0020）。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23007aff'/%3E%3Ctext x='16' y='22' font-size='17' font-weight='650' fill='%23fff' text-anchor='middle'%3E%E5%89%A7%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body data-page="{{.Page}}">
 <a class="skip" href="#main">跳到内容</a>
-<header class="topbar">
-  <span class="wordmark">drama-hub</span>
-  <nav class="tabs" aria-label="管理页">
-    <a href="/"{{if eq .Nav "overview"}} aria-current="page"{{end}}>概览</a>
-    <a href="/library"{{if eq .Nav "library"}} aria-current="page"{{end}}>剧库</a>
-    <a href="/categories"{{if eq .Nav "categories"}} aria-current="page"{{end}}>分类</a>
-    <a href="/settings"{{if eq .Nav "settings"}} aria-current="page"{{end}}>设置</a>
-  </nav>
-  <!-- 写操作（刷新/同步/改配置/补录）要带 X-Admin-Token。令牌平时不出现在页面上：
-       点这个按钮才开 #token-dialog，解锁后只存本标签页的 sessionStorage。 -->
-  <button type="button" class="btn token-btn" id="token-button" aria-haspopup="dialog">
-    <span id="token-state">写操作 · 未解锁</span>
-  </button>
-</header>
-<dialog id="token-dialog" class="token-dialog" aria-labelledby="token-title">
-  <form class="token-form" id="token-form" method="dialog">
-    <h2 id="token-title">管理令牌</h2>
-    <p class="hint">写操作需要部署时设置的 DRAMA_HUB_ADMIN_TOKEN。令牌只存在本标签页的 sessionStorage，关掉标签页即失效。</p>
+<div class="app">
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="drama-hub 概览">
+      <span class="brand-mark" aria-hidden="true">剧</span>
+      <span class="brand-copy">
+        <span class="brand-name">drama-hub</span>
+        <span class="brand-caption">MEDIA MANAGER</span>
+      </span>
+    </a>
+    <nav class="nav" aria-label="管理页">
+      <span class="nav-caption">管理</span>
+      <a class="nav-item" href="/"{{if eq .Page "overview"}} aria-current="page"{{end}}>
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.6"/><rect x="11" y="3" width="6" height="6" rx="1.6"/><rect x="3" y="11" width="6" height="6" rx="1.6"/><rect x="11" y="11" width="6" height="6" rx="1.6"/></svg>
+        <span>概览</span>
+      </a>
+      <a class="nav-item" href="/sync"{{if eq .Page "sync"}} aria-current="page"{{end}}>
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 10a6.5 6.5 0 0 1 11-4.7"/><path d="M14.5 2.6v3.2h-3.2"/><path d="M16.5 10a6.5 6.5 0 0 1-11 4.7"/><path d="M5.5 17.4v-3.2h3.2"/></svg>
+        <span>同步</span>
+      </a>
+      <a class="nav-item" href="/settings"{{if eq .Page "settings"}} aria-current="page"{{end}}>
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 6h13M3.5 10h13M3.5 14h13"/><circle cx="7" cy="6" r="1.7"/><circle cx="13" cy="10" r="1.7"/><circle cx="8" cy="14" r="1.7"/></svg>
+        <span>设置</span>
+      </a>
+    </nav>
+    <div class="side-foot">只在局域网内提供管理面</div>
+  </aside>
+  <div class="main">
+    <header class="toolbar">
+      <button type="button" class="unlock" id="token-button" aria-haspopup="dialog">
+        <span id="token-state">写操作 · 未解锁</span>
+      </button>
+    </header>
+    <main class="content" id="main" tabindex="-1">
+{{template "content" .}}
+    </main>
+  </div>
+</div>
+<dialog id="token-dialog" class="dialog" aria-labelledby="token-title">
+  <form class="dialog-body" id="token-form" method="dialog">
+    <h2 class="dialog-title" id="token-title">管理令牌</h2>
+    <p class="dialog-desc">写操作需要部署时设置的 DRAMA_HUB_ADMIN_TOKEN。令牌只存在本标签页的 sessionStorage，关掉标签页即失效。</p>
     <label class="field">
       <span class="field-label">令牌</span>
-      <input type="password" id="admin-token" autocomplete="off" spellcheck="false"
-             placeholder="DRAMA_HUB_ADMIN_TOKEN">
+      <input class="dialog-input" type="password" id="admin-token" autocomplete="off" spellcheck="false" placeholder="DRAMA_HUB_ADMIN_TOKEN">
     </label>
-    <p class="notice" id="token-notice" role="status" aria-live="polite"></p>
-    <div class="dialog-foot">
-      <button type="button" class="btn" id="token-clear">清除</button>
-      <button type="submit" class="btn primary" id="token-save">解锁</button>
+    <p class="state" id="token-notice" role="status" aria-live="polite"></p>
+    <div class="dialog-actions">
+      <button type="button" class="secondary-btn" id="token-clear">清除</button>
+      <button type="submit" class="primary-btn" id="token-save">解锁</button>
     </div>
   </form>
 </dialog>
-<main id="main" tabindex="-1">
-{{template "content" .}}
-</main>
-<script src="/static/paging.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>{{end}}

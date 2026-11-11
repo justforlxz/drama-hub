@@ -1,121 +1,144 @@
 {{define "content"}}
-<section class="page-head">
-  <h1>设置</h1>
-</section>
-<p class="lede">改完点一次「保存」：只提交改动过的项，非法值整批拒绝、库里不动。</p>
+<div class="page-head">
+  <div>
+    <h1 class="page-title">设置</h1>
+    <p class="page-desc">改完点一次「保存」，只有改动的项会被写入。</p>
+  </div>
+</div>
 <p class="notice" id="notice" role="status" aria-live="polite"></p>
 
-<form class="form" id="settings-form">
-  <fieldset class="group">
-    <legend>访问</legend>
-    <p class="hint">Jellyfin / 播放器用 WebDAV 连过来时用的凭据，以及写进 .strm 的地址前缀。</p>
-    <div class="fields">
-      <label class="field">
-        <span class="field-label">WebDAV 用户 <span class="badge" data-timing="immediate">即时</span></span>
-        <input id="set-webdav-user" name="webdav_user" autocomplete="off" spellcheck="false">
-        <span class="hint"><code>webdav_user</code></span>
-      </label>
-      <label class="field">
-        <span class="field-label">WebDAV 密码 <span class="badge" data-timing="immediate">即时</span></span>
-        <input id="set-webdav-pass" name="webdav_pass" type="password"
-               autocomplete="new-password" spellcheck="false">
-        <span class="hint"><code>webdav_pass</code></span>
-      </label>
-      <label class="field wide">
-        <span class="field-label">strm 前缀 <span class="badge" data-timing="immediate">即时</span></span>
-        <input id="set-strm-prefix" name="strm_prefix" autocomplete="off" spellcheck="false"
-               placeholder="空 = 按请求 Host 推导">
-        <span class="hint"><code>strm_prefix</code>：留空则按请求的 Host 推导播放地址。</span>
-      </label>
+<form class="card settings-panel" id="settings-form">
+  <fieldset class="settings-group">
+    <legend class="visually-hidden">访问</legend>
+    <div class="settings-body">
+      <div class="group-head">
+        <div class="group-title">访问</div>
+        <p class="group-description">WebDAV 登录凭据与对外 STRM 地址前缀。改完立刻对新建连接生效。</p>
+      </div>
+      <div class="fields">
+        <label class="field">
+          <span class="field-label">WebDAV 用户名 <span class="badge" data-timing="immediate">即时</span></span>
+          <input id="set-webdav-user" name="webdav_user" type="text" autocomplete="username" spellcheck="false" placeholder="留空不改">
+          <span class="field-hint">未设置时 /webdav 恒 401</span>
+        </label>
+        <label class="field">
+          <span class="field-label">WebDAV 密码 <span class="badge" data-timing="immediate">即时</span></span>
+          <input id="set-webdav-pass" name="webdav_pass" type="password" autocomplete="new-password" spellcheck="false" placeholder="留空不改">
+          <span class="field-hint">不回显；留空表示不修改</span>
+        </label>
+        <label class="field full">
+          <span class="field-label">STRM 地址前缀 <span class="badge" data-timing="immediate">即时</span></span>
+          <input id="set-strm-prefix" name="strm_prefix" type="text" spellcheck="false" placeholder="http://nas.local:8080">
+          <span class="field-hint">写进 .strm 的播放地址前缀</span>
+        </label>
+      </div>
     </div>
   </fieldset>
 
-  <fieldset class="group">
-    <legend>同步与刷新</legend>
-    <p class="hint">多久去上游看一次新集；改动在下一轮生效。</p>
-    <div class="fields">
-      <label class="field">
-        <span class="field-label">刷新间隔秒 <span class="badge" data-timing="refresh">≤60 秒</span></span>
-        <input id="set-refresh-interval" name="refresh_interval_sec" inputmode="numeric" autocomplete="off">
-        <span class="hint"><code>refresh_interval_sec</code></span>
-      </label>
+  <fieldset class="settings-group">
+    <legend class="visually-hidden">同步与刷新</legend>
+    <div class="settings-body">
+      <div class="group-head">
+        <div class="group-title">同步与刷新</div>
+        <p class="group-description">播放源扫描的周期。改完在下一轮调度时生效。</p>
+      </div>
+      <div class="fields">
+        <label class="field">
+          <span class="field-label">刷新间隔（秒） <span class="badge" data-timing="refresh">≤60 秒</span></span>
+          <input id="set-refresh-interval" name="refresh_interval_sec" type="number" min="1" step="1">
+          <span class="field-hint">调度器按这个间隔安排下一次扫描</span>
+        </label>
+      </div>
     </div>
   </fieldset>
 
-  <fieldset class="group">
-    <legend>合并与对外集号</legend>
-    <p class="hint">上游把一集切成多个小片段时，按多少片段合成一个对外集号。</p>
-    <div class="fields">
-      <label class="field">
-        <span class="field-label">合并分块集数 <span class="badge" data-timing="immediate">即时</span></span>
-        <input id="set-merge-chunk-size" name="merge_chunk_size" inputmode="numeric" autocomplete="off">
-        <span class="hint"><code>merge_chunk_size</code>：改完对外集号立刻变化（Jellyfin 需重扫）。</span>
-      </label>
+  <fieldset class="settings-group">
+    <legend class="visually-hidden">合并与对外集号</legend>
+    <div class="settings-body">
+      <div class="group-head">
+        <div class="group-title">合并与对外集号</div>
+        <p class="group-description">把一个来源的连续集聚合成对外可见的一集。改完影响后续派生的集号。</p>
+      </div>
+      <div class="fields">
+        <label class="field">
+          <span class="field-label">合并集包含集数 <span class="badge" data-timing="immediate">即时</span></span>
+          <input id="set-merge-chunk-size" name="merge_chunk_size" type="number" min="1" step="1">
+          <span class="field-hint">1 表示不做合并</span>
+        </label>
+      </div>
     </div>
   </fieldset>
 
-  <fieldset class="group">
-    <legend>缓存</legend>
-    <p class="hint">分片与封面的磁盘占用；超限或过期由回收器在后台清。</p>
-    <div class="fields">
-      <label class="field">
-        <span class="field-label">缓存上限 MB <span class="badge" data-timing="evict">≤5 分钟</span></span>
-        <input id="set-cache-max-mb" name="cache_max_mb" inputmode="numeric" autocomplete="off">
-        <span class="hint"><code>cache_max_mb</code></span>
-      </label>
-      <label class="field">
-        <span class="field-label">缓存保留天数 <span class="badge" data-timing="evict">≤5 分钟</span></span>
-        <input id="set-cache-lru-days" name="cache_lru_days" inputmode="numeric" autocomplete="off">
-        <span class="hint"><code>cache_lru_days</code></span>
-      </label>
+  <fieldset class="settings-group">
+    <legend class="visually-hidden">缓存</legend>
+    <div class="settings-body">
+      <div class="group-head">
+        <div class="group-title">缓存</div>
+        <p class="group-description">冷片段的磁盘缓存上限与保留天数。改完在下一轮清理时生效。</p>
+      </div>
+      <div class="fields">
+        <label class="field">
+          <span class="field-label">容量上限（MB） <span class="badge" data-timing="evict">≤5 分钟</span></span>
+          <input id="set-cache-max-mb" name="cache_max_mb" type="number" min="0" step="1">
+          <span class="field-hint">0 表示不限制</span>
+        </label>
+        <label class="field">
+          <span class="field-label">保留天数 <span class="badge" data-timing="evict">≤5 分钟</span></span>
+          <input id="set-cache-lru-days" name="cache_lru_days" type="number" min="0" step="1">
+          <span class="field-hint">0 表示不按时间淘汰</span>
+        </label>
+      </div>
     </div>
   </fieldset>
 
-  <fieldset class="group">
-    <legend>Jellyfin</legend>
-    <p class="hint">地址、API key、媒体库根三项都非空才启用；分类开关在「分类」页。</p>
-    <div class="fields">
-      <label class="field wide">
-        <span class="field-label">地址 <span class="badge" data-timing="immediate">即时</span></span>
-        <input id="set-jellyfin-url" name="jellyfin_url" autocomplete="off" spellcheck="false"
-               placeholder="空 = 关闭（如 http://jellyfin:8096）">
-        <span class="hint"><code>jellyfin_url</code></span>
-      </label>
-      <label class="field wide">
-        <span class="field-label">API key <span class="badge" data-timing="immediate">即时</span></span>
-        <input id="set-jellyfin-api-key" name="jellyfin_api_key" type="password"
-               autocomplete="new-password" spellcheck="false">
-        <span class="hint"><code>jellyfin_api_key</code></span>
-      </label>
-      <label class="field wide">
-        <span class="field-label">媒体库根（Jellyfin 容器内） <span class="badge" data-timing="immediate">即时</span></span>
-        <input id="set-jellyfin-root" name="jellyfin_library_root" autocomplete="off" spellcheck="false"
-               placeholder="空 = 关闭（如 /data/video/dramahub）">
-        <span class="hint"><code>jellyfin_library_root</code></span>
-      </label>
-      <label class="field">
-        <span class="field-label">库名前缀 <span class="badge" data-timing="immediate">即时</span></span>
-        <input id="set-jellyfin-prefix" name="jellyfin_library_prefix" autocomplete="off" spellcheck="false">
-        <span class="hint"><code>jellyfin_library_prefix</code></span>
-      </label>
-      <label class="field">
-        <span class="field-label">单次请求超时秒 <span class="badge" data-timing="immediate">即时</span></span>
-        <input id="set-jellyfin-timeout" name="jellyfin_timeout_sec" inputmode="numeric" autocomplete="off">
-        <span class="hint"><code>jellyfin_timeout_sec</code></span>
-      </label>
+  <fieldset class="settings-group">
+    <legend class="visually-hidden">Jellyfin</legend>
+    <div class="settings-body">
+      <div class="group-head">
+        <div class="group-title">Jellyfin 连接</div>
+        <p class="group-description">只用于创建与维护托管媒体库，不会改动用户手动创建的库。</p>
+      </div>
+      <div class="fields">
+        <label class="field">
+          <span class="field-label">服务器地址 <span class="badge" data-timing="immediate">即时</span></span>
+          <input id="set-jellyfin-url" name="jellyfin_url" type="url" spellcheck="false" placeholder="http://jellyfin.local:8096">
+          <span class="field-hint">不带尾斜杠也可以</span>
+        </label>
+        <label class="field">
+          <span class="field-label">API Key <span class="badge" data-timing="immediate">即时</span></span>
+          <input id="set-jellyfin-api-key" name="jellyfin_api_key" type="password" autocomplete="new-password" spellcheck="false" placeholder="留空不改">
+          <span class="field-hint">不回显；留空表示不修改</span>
+        </label>
+        <label class="field">
+          <span class="field-label">媒体库根目录 <span class="badge" data-timing="immediate">即时</span></span>
+          <input id="set-jellyfin-root" name="jellyfin_library_root" type="text" spellcheck="false" placeholder="/media/drama-hub">
+          <span class="field-hint">Jellyfin 侧看到的目录</span>
+        </label>
+        <label class="field">
+          <span class="field-label">库名前缀 <span class="badge" data-timing="immediate">即时</span></span>
+          <input id="set-jellyfin-prefix" name="jellyfin_library_prefix" type="text" spellcheck="false" placeholder="drama-hub · ">
+          <span class="field-hint">用来区分托管库；前缀匹配不到就不接管</span>
+        </label>
+        <label class="field">
+          <span class="field-label">请求超时（秒） <span class="badge" data-timing="immediate">即时</span></span>
+          <input id="set-jellyfin-timeout" name="jellyfin_timeout_sec" type="number" min="1" step="1">
+          <span class="field-hint">单次 Jellyfin 调用超时</span>
+        </label>
+      </div>
     </div>
   </fieldset>
 
-  <div class="form-foot">
-    <button type="submit" class="btn primary" id="settings-save">保存</button>
-    <p class="hint" id="settings-hint"></p>
+  <div class="settings-footer">
+    <p class="footer-note" id="settings-hint"></p>
+    <button type="reset" class="secondary-btn" id="settings-reset">重置</button>
+    <button type="submit" class="primary-btn" id="settings-save">保存</button>
   </div>
-
-  <details class="card">
-    <summary>只读运行参数</summary>
-    <div class="card-body">
-      <dl class="kv" id="readonly"></dl>
-    </div>
-  </details>
 </form>
+
+<details class="card readonly-card">
+  <summary>只读运行参数</summary>
+  <div class="card-body">
+    <dl class="kv" id="readonly"></dl>
+  </div>
+</details>
 {{end}}

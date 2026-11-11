@@ -1,0 +1,65 @@
+{{define "content"}}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">同步</h1>
+    <p class="page-desc">Jellyfin 连接、托管媒体库与最近一次同步的结果。</p>
+  </div>
+</div>
+<p class="notice" id="notice" role="status" aria-live="polite"></p>
+<p class="write-hint" id="write-hint"></p>
+
+<section class="card sync-summary" id="jellyfin-summary" aria-labelledby="jellyfin-title">
+  <div class="sync-summary-top">
+    <div class="provider-id">
+      <span class="provider-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20"><path d="M4 5.5h12M4 10h12M4 14.5h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      </span>
+      <div>
+        <div class="provider-name" id="jellyfin-title">Jellyfin</div>
+        <div class="provider-sub" id="jellyfin-server">服务器地址未配置</div>
+        <span class="badge" data-tone="muted" id="jellyfin-badge">读取中</span>
+      </div>
+    </div>
+    <button type="button" class="primary-btn" id="jellyfin-sync">立即同步</button>
+  </div>
+  <div class="sync-meta">
+    <div class="sync-meta-item">
+      <div class="sync-meta-label">最近同步</div>
+      <div class="sync-meta-value" id="jellyfin-when">还没有同步过</div>
+    </div>
+    <div class="sync-meta-item">
+      <div class="sync-meta-label">上次结果</div>
+      <div class="sync-meta-value" id="jellyfin-last">—</div>
+    </div>
+    <div class="sync-meta-item">
+      <div class="sync-meta-label">托管库</div>
+      <div class="sync-meta-value" id="jellyfin-result">—</div>
+    </div>
+  </div>
+  <p class="state" id="jellyfin-progress" role="status" aria-live="polite"></p>
+  <div class="issues" id="jellyfin-issues"></div>
+  <p class="hint" id="jellyfin-hint"></p>
+</section>
+
+<div class="library-heading">
+  <h2>托管媒体库</h2>
+  <p>仅管理由 drama-hub 创建的媒体库</p>
+</div>
+<section class="card library-list" id="jellyfin-categories" aria-label="托管媒体库列表">
+  <p class="empty">读取中…</p>
+</section>
+<div class="sync-note" id="sync-note">
+  <span>关闭媒体库后，对应的托管库会在下一轮周期同步或手动同步时删除；点「立即同步」则当场删除。用户手动创建的 Jellyfin 媒体库不会受到影响。</span>
+</div>
+
+<dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-title">
+  <div class="dialog-body">
+    <h2 class="dialog-title" id="confirm-title">关闭托管媒体库</h2>
+    <p class="dialog-desc" id="confirm-text"></p>
+    <div class="dialog-actions">
+      <button type="button" class="secondary-btn" id="confirm-cancel">取消</button>
+      <button type="button" class="primary-btn" id="confirm-ok">关闭媒体库</button>
+    </div>
+  </div>
+</dialog>
+{{end}}

@@ -112,6 +112,38 @@ func TestManagerCreatesOneLibraryPerCategory(t *testing.T) {
 	}
 }
 
+// TestManagerRoundVerdict 锁定「一轮成不成功」的判据（同步页收尾提示依赖它）：
+// 成功轮次用同一个时刻写 last_ok_at 与 last_run_at；整轮中止只推进 last_run_at，
+// last_ok_at 停在上一轮成功。页面据此把「跑到结束但没成功」和成功区分开，
+// 不靠 last_error（冲突 / 部分被拒也会写它，但那几轮是成功的）。
+func TestManagerRoundVerdict(t *testing.T) {
+	h := newHarness(t, nil, []string{"都市"})
+	h.run()
+
+	ok := h.state()
+	if ok.LastOKAt.IsZero() || !ok.LastOKAt.Equal(ok.LastRunAt) {
+		t.Fatalf("成功轮次 last_ok_at(%v) 与 last_run_at(%v) 应是同一时刻", ok.LastOKAt, ok.LastRunAt)
+	}
+
+	// 下一轮整轮中止：列分类失败，record 只写 last_error，不推进 last_ok_at。
+	h.catsErr = errors.New("列分类失败")
+	h.run()
+
+	bad := h.state()
+	if bad.LastError == "" {
+		t.Fatal("中止轮次应写 last_error")
+	}
+	if !bad.LastOKAt.Equal(ok.LastOKAt) {
+		t.Errorf("中止轮次不该推进 last_ok_at：%v → %v", ok.LastOKAt, bad.LastOKAt)
+	}
+	if !bad.LastRunAt.After(ok.LastRunAt) {
+		t.Errorf("中止轮次应推进 last_run_at：%v → %v", ok.LastRunAt, bad.LastRunAt)
+	}
+	if bad.LastOKAt.Equal(bad.LastRunAt) {
+		t.Error("中止轮次的 last_ok_at 与 last_run_at 不该相等：页面会误报成功")
+	}
+}
+
 // TestManagerIdempotent 锁定「再点一次 0 新增、0 写请求」（AC-3）。
 func TestManagerIdempotent(t *testing.T) {
 	h := newHarness(t, nil, []string{"都市", "爱情"})
